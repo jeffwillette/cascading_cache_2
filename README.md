@@ -6,6 +6,16 @@
 pip install -e .
 ```
 
+## TODO
+
+- add the PMA layer to each sublayer of the LLM and try compressing contexts. 
+  - bring the UMBC model in here
+  - touch up the UMBC model to use flash attention
+  - make sure the UMBC layer is setup to do the cumsum operation
+  - concat the cumsum and the sliding window.
+  - train the first layer to match teh features of the sliding window features.
+  - if there is enough room on the GPU, finetune the whole network for the task loss
+
 ## Note
 
 ```bash

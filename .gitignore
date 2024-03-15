@@ -40,3 +40,4 @@ save/
 *.qdstrm
 *.nsys-rep
 *.egg-info
+.aim/*

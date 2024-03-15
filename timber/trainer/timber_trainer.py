@@ -12,10 +12,11 @@ import transformers
 from lightning import Trainer
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.callbacks import EarlyStopping
-from pytorch_lightning.loggers.wandb import WandbLogger
+from aim.pytorch_lightning import AimLogger
 from pytorch_lightning.profilers import PyTorchProfiler
 from torch.utils.data import Subset
 from sklearn.model_selection import train_test_split
+from timber.models.umbc import SlotSetEncoder
 import torch.utils.checkpoint
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 import deepspeed.checkpoint
@@ -23,6 +24,9 @@ import deepspeed
 import torch.autograd
 
 # torch.autograd.set_detect_anomaly(True)
+
+from peft import LoraConfig, TaskType
+from peft import get_peft_model, prepare_model_for_kbit_training
 
 from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig, LlamaDecoderLayer
 
@@ -35,6 +39,7 @@ from torch.utils.data import DataLoader, random_split
 
 torch.set_float32_matmul_precision('high')
 
+
 @dataclass
 class TrainConfig:
     disable_kd: bool = False
@@ -45,25 +50,27 @@ class TrainConfig:
     lora_r: int = 32
     save_steps: int = 100
     dense_queries: int = None
-    seq_len: int = 4096
+    seq_len: int = 64
     max_steps: int = -1
     model_checkpoint_dir: str = "./saves/dev/checkpoint"
-    dataset: str = 'wikitext103'
+    dataset: str = 'wikitext2'
     load_from_checkpoint: str = None
     k: int = 512
     block_size_q: int = 8
     block_size_k: int = 8
     init_from_checkpoint: str = None
-    method: str = 'timber'
-    model: str = 'llama32k'
+    method: str = 'none'
+    model: str = 'qwen500m'
     disable_global_context: bool = False
 
+
 class LabDataModule(pl.LightningDataModule):
+
     def __init__(
         self,
         config: TrainConfig,
         num_workers: int = 0,
-        data_dir: Path ="data",
+        data_dir: Path = "data",
         download: bool = True,
         train_size: float = 0.9,
     ):
@@ -77,7 +84,7 @@ class LabDataModule(pl.LightningDataModule):
         self.dataset = None
         self.tokenizer = load_tokenizer()
         self.bsize = config.batch_size
-    
+
     def prepare_data(self):
         if self.config.dataset in ['wikitext2', 'wikitext103']:
             self.dataset = LabDataset(
@@ -88,13 +95,9 @@ class LabDataModule(pl.LightningDataModule):
                 dataset=self.config.dataset,
             )
         elif self.config.dataset in ['alpaca']:
-            self.dataset = AlpacaDataset(
-                tokenizer=self.tokenizer,
-            )
+            self.dataset = AlpacaDataset(tokenizer=self.tokenizer, )
         elif self.config.dataset in ['booksum']:
-            self.dataset = BookSumDataset(
-                tokenizer=self.tokenizer,
-            )
+            self.dataset = BookSumDataset(tokenizer=self.tokenizer, )
         elif self.config.dataset in ['openwebtext']:
             self.dataset = OpenWebTextDataset(
                 tokenizer=self.tokenizer,
@@ -102,83 +105,97 @@ class LabDataModule(pl.LightningDataModule):
             )
         else:
             raise Exception()
-    
+
     def setup(self, stage: str):
         if self.config.dataset in ['wikitext2', 'wikitext103']:
             if stage == "fit" or stage is None:
                 test_size = min(100, len(self.dataset) * (1 - self.train_size))
                 train_size = int(len(self.dataset) - test_size)
-                self.train_data, self.val_data = random_split(self.dataset, lengths=[train_size, test_size])
+                # to ensure they are both ints and sum to the total dataset size
+                test_size = len(self.dataset) - train_size
+
+                self.train_data, self.val_data = random_split(
+                    self.dataset, lengths=[train_size, test_size])
             if stage == "test" or stage is None:
                 self.test_data = self.val_data
         elif self.config.dataset in ['booksum', 'alpaca', 'openwebtext']:
             if stage == "fit" or stage is None:
+
                 def train_val_dataset(dataset, val_split=0.05):
-                    train_idx, val_idx = train_test_split(list(range(len(dataset))), test_size=val_split)
+                    train_idx, val_idx = train_test_split(list(
+                        range(len(dataset))),
+                                                          test_size=val_split)
                     train = Subset(dataset, train_idx)
                     valid = Subset(dataset, val_idx)
                     return train, valid
-                self.train_data, self.val_data = train_val_dataset(self.dataset)
+
+                self.train_data, self.val_data = train_val_dataset(
+                    self.dataset)
             if stage == "test" or stage is None:
                 self.test_data = self.val_data
         else:
             raise Exception()
 
     def train_dataloader(self):
-        return DataLoader(self.train_data, num_workers=self.num_workers, batch_size=self.bsize)
+        return DataLoader(self.train_data,
+                          num_workers=self.num_workers,
+                          batch_size=self.bsize)
 
     def val_dataloader(self):
-        return DataLoader(self.val_data, num_workers=self.num_workers, batch_size=self.bsize)
+        return DataLoader(self.val_data,
+                          num_workers=self.num_workers,
+                          batch_size=self.bsize)
 
     def test_dataloader(self):
-        return DataLoader(self.test_data, num_workers=self.num_workers, batch_size=self.bsize)
+        return DataLoader(self.test_data,
+                          num_workers=self.num_workers,
+                          batch_size=self.bsize)
 
-from peft import LoraConfig, TaskType
-from peft import get_peft_model, prepare_model_for_kbit_training
 
 def load_model(
-    train_config: TrainConfig = None, 
-    method = 'timber', 
-    device = 'cuda:0',
+    train_config: TrainConfig = None,
+    method='timber',
+    device='cuda:0',
 ):
     if train_config.using_fsdp:
         device = 'cpu'
-    
+
     MODELS = {
         'llama32k': 'togethercomputer/LLaMA-2-7B-32K',
+        'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B-ShareGPT',
         'llama13b': 'meta-llama/Llama-2-13b-hf',
         'qwen7b': 'Qwen/Qwen1.5-7B-Chat',
         'qwen14b': 'Qwen/Qwen1.5-14B-Chat',
+        'qwen500m': "Qwen/Qwen1.5-0.5b-Chat",
         'yi6b': '01-ai/Yi-6B-200K',
         'yi34b': '01-ai/Yi-34B-200K',
     }
     assert train_config.model in MODELS, MODELS.keys()
     model_id = MODELS[train_config.model]
-    
+
     config = LlamaConfig.from_pretrained(model_id)
     config._attn_implementation = config.attn_implementation = 'sdpa'
-    
+
     quant_config = transformers.BitsAndBytesConfig(
         load_in_4bit=True,
-        llm_int8_skip_modules=['tree_avgpool_scaler'],
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
     )
     if train_config.using_fsdp:
         quant_config = None
-    
+
     model = LlamaForCausalLM.from_pretrained(
         model_id,
-        config=config, 
-        device_map={"" : device} if device != 'cpu' else 'cpu',
-        load_in_4bit=quant_config is not None,
+        config=config,
+        device_map={"": device} if device != 'cpu' else 'cpu',
+        load_in_4bit=quant_config is None,
         quantization_config=quant_config,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
-    
+
     for m in model.modules():
         if hasattr(m, 'attention_method'):
             m.attention_method = method
@@ -196,98 +213,121 @@ def load_model(
                 m._gradient_checkpointing_func = torch.utils.checkpoint.checkpoint
             else:
                 m._gradient_checkpointing_func = torch.utils.checkpoint.checkpoint
-    
-    if method != 'none':
+
+    # if method not in ['none', 'umbc']:
+    if method != "none":
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
             r=train_config.lora_r,
-            lora_alpha=train_config.lora_r//2, 
+            lora_alpha=train_config.lora_r // 2,
             lora_dropout=0.05,
             target_modules=[
-                'q_proj', 'k_proj', 'v_proj', 'o_proj', 
-                'gate_proj', 'up_proj', 'down_proj', 
+                'q_proj',
+                'k_proj',
+                'v_proj',
+                'o_proj',
+                'gate_proj',
+                'up_proj',
+                'down_proj',
                 # 'input_layernorm', 'post_attention_layernorm'
             ],
-            modules_to_save=[
-                'tree_avgpool_scaler',
-                'input_layernorm', 'post_attention_layernorm'
-            ]
-        )
-        
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+            modules_to_save=['input_layernorm', 'post_attention_layernorm'])
+
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=True)
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
-        
+
         if train_config.init_from_checkpoint is not None:
             print('loading from', train_config.init_from_checkpoint)
-            state_dict = torch.load(train_config.init_from_checkpoint, map_location='cpu')['state_dict']
+            state_dict = torch.load(train_config.init_from_checkpoint,
+                                    map_location='cpu')['state_dict']
             keys = list(state_dict.keys())
             for key in keys:
                 x = state_dict[key]
                 state_dict[key.strip('model.')] = x
                 del state_dict[key]
             model.load_state_dict(state_dict)
-            print('lora checkpoint loaded from', train_config.init_from_checkpoint)
-    
+            print('lora checkpoint loaded from',
+                  train_config.init_from_checkpoint)
+
     return model
+
 
 def load_tokenizer():
     model_id = 'togethercomputer/LLaMA-2-7B-32K'
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
     return tokenizer
 
+
 class LabModule(pl.LightningModule):
+
     def __init__(self, config: TrainConfig):
         super().__init__()
-        
+
         self.model = load_model(train_config=config, method=config.method)
+        self.sse = SlotSetEncoder(
+            K=32,
+            dim=2048,
+            slot_type="deterministic",
+            heads=16,
+        )
+
+        print(f"sse {self.sse=}")
         if not config.disable_kd:
             self.teacher = load_model(train_config=config, method='none')
         else:
             self.teacher = None
-        
+
         self.validation_preds = []
         self.validation_targets = []
-        
+
         self.config = config
 
     def forward(self, inputs, target, output_hidden_states=False):
-        return self.model(
-            inputs,
-            labels=target, 
-            output_hidden_states=output_hidden_states
-        )
+        return self.model(inputs,
+                          labels=target,
+                          output_hidden_states=output_hidden_states)
 
     def training_step(self, batch, batch_idx):
         if self.teacher is not None:
             self.teacher.eval()
         self.model.train()
-        
+
         inputs, target = batch
-        
+
         if not self.config.disable_kd:
-            with torch.no_grad(): #, torch.autocast('cuda', torch.bfloat16):
-                output_teacher = self.teacher(inputs, output_hidden_states=not self.config.disable_kd)
-        # with torch.autocast('cuda', torch.bfloat16):
-        output = self(inputs, target, output_hidden_states=not self.config.disable_kd)
+            with torch.no_grad():  #, torch.autocast('cuda', torch.bfloat16):
+                output_teacher = self.teacher(
+                    inputs, output_hidden_states=not self.config.disable_kd)
+
+        print(inputs.size(), target.size())
+        T = inputs.size(1)
+        output = self(inputs,
+                      target,
+                      output_hidden_states=not self.config.disable_kd)
         logits = output.logits
-        
+
         loss_model = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.shape[-1]).to(torch.float32),
-            target.view(-1)
-        )
-        
+            target.view(-1))
+
         loss_kd_hidden = 0
         loss_kd_logits = 0
         if not self.config.disable_kd:
-            for teacher_layer, student_layer in zip(output_teacher.hidden_states, output.hidden_states):
-                loss_kd_hidden += torch.nn.functional.mse_loss(student_layer.to(torch.float32), teacher_layer.to(torch.float32))
+            for teacher_layer, student_layer in zip(
+                    output_teacher.hidden_states, output.hidden_states):
+                loss_kd_hidden += torch.nn.functional.mse_loss(
+                    student_layer.to(torch.float32),
+                    teacher_layer.to(torch.float32))
             loss_kd_hidden = loss_kd_hidden / len(output_teacher.hidden_states)
-            
+
             loss_kd_logits = torch.nn.functional.kl_div(
-                output.logits.view(-1, logits.shape[-1]).to(torch.float32).log_softmax(-1),
-                output_teacher.logits.view(-1, logits.shape[-1]).to(torch.float32).softmax(-1),
+                output.logits.view(-1, logits.shape[-1]).to(
+                    torch.float32).log_softmax(-1),
+                output_teacher.logits.view(-1, logits.shape[-1]).to(
+                    torch.float32).softmax(-1),
                 reduction='batchmean',
             )
 
@@ -295,7 +335,7 @@ class LabModule(pl.LightningModule):
             loss = loss_model * 0.1 + (loss_kd_hidden + loss_kd_logits) * 2.5
         else:
             loss = loss_model
-        
+
         self.log("training/loss_model", loss_model.item())
         if not self.config.disable_kd:
             if loss_kd_hidden > 0:
@@ -303,25 +343,23 @@ class LabModule(pl.LightningModule):
             if loss_kd_logits > 0:
                 self.log("training/loss_kd_logits", loss_kd_logits.item())
         self.log("training/loss", loss.item())
-        
+
         return loss
-    
+
     def validation_step(self, batch, batch_idx):
         self.model.eval()
-        
+
         inputs, target = batch
-        with torch.no_grad(): #, torch.autocast('cuda', torch.bfloat16):
+        with torch.no_grad():  #, torch.autocast('cuda', torch.bfloat16):
             # print('asdfasdf', inputs.shape, target.shape, flush=True)
             output = self(inputs, target).logits
             loss = torch.nn.functional.cross_entropy(
-                output.view(-1, output.shape[-1]), 
-                target.view(-1)
-            )
+                output.view(-1, output.shape[-1]), target.view(-1))
         self.log("val/loss", loss.item())
-        
+
         self.validation_preds.append(output.cpu())
         self.validation_targets.append(target.cpu())
-    
+
     def on_validation_epoch_end(self):
         from torchmetrics.text.perplexity import Perplexity
         with torch.no_grad():
@@ -329,16 +367,17 @@ class LabModule(pl.LightningModule):
             if self.config.using_fsdp:
                 device = 'cuda'
             calculator = Perplexity(ignore_index=-100).to(device)
-            for preds, target in zip(self.validation_preds, self.validation_targets):
+            for preds, target in zip(self.validation_preds,
+                                     self.validation_targets):
                 calculator.update(preds.to(device), target.to(device))
             ppl = calculator.compute()
         ppl = ppl.item()
         print('val/ppl', ppl)
         self.log("val/ppl", ppl)
-        
+
         self.validation_preds.clear()
         self.validation_targets.clear()
-        
+
     def configure_optimizers(self):
         params = []
         for name, p in self.model.named_parameters():
@@ -350,13 +389,14 @@ class LabModule(pl.LightningModule):
         # return DeepSpeedCPUAdam(params, lr=self.config.lr)
         return torch.optim.AdamW(params, lr=self.config.lr)
 
+
 from lightning.pytorch.strategies import FSDPStrategy
 from lightning.pytorch.strategies import DeepSpeedStrategy
 
+
 def main(config: TrainConfig):
-    os.makedirs('./saves/dev/wandb', exist_ok=True)
     os.makedirs('./saves/dev/checkpoint', exist_ok=True)
-    
+
     if config.using_fsdp:
         devices = "1"
         policy = {LlamaDecoderLayer}
@@ -370,12 +410,16 @@ def main(config: TrainConfig):
             "zero_allow_untested_optimizer": True,
             "zero_optimization": {
                 "stage": 3,
-                "offload_param": {"device": "cpu"},
-                "offload_optimizer": {"device": "cpu"},
+                "offload_param": {
+                    "device": "cpu"
+                },
+                "offload_optimizer": {
+                    "device": "cpu"
+                },
                 "max_live_parameters": 5e8,
                 "max_reuse_distance": 1e8,
                 "contiguous_gradients": True,
-                "overlap_comm": False, 
+                "overlap_comm": False,
                 "allgather_bucket_size": 1e7,
                 "reduce_bucket_size": 1e7,
             },
@@ -384,18 +428,20 @@ def main(config: TrainConfig):
     else:
         devices = "1"
         strategy = "auto"
-    
+
     if config.method == 'timber':
         filename = f'llama32k-{config.dataset}-{config.seq_len}-bq{config.block_size_q}-bk{config.block_size_k}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'none':
         filename = f'llama32k-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
+    elif config.method == 'umbc':
+        filename = f'qwen500m-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
     elif config.method == 'reformer':
         filename = f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'performer':
         filename = f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
     else:
         raise Exception()
-    
+
     checkpoint_callback = ModelCheckpoint(
         save_top_k=3,
         monitor="step",
@@ -407,7 +453,7 @@ def main(config: TrainConfig):
     )
     checkpoint_callback.CHECKPOINT_EQUALS_CHAR = '-'
     checkpoint_callback.FILE_EXTENSION = '.pth'
-    
+
     trainer = pl.Trainer(
         log_every_n_steps=1,
         devices=devices,
@@ -418,33 +464,29 @@ def main(config: TrainConfig):
         accumulate_grad_batches=config.accumulation_steps,
         max_epochs=20,
         max_steps=config.max_steps,
-        logger=WandbLogger(
-            save_dir="saves/dev/wandb", 
-            project="timber-attention"
-        ),
+        logger=AimLogger(experiment="umbc-llm"),
         enable_checkpointing=True,
-        callbacks=[
-            checkpoint_callback
-        ],
+        callbacks=[checkpoint_callback],
     )
-    
+
     datamodule = LabDataModule(config=config)
     model = LabModule(config=config)
     kwargs = dict(
         model=model,
-        datamodule=datamodule, 
+        datamodule=datamodule,
     )
     if config.load_from_checkpoint is not None:
         kwargs['ckpt_path'] = config.load_from_checkpoint
     trainer.fit(**kwargs)
 
+
 if __name__ == "__main__":
     seed()
-    
+
     import argparse
-    
+
     parser = argparse.ArgumentParser()
-    
+
     parser.add_argument('--model', default='llama32k', type=str)
     parser.add_argument('--using_fsdp', action='store_true')
     parser.add_argument('--disable_kd', action='store_true')
@@ -462,10 +504,10 @@ if __name__ == "__main__":
     parser.add_argument('--k', default=512, type=int)
     parser.add_argument('--block_size_q', default=16, type=int)
     parser.add_argument('--block_size_k', default=2, type=int)
-    parser.add_argument('--method', default='timber', type=str)
-    
+    parser.add_argument('--method', default='umbc', type=str)
+
     args = parser.parse_args()
-    
+
     train_config = TrainConfig(
         using_fsdp=args.using_fsdp,
         disable_kd=args.disable_kd,
@@ -492,5 +534,5 @@ if __name__ == "__main__":
         train_config.seq_len = args.seq_len
     if args.save_steps > 0:
         train_config.save_steps = args.save_steps
-    
+
     main(train_config)

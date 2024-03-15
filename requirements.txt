@@ -139,4 +139,3 @@ wrapt==1.14.1
 xmltodict==0.13.0
 # flash-attn==2.3.3
 torch==2.2.0
-triton==2.2.0
