@@ -155,8 +155,15 @@ attn_act_funcs = {
 
 class Slots(nn.Module):
 
-    def __init__(self, K: int, h: int, slot_type: str) -> None:
+    def __init__(self,
+                 K: int,
+                 h: int,
+                 slot_type: str,
+                 device=None,
+                 dtype=None) -> None:
         super().__init__()
+
+        factory_kwargs = {'device': device, 'dtype': dtype}
         self.name = "Slots"
         self.K = K  # Number of Slots
         self.h = h  # Slot size
@@ -168,50 +175,55 @@ class Slots(nn.Module):
 
         if slot_type == "random":
             # same initialization as "Weight Uncertainty in Neural Networks"
-            self.mu = nn.Parameter(torch.zeros(1, self.K,
-                                               self.h).uniform_(-0.2, 0.2),
-                                   requires_grad=True)
-            self.sigma = nn.Parameter(torch.zeros(1, self.K,
-                                                  self.h).uniform_(-5.0, -4.0),
-                                      requires_grad=True)
+            self.mu = nn.Embedding(self.K, self.h, **factory_kwargs)
+            self.sigma = nn.Embedding(self.K, self.h, **factory_kwargs)
+
             return
 
-        self.S = nn.Parameter(torch.zeros(1, self.K, self.h),
-                              requires_grad=True)
-        nn.init.xavier_uniform_(self.S)  # type: ignore
+        self.weight = nn.Embedding(self.K, self.h, **factory_kwargs)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.slot_type == "random":
+            nn.init.uniform_(self.mu.weight, -0.2, 0.2)
+            nn.init.uniform_(self.sigma.weight, -5.0, -4.0)
+            return
+
+        nn.init.xavier_uniform_(self.weight.weight)  # type: ignore
+
+    def forward(self):
+        return self.sample_s()
 
     def sample_s(self) -> T:
         if self.slot_type == "random":
             if self.training:
                 return (  # type: ignore
-                    torch.randn_like(self.mu) * \
-                    F.softplus(self.sigma) + self.mu
-                )
-            return self.mu
+                    torch.randn_like(self.mu(0)) * \
+                    F.softplus(self.sigma(0)) + self.mu
+                ).unsqueeze(0)
+            return self.mu.unsqueeze(0)
 
         # returning the parameter S caused problems because it is an
         # nn.Parameter and the above random returns a tensor. Return
         # a tensor here to make it consistent
-        return (  # type: ignore
-            torch.ones_like(self.S) * self.S)
+        return self.weight.weight.unsqueeze(0)
 
 
 class SlotSetEncoder(MBCFunction):
 
-    def __init__(
-        self,
-        K: int,
-        dim: int,
-        slot_type: str = "random",
-        ln_slots: bool = True,
-        heads: int = 4,
-        bias: bool = True,
-        slot_drop: float = 0.0,
-        attn_act: str = "slot-sigmoid",
-        slot_residual: bool = True,
-        eps: float = EPS,
-        ln_after: bool = True,
-    ):
+    def __init__(self,
+                 K: int,
+                 dim: int,
+                 slot_type: str = "random",
+                 ln_slots: bool = True,
+                 heads: int = 4,
+                 bias: bool = True,
+                 slot_drop: float = 0.0,
+                 attn_act: str = "slot-sigmoid",
+                 eps: float = EPS,
+                 ln_after: bool = True,
+                 max_batch: int = 32):
         super().__init__()
         self.name = "SlotSetEncoder"
         self.dim = dim
@@ -222,7 +234,6 @@ class SlotSetEncoder(MBCFunction):
         self.ln_slots = ln_slots  # never used
         self.slot_drop = slot_drop
         self.attn_act = attn_act
-        self.slot_residual = slot_residual
 
         self.slots: Slots
 
@@ -235,31 +246,25 @@ class SlotSetEncoder(MBCFunction):
         self.sqrt_dim = 1.0 / math.sqrt(dim // heads)
         self.slots = Slots(K=K, h=dim, slot_type=slot_type)
 
-        self.q = nn.Linear(dim, dim, bias=bias)
-        self.v = nn.Linear(dim, dim, bias=bias)
-        self.k = nn.Linear(dim, dim, bias=bias)
+        self.sse_q = nn.Linear(dim, dim, bias=bias)
+        self.sse_v = nn.Linear(dim, dim, bias=bias)
+        self.sse_k = nn.Linear(dim, dim, bias=bias)
 
         self.norm_slots = nn.LayerNorm(
             normalized_shape=dim) if ln_slots else nn.Identity()
 
-        self.pre_sampled_slots = T()
         self.norm_after = nn.LayerNorm(dim) if ln_after else nn.Identity()
-        self.pre_sampled = False
+
+        self.register_buffer(
+            "x_prev",
+            torch.zeros(max_batch, self.heads, K, self.dim // self.heads))
+        self.register_buffer("c_prev", torch.zeros(max_batch, self.heads, K,
+                                                   1))
 
     def sample_s(self) -> T:
-        S = self.slots.sample_s()
+        S = self.slots()
         S = self.norm_slots(S)
-
-        if self.slot_drop <= 0.0 or not self.training:
-            return self.q(S)  # type: ignore
-
-        idx = torch.rand(self.slots.K) > self.slot_drop
-        # we need to ensure that at least one slot is not dropped
-        if idx.sum() == 0:
-            lucky_one = torch.randperm(self.slots.K)[0]
-            idx[lucky_one] = True
-
-        return self.q(S[:, idx])  # type: ignore
+        return S
 
     def head_split(self, x):
         # in: (B, S, D) --> (B, H, S, D//H)
@@ -274,17 +279,16 @@ class SlotSetEncoder(MBCFunction):
         if S.size(0) == 1:  # in case S was passed in and not repeated
             S = S.repeat(X.size(0), 1, 1)
 
-        Q, K, V = S, self.k(X), self.v(X)  # (B, T, D)
+        Q, K, V = S, self.sse_k(X), self.sse_v(X)  # (B, T, D)
         Q, K, V = map(self.head_split, (Q, K, V))  # (B, H, T, D)
 
         A = torch.einsum("bhkd,bhsd->bhks", Q * np.sqrt(self.sqrt_dim),
                          K * np.sqrt(self.sqrt_dim))
+
         return Q, A, V
 
     def forward(self, X: T, S: OT = None, mask: OT = None) -> T:
         B, T, D = X.size()
-        if self.pre_sampled:
-            S = self.pre_sampled_slots
 
         if mask is not None:
             mask = mask.repeat(self.heads, 1).unsqueeze(1)
@@ -305,6 +309,66 @@ class SlotSetEncoder(MBCFunction):
         S_hat = self.norm_after(S_hat)
         return S_hat  # type: ignore
 
+    def forward_mbc(
+        self,
+        X: T,
+        grad: bool = True,
+        mask: OT = None,
+    ) -> Tuple[T, T]:
+        if mask is not None:
+            mask = mask.repeat(self.heads, 1).unsqueeze(1)
+
+        s = self.sample_s().repeat(X.size(0), 1, 1)
+        with torch.set_grad_enabled(grad):
+            _, x, c = self.process_batch(X, S=s, mask=mask)
+
+        with torch.no_grad():
+            c_prev, x_prev = torch.clone(self.c_prev[:c.size(0)]), torch.clone(
+                self.x_prev[:x.size(0)])
+            self.x_prev[:x.size(0)].add_(x)
+            self.c_prev[:c.size(0)].add_(c)
+
+        c += c_prev
+        x += x_prev
+
+        view_std = (x.size(0), s.size(1), -1)
+
+        x = x.transpose(1, 2) / (c.transpose(1, 2) + self.eps)  # type: ignore
+        x = x.reshape(*view_std)
+
+        x = self.norm_after(x)
+        return x
+
+    def process_batch(self,
+                      X: T,
+                      S: OT = None,
+                      mask: OT = None) -> Tuple[T, T, T]:
+        """
+        this is a 'partial forward' which allows the user to aggreate the
+        components manually returns:
+        S: Slots
+        S_hat: SSE output to be aggregated
+        C: normalization constant
+        """
+        S, W, V = self.get_attn_v(X, S=S)
+
+        W = W.softmax(dim=-2)  # softmax over the slots
+        C = W.sum(dim=-1, keepdim=True)  # cumulative normalization constant
+
+        S_hat = torch.einsum("bhks,bhsd->bhkd", W, V)  # (B, H, K, D // H)
+
+        return S, S_hat, C  # type: ignore
+
+    def post_forward_mbc_cleanup(self):
+        with torch.no_grad():
+            self.x_prev.zero_()
+            self.c_prev.zero_()
+
+    def grad_correct(self, c: float) -> None:
+        for n, p in self.named_parameters():
+            if "norm_after" not in n:
+                p.grad.data.mul_(c)
+
 
 if __name__ == "__main__":
     sse = SlotSetEncoder(
@@ -313,5 +377,21 @@ if __name__ == "__main__":
         slot_type="deterministic",
         bias=False,
     )
+    sse.eval()
 
-    out = sse(torch.randn(2, 256, 128))
+    x = torch.randn(32, 256, 128)
+    out = sse(x)
+    out_mbc = sse.forward_mbc(x)
+
+    diff = (out - out_mbc).abs().amax()
+    print(f"{out.size()=} {out_mbc.size()=}")
+    print(f"max diff: {diff=}")
+
+    sse.post_forward_mbc_cleanup()
+    # for chnk in x.chunk(8, dim=1):
+    for chnk in x.chunk(256, dim=1):
+        out_mbc = sse.forward_mbc(chnk)
+
+    diff = (out - out_mbc).abs().amax()
+    print(f"{out.size()=} {out_mbc.size()=}")
+    print(f"max diff: {diff=}")
