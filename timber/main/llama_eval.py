@@ -80,15 +80,21 @@ def load_model(args):
         'qwen14b': 'Qwen/Qwen1.5-14B-Chat',
         'qwen7b': 'Qwen/Qwen1.5-7B-Chat',
         'qwen0.5b': 'Qwen/Qwen1.5-0.5B-Chat',
+        # 'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B-ShareGPT',
+        'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B',
     }
     assert args.model in MODELS, MODELS.keys()
     model_id = MODELS[args.model]
 
     config = LlamaConfig.from_pretrained(model_id)
     config._attn_implementation = config.attn_implementation = 'sdpa'
+    config._use_umbc = args.method == "umbc"
+    config._umbc_slots = args.slots
+    config._window = args.window
 
-    infer_dtype = torch.bfloat16
+    # infer_dtype = torch.bfloat16
     # infer_dtype = torch.float32
+    infer_dtype = torch.float16
     model = LlamaForCausalLM.from_pretrained(
         model_id,
         config=config,
@@ -98,7 +104,17 @@ def load_model(args):
             bnb_4bit_compute_dtype=infer_dtype,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-        ),
+            llm_int8_skip_modules=[
+                "sse_q",
+                "sse_k",
+                "sse_v",
+                "slots",
+                "norm_slots",
+                "norm_after",
+                # "input_layernorm",
+                # "post_attention_layernorm",
+                # "norm",
+            ]),
         torch_dtype=infer_dtype,
         trust_remote_code=True,
     )
@@ -106,14 +122,8 @@ def load_model(args):
     for m in model.modules():
         if hasattr(m, 'attention_method'):
             m.attention_method = args.method
-            m.tree_k = args.k
-            m.tree_block_size_q = args.block_size_q
-            m.tree_block_size_k = args.block_size_k
-            m.tree_using_context_avg = True
-            m.tree_dense_queries = args.dense_queries
-            m.tree_dense_layers = list(range(args.dense_layers))
 
-    if args.method != 'none' and args.checkpoint is not None:
+    if args.method not in ["none", "umbc"] and args.checkpoint is not None:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=True,
@@ -147,13 +157,19 @@ def load_model(args):
         print('load result', result)
         model = model.to(infer_dtype)
         print('lora checkpoint loaded from', args.checkpoint)
+    elif args.method == "umbc":
+        if args.checkpoint is not None:
+            ckpt = torch.load(args.checkpoint, map_location="cpu")
+
+        ckpt = {k[6:]: v for k, v in ckpt["state_dict"].items()}
+        model.load_state_dict(ckpt)
+
     elif args.method != 'none':
         for m in model.modules():
             if hasattr(m, 'attention_method'):
                 m.tree_using_context_avg = False
 
     model = model.eval()
-
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 
     return model, tokenizer, device

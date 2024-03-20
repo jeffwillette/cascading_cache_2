@@ -15,19 +15,20 @@ from torch.utils.data import Dataset
 import tqdm
 from transformers import AutoTokenizer
 
+
 class LabDataset(Dataset):
     """Mini version of WikiText2."""
 
     def __init__(
-        self, 
-        data_dir: Path = './cache/wikitext2', 
-        block_size: int = 4096, 
+        self,
+        data_dir: Path = './cache/wikitext2',
+        block_size: int = 4096,
         download: bool = True,
         tokenizer: AutoTokenizer = None,
         dataset: str = 'wikitext103',
     ) -> None:
         super().__init__()
-        
+
         self.dataset = dataset
         os.makedirs('./cache/wikitext2', exist_ok=True)
         cache_path = './cache/wikitext2/tokenized.pth'
@@ -48,7 +49,7 @@ class LabDataset(Dataset):
             data = torch.cat(lines)
             torch.save(data, cache_path)
             print('tokenized')
-        
+
         self.data = data
         self.block_size = block_size
 
@@ -59,12 +60,12 @@ class LabDataset(Dataset):
         start = index * self.block_size
         end = start + self.block_size
         inputs = self.data[start:end]
-        target = self.data[(start + 1) : (end + 1)]  # noqa: E203
-        return inputs, target
+        # target = self.data[(start + 1):(end + 1)]  # noqa: E203
+        return inputs, inputs
 
     def download(self, destination: Path) -> None:
         os.makedirs(destination.parent, exist_ok=True)
-        
+
         dataset = self.dataset
         if dataset == 'wikitext2':
             url = "https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/train.txt"
@@ -73,16 +74,19 @@ class LabDataset(Dataset):
             data = requests.get(url).text
         elif dataset == 'wikitext103':
             from datasets import load_dataset
-            test = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+            test = load_dataset("wikitext",
+                                "wikitext-103-raw-v1",
+                                split="train")
             data = "\n\n".join(test["text"])
         else:
             raise Exception()
-        
+
         with open(destination, "w") as f:
             f.write(data)
 
 
 class Dictionary:
+
     def __init__(self) -> None:
         self.word2idx: Dict[str, int] = {}
         self.idx2word: List[str] = []

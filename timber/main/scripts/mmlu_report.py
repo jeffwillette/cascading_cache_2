@@ -2,15 +2,16 @@ import os
 import json
 from timber.main.jobs.mmlu import MMLU_SUBJECTS
 
+
 def main():
     os.makedirs('./saves/mmlu_report', exist_ok=True)
-    
+
     configs = [
-        'none', 
+        'none',
         'llama32k_timber_bq32_bk2_k512',
-        'llama13b_timber_bq32_bk2_k512'
+        'llama13b_timber_bq32_bk2_k512',
     ]
-    header = ['config',] + MMLU_SUBJECTS + ['avg',]
+    header = ['config'] + MMLU_SUBJECTS + ['avg']
     lines = [','.join(header)]
     seq_len = {}
     data_len = {}
@@ -28,8 +29,12 @@ def main():
                 data_len[subject] = len(data['results'])
         row.append(str(acc_sum / acc_len))
         lines.append(','.join(row))
-    seq_len = ['seq_len'] + [str(seq_len[subject]) for subject in MMLU_SUBJECTS] + [str(sum(seq_len.values()) / len(seq_len))]
-    data_len = ['data_len'] + [str(data_len[subject]) for subject in MMLU_SUBJECTS] + [str(sum(data_len.values()) / len(data_len))]
+    seq_len = ['seq_len'] + [
+        str(seq_len[subject]) for subject in MMLU_SUBJECTS
+    ] + [str(sum(seq_len.values()) / len(seq_len))]
+    data_len = ['data_len'] + [
+        str(data_len[subject]) for subject in MMLU_SUBJECTS
+    ] + [str(sum(data_len.values()) / len(data_len))]
     lines.append(','.join(seq_len))
     lines.append(','.join(data_len))
     csv = '\n'.join(lines)
@@ -37,6 +42,7 @@ def main():
     with open('./saves/mmlu_report/report.csv', 'w') as f:
         f.write(csv)
     print('dumped ./saves/mmlu_report/report.csv')
+
 
 if __name__ == '__main__':
     main()

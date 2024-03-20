@@ -257,36 +257,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb_umbc(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    q_len = q.size(2)
-    print(f"{q.size()=} {k.size()=} {cos.size()=} {sin.size()=} {position_ids.size()=}")
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos[:, :, -q_len:]) + (rotate_half(q) * sin[:, :, -q_len:])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
@@ -859,39 +829,20 @@ class LlamaCustomAttention(LlamaAttention):
                Optional[Tuple[torch.Tensor]]]:
         with timer("attention_layer"):
             bsz, q_len, _ = hidden_states.size()
-            k_len = v_len = q_len
-            if self.config._use_umbc:
-                q_len = 1
             # assert hidden_states.dtype == torch.bfloat16
 
             with timer("layer.qkv_proj"):
-                # if we are using umbc, we do not want to compute the slot
-                # projections every time they are
-                if self.config._use_umbc and hidden_states.size(1) > 1:
-                    slots, hidden_states = \
-                            hidden_states[:, :self.config._umbc_slots], \
-                            hidden_states[:, self.config._umbc_slots:]
-
-                    query_states = self.q_proj(hidden_states[:, -1:])
-                    key_states = self.k_proj(hidden_states)
-                    value_states = self.v_proj(hidden_states)
-
-                    # query states will be a single query, kv states need the
-                    # pooled slots
-                    key_states = torch.cat((slots, key_states), dim=1)
-                    value_states = torch.cat((slots, value_states), dim=1)
-                else:
-                    query_states = self.q_proj(hidden_states)
-                    key_states = self.k_proj(hidden_states)
-                    value_states = self.v_proj(hidden_states)
+                query_states = self.q_proj(hidden_states)
+                key_states = self.k_proj(hidden_states)
+                value_states = self.v_proj(hidden_states)
 
                 query_states = query_states.view(bsz, q_len, self.num_heads,
                                                  self.head_dim).transpose(
                                                      1, 2)
-                key_states = key_states.view(bsz, k_len,
+                key_states = key_states.view(bsz, q_len,
                                              self.num_key_value_heads,
                                              self.head_dim).transpose(1, 2)
-                value_states = value_states.view(bsz, v_len,
+                value_states = value_states.view(bsz, q_len,
                                                  self.num_key_value_heads,
                                                  self.head_dim).transpose(
                                                      1, 2)
@@ -903,12 +854,8 @@ class LlamaCustomAttention(LlamaAttention):
                         kv_seq_len, self.layer_idx)
                 cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-                if self.config._use_umbc:
-                    query_states, key_states = apply_rotary_pos_emb_umbc(
-                        query_states, key_states, cos, sin, position_ids)
-                else:
-                    query_states, key_states = apply_rotary_pos_emb(
-                        query_states, key_states, cos, sin, position_ids)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, position_ids)
 
             with timer("layer.kv_update"):
                 if past_key_value is not None:
@@ -968,23 +915,18 @@ class LlamaCustomAttention(LlamaAttention):
                     value_states = value_states.contiguous()
 
                 with timer("layer.flash"):
-                    with torch.backends.cuda.sdp_kernel(
-                            enable_flash=True,
-                            enable_math=True,
-                            enable_mem_efficient=True,
-                    ):
-                        attn_output = torch.nn.functional.scaled_dot_product_attention(
-                            query_states,
-                            key_states,
-                            value_states,
-                            attn_mask=attention_mask,
-                            dropout_p=self.attention_dropout
-                            if self.training else 0.0,
-                            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d
-                            # that does not create a causal mask in case q_len == 1.
-                            is_causal=self.is_causal and attention_mask is None
-                            and q_len > 1,
-                        )
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        query_states,
+                        key_states,
+                        value_states,
+                        attn_mask=attention_mask,
+                        dropout_p=self.attention_dropout
+                        if self.training else 0.0,
+                        # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d
+                        # that does not create a causal mask in case q_len == 1.
+                        is_causal=self.is_causal and attention_mask is None
+                        and q_len > 1,
+                    )
                 if os.environ.get('CHECKOUT_STATES', '0') == '1':
                     os.makedirs('./cache/llama/', exist_ok=True)
                     torch.save(
@@ -1144,6 +1086,7 @@ class LlamaSdpaAttention(LlamaAttention):
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
     "flash_attention_2": LlamaFlashAttention2,
+    # "sdpa": LlamaSdpaAttention,
     "sdpa": LlamaCustomAttention,
 }
 
@@ -1234,15 +1177,7 @@ class LlamaDecoderLayer(nn.Module):
             residual = hidden_states
 
             with timer("decoder_layer.input_layernorm"):
-                if self.config._use_umbc:
-                    slots, hidden_states = \
-                            hidden_states[:, :self.config._umbc_slots], \
-                            hidden_states[:, self.config._umbc_slots:]
-
                 hidden_states = self.input_layernorm(hidden_states)
-
-                if self.config._use_umbc:
-                    hidden_states = torch.cat((slots, hidden_states), dim=1)
 
             with timer("decoder_layer.self_attn"):
                 # Self Attention
@@ -1255,11 +1190,6 @@ class LlamaDecoderLayer(nn.Module):
                     use_cache=use_cache,
                     **kwargs,
                 )
-                print(
-                    f"attention out: {hidden_states.size()=} {residual.size()=}"
-                )
-                if self.config._use_umbc:
-                    residual = residual[:, -hidden_states.size(1):]
                 hidden_states = residual + hidden_states
 
             # Fully Connected
@@ -1471,12 +1401,12 @@ class LlamaModel(LlamaPreTrainedModel):
             batch_size, seq_length = input_ids.shape[:2]
             if self.config._use_umbc:
                 seq_length = self.config._umbc_slots + min(
-                    self.config._umbc_slots, input_ids.shape[1])
+                    self.config._window, input_ids.shape[1])
         elif inputs_embeds is not None:
             batch_size, seq_length = inputs_embeds.shape[:2]
             if self.config._use_umbc:
                 seq_length = self.config._umbc_slots + min(
-                    self.config._umbc_slots, input_ids.shape[1])
+                    self.config._window, input_ids.shape[1])
         else:
             raise ValueError(
                 "You have to specify either input_ids or inputs_embeds")
@@ -1508,29 +1438,19 @@ class LlamaModel(LlamaPreTrainedModel):
                                         dtype=torch.long,
                                         device=device)
             position_ids = position_ids.unsqueeze(0)
-            # print(f"{position_ids=}")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         # ------------------------------------------------------
         # if we are doing the umbc model, pool everything here
-        # if hasattr(self, "sse"):
-        #     sse_out = self.sse(inputs_embeds)
-
-        #     cutoff = min(input_ids.shape[1], self.config._umbc_slots)
-        #     inputs_embeds = inputs_embeds[:, -cutoff:]
-
-        #     inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
         if hasattr(self, "sse"):
-            sse_out = self.sse.forward_mbc(inputs_embeds[:, -1:])
-            # sse_out = self.sse.forward(inputs_embeds)
+            sse_out = self.sse(inputs_embeds)
 
-            cutoff = min(input_ids.shape[1], self.config._umbc_slots)
+            cutoff = min(input_ids.shape[1], self.config._window)
             inputs_embeds = inputs_embeds[:, -cutoff:]
 
             inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
-            inputs_embeds.slots = self.config._umbc_slots
         # ------------------------------------------------------
 
         if self._use_flash_attention_2:
@@ -1585,7 +1505,6 @@ class LlamaModel(LlamaPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
-            print(f"layer output: {hidden_states.size()=}")
 
             if use_cache:
                 next_decoder_cache = layer_outputs[
@@ -1723,16 +1642,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         logits = logits.float()
 
         loss = None
-        print(f"\n\n{labels=}\n\n")
         if labels is not None:
             # Shift so that tokens < n predict n
-            print(f"{logits.size()=} {labels.size()=}")
             if self.model.config._use_umbc:
                 logits, labels = logits[
                     ..., self.model.config._umbc_slots:, :], labels[
-                        ..., -self.model.config._umbc_slots:]
-
-            # print(f"{logits=}\n{labels=}")
+                        ..., -self.model.config._window:]
 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

@@ -2,6 +2,7 @@ import argparse
 from dataclasses import dataclass
 from typing import Literal, Optional
 
+
 @dataclass
 class ArgsType:
     model: Literal['llama32k', 'llama16b', 'qwen'] = 'llama32k'
@@ -18,9 +19,10 @@ class ArgsType:
     dense_queries: int = 0
     dense_layers: int = 3
 
+
 def eval_args(
-    default_model = 'llama32k',
-    default_job = 'ppl',
+    default_model='llama32k',
+    default_job='ppl',
 ) -> ArgsType:
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=default_model)
@@ -30,14 +32,12 @@ def eval_args(
     parser.add_argument('--lora_r', type=int, default=32)
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--count', type=int, default=100)
-    parser.add_argument('--block_size_q', type=int, default=32)
-    parser.add_argument('--block_size_k', type=int, default=2)
     parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--k', type=int, default=512)
-    parser.add_argument('--dense_layers', type=int, default=3)
-    parser.add_argument('--dense_queries', type=int, default=2048)
     parser.add_argument('--input', type=str, default=None)
     parser.add_argument('--max_tokens', type=int, default=512)
+    parser.add_argument('--slots', default=32, type=int)
+    parser.add_argument('--window', default=256, type=int)
+
     args = parser.parse_args()
     print(args)
     return args

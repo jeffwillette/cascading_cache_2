@@ -1,5 +1,6 @@
 import gc
 import os
+from lightning.pytorch.strategies import DDPStrategy
 import copy
 from dataclasses import asdict, dataclass
 from os import PathLike
@@ -42,16 +43,10 @@ from torch.utils.data import DataLoader, random_split
 
 torch.set_float32_matmul_precision('high')
 
-# TODO:
-# - make the inputs on every inner ieration have length one
-# - make the train time kv cache for the transformer so it can accept input size of 1
-#  - it should store teh kv values after proejction (if possible without retain graph)
-#  - if we need to call retain graph, then we can accumulate for a while with retain and then periodically clear the graph and the cache
-# - make sure that the randomness is seeded on every iteration of the inner loop
-
 
 @dataclass
 class TrainConfig:
+    dev_run: bool = False
     disable_kd: bool = False
     using_fsdp: bool = False
     lr: float = 5e-5
@@ -60,20 +55,20 @@ class TrainConfig:
     lora_r: int = 32
     save_steps: int = 100
     dense_queries: int = None
-    seq_len: int = 2048
+    seq_len: int = 1024
     max_steps: int = -1
-    model_checkpoint_dir: str = "./saves/dev/checkpoint"
+    model_checkpoint_dir: str = "./checkpoint"
     dataset: str = 'wikitext2'
     load_from_checkpoint: str = None
     k: int = 512
     slots: int = 32
-    umbc: bool = False
     block_size_q: int = 8
     block_size_k: int = 8
     init_from_checkpoint: str = None
     method: str = 'none'
     model: str = 'qwen500m'
     disable_global_context: bool = False
+    window: int = 256
 
 
 class LabDataModule(pl.LightningDataModule):
@@ -119,6 +114,11 @@ class LabDataModule(pl.LightningDataModule):
             raise Exception()
 
     def setup(self, stage: str):
+        # safe to call this again because data will not be double downloaded
+        # this needs to be called here in order to get called on every device
+        # https://lightning.ai/docs/pytorch/stable/data/datamodule.html#prepare-data
+        self.prepare_data()
+
         if self.config.dataset in ['wikitext2', 'wikitext103']:
             if stage == "fit" or stage is None:
                 test_size = min(100, len(self.dataset) * (1 - self.train_size))
@@ -167,18 +167,18 @@ class LabDataModule(pl.LightningDataModule):
 def load_model(
     train_config: TrainConfig = None,
     method='timber',
-    device='cuda:0',
+    device='cpu',
 ):
     if train_config.using_fsdp:
         device = 'cpu'
 
     MODELS = {
         'llama32k': 'togethercomputer/LLaMA-2-7B-32K',
-        'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B-ShareGPT',
+        'llama1.3b-share-gpt': 'princeton-nlp/Sheared-LLaMA-1.3B-ShareGPT',
+        'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B',
         'llama13b': 'meta-llama/Llama-2-13b-hf',
         'qwen7b': 'Qwen/Qwen1.5-7B-Chat',
         'qwen14b': 'Qwen/Qwen1.5-14B-Chat',
-        'qwen500m': "Qwen/Qwen1.5-0.5b-Chat",
         'yi6b': '01-ai/Yi-6B-200K',
         'yi34b': '01-ai/Yi-34B-200K',
     }
@@ -187,22 +187,31 @@ def load_model(
 
     config = LlamaConfig.from_pretrained(model_id)
     config._attn_implementation = config.attn_implementation = 'sdpa'
-    config._use_umbc = train_config.umbc
+    config._use_umbc = train_config.method == "umbc"
     config._umbc_slots = train_config.slots
+    config._window = train_config.window
 
     quant_config = transformers.BitsAndBytesConfig(
-        # load_in_4bit=True,
         load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        # bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.float32,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         llm_int8_skip_modules=[
-            "sse_q", "sse_k", "sse_v", "slots", "norm_slots", "norm_after"
+            "sse_q",
+            "sse_k",
+            "sse_v",
+            "slots",
+            "norm_slots",
+            "norm_after",
+            # "input_layernorm",
+            # "post_attention_layernorm",
+            # "norm",
         ])
     if train_config.using_fsdp:
         quant_config = None
 
-    print(f"{quant_config=}")
+    # print(f"{quant_config=}")
 
     model = LlamaForCausalLM.from_pretrained(
         model_id,
@@ -210,12 +219,13 @@ def load_model(
         device_map={"": device} if device != 'cpu' else 'cpu',
         load_in_4bit=quant_config is None,
         quantization_config=quant_config,
-        torch_dtype=torch.bfloat16,
+        # torch_dtype=torch.bfloat16,
+        # torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         low_cpu_mem_usage=True,
-        trust_remote_code=True,
     )
 
-    if train_config.umbc:
+    if train_config.method == "umbc":
         # bitsandbytes somehow did not ignore this module and I could never figure out why.
         # just reinit the parameters to get rid of large values and NaN's
         model.model.sse.slots.reset_parameters()
@@ -240,7 +250,7 @@ def load_model(
             else:
                 m._gradient_checkpointing_func = torch.utils.checkpoint.checkpoint
 
-    if method != "none":
+    if method not in ["none", "umbc"]:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -301,135 +311,109 @@ class LabModule(pl.LightningModule):
     def __init__(self, config: TrainConfig):
         super().__init__()
 
-        tconfig = copy.deepcopy(config)
-        tconfig.umbc = False
-
-        sconfig = copy.deepcopy(config)
-        if config.umbc:
-            sconfig.seq_len = config.slots * 2
-
-        self.model = load_model(train_config=sconfig, method=config.method)
-        if not config.disable_kd:
-            self.teacher = load_model(train_config=tconfig, method='none')
-        else:
-            self.teacher = None
-
         self.validation_preds = []
         self.validation_targets = []
 
         self.config = config
-        self.automatic_optimization = False
 
-    def forward(self, inputs, target, output_hidden_states=False):
-        return self.model(inputs,
-                          labels=target,
-                          output_hidden_states=output_hidden_states)
+    def forward(
+        self,
+        inputs,
+        target,
+        output_hidden_states=False,
+        position_ids=None,
+    ):
+        return self.model(
+            inputs,
+            labels=target,
+            output_hidden_states=output_hidden_states,
+            position_ids=position_ids,
+        )
 
-    def inner_step_umbc(self, full_inputs, full_target, output_teacher):
-        total_loss, total_kd_hidden, total_kd_logits = 0, 0, 0
-        for i in range(self.config.seq_len):
-            cutoff = min(i, self.config.slots - 1)
-            start, end = i - cutoff, i + 1
-            print(f"\n\n{cutoff=} {start=} {end=}\n\n")
+    def step_umbc(self, full_inputs, full_target, output_teacher):
+        i = torch.randint(8, self.config.seq_len + 1, size=(1, )).item()
+        cutoff = min(i, self.config.window - 1)
+        start, end = i - cutoff, i + 1
+        # print(f"\n\n{cutoff=} {start=} {end=}\n\n")
 
-            inputs = full_inputs[:, :end]
-            target = full_target[:, :end]
+        inputs = full_inputs[:, :end]
+        target = full_target[:, :end]
 
-            # print(
-            #     f"\n\n\niteration: {i} {inputs.size()=} {target.size()=}\n\n\n"
-            # )
+        # print(
+        #     f"\n\n\niteration: {i} {inputs.size()=} {target.size()=}\n\n\n"
+        # )
 
-            output = self(inputs,
-                          target,
-                          output_hidden_states=not self.config.disable_kd)
-
-            logits = output.logits
-            target = target[:, start:end]
-
-            # print(
-            #     f"sanity check logits in trainer: {logits.size()=} {target.size()=}"
-            # )
-            loss_model = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]).to(torch.float32),
-                target.reshape(-1))
-
-            loss_kd_hidden, loss_kd_logits = 0, 0
-            if not self.config.disable_kd:
-                for teacher_layer, student_layer in zip(
-                        output_teacher.hidden_states, output.hidden_states):
-
-                    # print(
-                    #     f"sanity check student and teacher layer before slicing: {student_layer.size()=} {teacher_layer.size()=} {cutoff=}"
-                    # )
-                    student_layer = student_layer[:, -(cutoff + 1):]
-                    teacher_layer = teacher_layer[:, start:end]
-                    # print(
-                    #     f"sanity check student and teacher layer: {student_layer.size()=} {teacher_layer.size()=}"
-                    # )
-
-                    loss_kd_hidden += torch.nn.functional.mse_loss(
-                        student_layer.to(torch.float32),
-                        teacher_layer.to(torch.float32))
-                loss_kd_hidden = loss_kd_hidden / len(
-                    output_teacher.hidden_states)
-
-                # output logits were already truncated within the model
-                # print(
-                #     f"sanity check out logits kd (before slicing): {output_teacher.logits.size()=} {output.logits.size()}"
-                # )
-                teacher_logits = output_teacher.logits[:, start:end]
-                # print(
-                #     f"sanity check out logits kd: {teacher_logits.size()=} {output.logits.size()}"
-                # )
-
-                loss_kd_logits = torch.nn.functional.kl_div(
-                    output.logits.reshape(-1, logits.shape[-1]).to(
-                        torch.float32).log_softmax(-1),
-                    teacher_logits.reshape(-1, logits.shape[-1]).to(
-                        torch.float32).softmax(-1),
-                    reduction='batchmean',
-                )
-
-            if not self.config.disable_kd:
-                print(
-                    f"{loss_model.item()=} {loss_kd_hidden.item()=} {loss_kd_logits.item()=}"
-                )
-                loss = loss_model * 0.1 + (loss_kd_hidden +
-                                           loss_kd_logits) * 2.5
-            else:
-                print(f"{loss_model.item()=}")
-                loss = loss_model
-
-            loss = loss / self.config.seq_len
-            self.manual_backward(loss)
-            total_loss += loss_model.detach() / self.config.seq_len
-            total_kd_hidden += loss_kd_hidden.detach() / self.config.seq_len
-            total_kd_logits += loss_kd_logits.detach() / self.config.seq_len
-
-        self.model.model.model.sse.post_forward_mbc_cleanup()
-        # self.log("training/loss_model", loss_model.item())
-        # if not self.config.disable_kd:
-        #     if loss_kd_hidden > 0:
-        #         self.log("training/loss_kd_hidden", loss_kd_hidden.item())
-        #     if loss_kd_logits > 0:
-        #         self.log("training/loss_kd_logits", loss_kd_logits.item())
-        # self.log("training/loss", loss.item())
-
-        return total_loss
-
-    def step_plain(self, inputs, target, output_teacher):
         output = self(inputs,
                       target,
                       output_hidden_states=not self.config.disable_kd)
-        logits = output.logits
 
-        loss_model = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).to(torch.float32),
-            target.reshape(-1))
-
-        loss_kd_hidden = 0
-        loss_kd_logits = 0
+        loss_kd_hidden, loss_kd_logits = 0, 0
         if not self.config.disable_kd:
+            logits = output.logits
+            target = target[:, start:end]
+
+            for teacher_layer, student_layer in zip(
+                    output_teacher.hidden_states, output.hidden_states):
+
+                # print(
+                #     f"sanity check student and teacher layer before slicing: {student_layer.size()=} {teacher_layer.size()=} {cutoff=}"
+                # )
+                student_layer = student_layer[:, -(cutoff + 1):]
+                teacher_layer = teacher_layer[:, start:end]
+                # print(
+                #     f"sanity check student and teacher layer: {student_layer.size()=} {teacher_layer.size()=}"
+                # )
+
+                loss_kd_hidden += torch.nn.functional.mse_loss(
+                    student_layer.to(torch.float32),
+                    teacher_layer.to(torch.float32))
+            loss_kd_hidden = loss_kd_hidden / len(output_teacher.hidden_states)
+
+            # output logits were already truncated within the model
+            # print(
+            #     f"sanity check out logits kd (before slicing): {output_teacher.logits.size()=} {output.logits.size()}"
+            # )
+            teacher_logits = output_teacher.logits[:, start:end]
+            # print(
+            #     f"sanity check out logits kd: {teacher_logits.size()=} {output.logits.size()}"
+            # )
+
+            # print(
+            #     f"{output.logits.size()=} {logits.size()=} {teacher_logits.size()=}"
+            # )
+
+            loss_kd_logits = torch.nn.functional.kl_div(
+                output.logits.reshape(-1, logits.shape[-1]).to(
+                    torch.float32).log_softmax(-1),
+                teacher_logits.reshape(-1, logits.shape[-1]).to(
+                    torch.float32).softmax(-1),
+                reduction='batchmean',
+            )
+
+        loss = output.loss
+        if not self.config.disable_kd:
+            loss = loss * 0.1 + (loss_kd_hidden + loss_kd_logits) * 2.5
+
+        self.log_losses(loss, output.loss, loss_kd_hidden, loss_kd_logits)
+        return loss
+
+    def log_losses(self, total, ce, kd_hidden=None, kd_logits=None):
+        self.log("train_loss_model", ce.item())
+        if not self.config.disable_kd:
+            if kd_hidden > 0:
+                self.log("train_loss_kd_hidden", kd_hidden.item())
+            if kd_logits > 0:
+                self.log("train_loss_kd_logits", kd_logits.item())
+        self.log("train_loss", total.item())
+
+    def step_plain(self, inputs, target, output_teacher=None):
+        output = self(inputs,
+                      target,
+                      output_hidden_states=not self.config.disable_kd)
+
+        loss_kd_hidden, loss_kd_logits = 0, 0
+        if not self.config.disable_kd:
+            logits = output.logits
             for teacher_layer, student_layer in zip(
                     output_teacher.hidden_states, output.hidden_states):
 
@@ -446,137 +430,108 @@ class LabModule(pl.LightningModule):
                 reduction='batchmean',
             )
 
+        loss = output.loss
         if not self.config.disable_kd:
-            loss = loss_model * 0.1 + (loss_kd_hidden + loss_kd_logits) * 2.5
-        else:
-            loss = loss_model
+            loss = loss * 0.1 + (loss_kd_hidden + loss_kd_logits) * 2.5
 
-        self.log("train_loss_model", loss_model.item())
-        if not self.config.disable_kd:
-            if loss_kd_hidden > 0:
-                self.log("train_loss_kd_hidden", loss_kd_hidden.item())
-            if loss_kd_logits > 0:
-                self.log("train_loss_kd_logits", loss_kd_logits.item())
-        self.log("train_loss", loss.item())
-
-        self.manual_backward(loss)
-        return loss.detach()
-
-    def training_step(self, batch, batch_idx):
-        if self.training:
-            opt = self.optimizers()
-
-        if self.teacher is not None:
-            self.teacher.eval()
-        self.model.train()
-
-        inputs, target = batch
-
-        if not self.config.disable_kd:
-            with torch.no_grad():
-                output_teacher = self.teacher(
-                    inputs, output_hidden_states=not self.config.disable_kd)
-
-        if self.config.umbc:
-            loss = self.inner_step_umbc(inputs, target, output_teacher)
-        else:
-            loss = self.step_plain(inputs, target, output_teacher)
-
-        if self.training and (batch_idx +
-                              1) % self.config.accumulation_steps == 0:
-            opt.step()
-            opt.zero_grad()
-
+        self.log_losses(loss, output.loss, loss_kd_hidden, loss_kd_logits)
         return loss
 
-    def training_step_cuda_graph(self, batch, batch_idx):
-        inputs, target = batch
-
-        if self.training:
-            opt = self.optimizers()
-
+    def training_step(self, batch, batch_idx):
         if self.teacher is not None:
             self.teacher.eval()
         self.model.train()
 
+        inputs, target = batch
+        output_teacher = None
         if not self.config.disable_kd:
             with torch.no_grad():
                 output_teacher = self.teacher(
                     inputs, output_hidden_states=not self.config.disable_kd)
 
-        if batch_idx == 0:
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                for i in range(2):
-                    opt.zero_grad(set_to_none=True)
-                    _ = self.inner_step_umbc(inputs, target, output_teacher)
-                    opt.step()
-            torch.cuda.current_stream().wait_stream(s)
+        if self.config.method == "umbc":
+            loss = self.step_umbc(inputs, target, output_teacher)
+            return loss
 
-            # capture
-            self.g = torch.cuda.CUDAGraph()
-            self.inputs = inputs
-            self.target = target
-            self.output_teacher = output_teacher
-            # Sets grads to None before capture, so backward() will create
-            # .grad attributes with allocations from the graph's private pool
-            opt.zero_grad(set_to_none=True)
-            with torch.cuda.graph(self.g):
-                _ = self.inner_step_umbc(self.inputs, self.target,
-                                         self.output_teacher)
-                opt.step()
-
-        if self.config.umbc:
-            self.inputs.copy_(inputs)
-            self.target.copy_(target)
-            self.output_teacher.copy_(output_teacher)
-            self.g.replay()
-        else:
-            loss = self.step_plain(inputs, target, output_teacher)
-
-        if self.training and (batch_idx +
-                              1) % self.config.accumulation_steps == 0:
-            opt.step()
-            opt.zero_grad()
-
+        loss = self.step_plain(inputs, target)
         return loss
 
     def validation_step(self, batch, batch_idx):
         self.model.eval()
 
         inputs, target = batch
-        with torch.no_grad():  #, torch.autocast('cuda', torch.bfloat16):
-            # print('asdfasdf', inputs.shape, target.shape, flush=True)
 
-            output = self(inputs, target).logits
-            if self.config.umbc:
-                target = target[:, -self.config.slots:]
-            loss = torch.nn.functional.cross_entropy(
-                output.reshape(-1, output.shape[-1]), target.reshape(-1))
+        if self.config.method == "umbc":
+            with torch.no_grad():
+                output_logits = torch.zeros(inputs.size(0),
+                                            inputs.size(1),
+                                            32000,
+                                            device=inputs.device)
+
+                for i in range(self.config.seq_len):
+                    cutoff = min(i, self.config.window - 1)
+                    start, end = i - cutoff, i + 1
+                    # print(f"\n\n{cutoff=} {start=} {end=}\n\n")
+
+                    _inputs = inputs[:, :end]
+                    _target = target[:, start:end]
+
+                    output = self(_inputs, _target)
+                    output_logits[:, i] = output.logits[:, -1]
+
+                logits = output_logits[:, :-1].reshape(-1,
+                                                       output_logits.size(-1))
+                t = target[:, 1:].reshape(-1)
+                loss = torch.nn.functional.cross_entropy(logits, t)
+
+        else:
+            with torch.no_grad():
+                output = self(inputs, target)
+                loss, output_logits = output.loss, output.logits
+
+        # evaluate both regular models and our model only on the last part of the windo
         self.log("val/loss", loss.item())
 
-        self.model.model.model.sse.post_forward_mbc_cleanup()
-        self.validation_preds.append(output.cpu())
-        self.validation_targets.append(target.cpu())
+        self.validation_preds.append(output_logits[:, :-1].cpu())
+        self.validation_targets.append(target[:, 1:].cpu())
 
     def on_validation_epoch_end(self):
         from torchmetrics.text.perplexity import Perplexity
         with torch.no_grad():
-            device = 'cpu'
-            if self.config.using_fsdp:
-                device = 'cuda'
-            calculator = Perplexity(ignore_index=-100).to(device)
+
+            device = f"cuda:{self.local_rank}"
+            # device = 'cpu'
+            # if self.config.using_fsdp:
+            #     device = 'cuda'
+            calculator = Perplexity().to(device)
             for preds, target in zip(self.validation_preds,
                                      self.validation_targets):
                 calculator.update(preds.to(device), target.to(device))
             ppl = calculator.compute()
         ppl = ppl.item()
-        print('val/ppl', ppl)
         self.log("val/ppl", ppl)
 
         self.validation_preds.clear()
         self.validation_targets.clear()
+
+    def setup(self, stage):
+        if stage == "fit":
+            tconfig = copy.deepcopy(self.config)
+            tconfig.method = "none"
+
+            sconfig = copy.deepcopy(self.config)
+            if self.config.method == "umbc":
+                sconfig.seq_len = self.config.slots + self.config.window
+
+            self.model = load_model(train_config=sconfig,
+                                    method=sconfig.method,
+                                    device=self.local_rank)
+            if not self.config.disable_kd:
+                self.teacher = load_model(train_config=tconfig,
+                                          method='none',
+                                          device=self.local_rank)
+            else:
+                self.teacher = None
 
     def configure_optimizers(self):
         params = []
@@ -591,10 +546,11 @@ class LabModule(pl.LightningModule):
 
 
 def main(config: TrainConfig):
-    os.makedirs('./saves/dev/checkpoint', exist_ok=True)
+    os.makedirs(config.model_checkpoint_dir, exist_ok=True)
 
+    d = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
     if config.using_fsdp:
-        devices = "1"
+        devices = f"{d}"
         policy = {LlamaDecoderLayer}
         # strategy = FSDPStrategy(
         #     auto_wrap_policy=policy,
@@ -622,15 +578,16 @@ def main(config: TrainConfig):
         }
         strategy = DeepSpeedStrategy(config=deepspeed_config)
     else:
-        devices = "1"
-        strategy = "auto"
+        devices = f"{d}"
+        strategy = DDPStrategy(find_unused_parameters=False, static_graph=True)
+        # strategy = "ddp_find_unused_parameters_false"
 
     if config.method == 'timber':
         filename = f'llama32k-{config.dataset}-{config.seq_len}-bq{config.block_size_q}-bk{config.block_size_k}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'none':
         filename = f'llama32k-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
     elif config.method == 'umbc':
-        filename = f'qwen500m-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
+        filename = f'llama1.3b-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
     elif config.method == 'reformer':
         filename = f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'performer':
@@ -655,13 +612,16 @@ def main(config: TrainConfig):
         devices=devices,
         accelerator="gpu",
         strategy=strategy,
-        precision=16,
+        # precision="bf16-mixed",
+        precision="16-mixed",
         default_root_dir=config.model_checkpoint_dir,
-        # accumulate_grad_batches=config.accumulation_steps,
+        accumulate_grad_batches=config.accumulation_steps,
         max_epochs=20,
+        check_val_every_n_epoch=20,
         max_steps=config.max_steps,
         logger=AimLogger(experiment="umbc-llm"),
         enable_checkpointing=True,
+        fast_dev_run=config.dev_run,
         callbacks=[checkpoint_callback],
     )
 
@@ -688,7 +648,7 @@ if __name__ == "__main__":
     parser.add_argument('--model', default='llama32k', type=str)
     parser.add_argument('--using_fsdp', action='store_true')
     parser.add_argument('--disable_kd', action='store_true')
-    parser.add_argument('--umbc', action='store_true')
+    parser.add_argument('--dev_run', action='store_true')
     parser.add_argument('--disable_global_context', action='store_true')
     parser.add_argument('--gradient_accumulation_steps', default=-1, type=int)
     parser.add_argument('--batch_size', default=-1, type=int)
@@ -701,14 +661,16 @@ if __name__ == "__main__":
     parser.add_argument('--init_checkpoint', default=None, type=str)
     parser.add_argument('--checkpoint', default=None, type=str)
     parser.add_argument('--k', default=512, type=int)
-    parser.add_argument('--slots', default=512, type=int)
+    parser.add_argument('--slots', default=32, type=int)
     parser.add_argument('--block_size_q', default=16, type=int)
     parser.add_argument('--block_size_k', default=2, type=int)
     parser.add_argument('--method', default='umbc', type=str)
+    parser.add_argument('--window', default=256, type=int)
 
     args = parser.parse_args()
 
     train_config = TrainConfig(
+        dev_run=args.dev_run,
         using_fsdp=args.using_fsdp,
         disable_kd=args.disable_kd,
         dataset=args.dataset,
@@ -719,7 +681,8 @@ if __name__ == "__main__":
         method=args.method,
         model=args.model,
         disable_global_context=args.disable_global_context,
-        umbc=args.umbc,
+        window=args.window,
+        slots=args.slots,
     )
     if args.gradient_accumulation_steps > 0:
         train_config.accumulation_steps = args.gradient_accumulation_steps

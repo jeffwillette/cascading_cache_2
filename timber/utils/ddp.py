@@ -8,6 +8,7 @@ ddp_rank = 0
 ddp_world_size = 1
 ddp_disabled = False
 
+
 def setup(rank, world_size, port):
     global ddp_rank, ddp_world_size
 
@@ -20,8 +21,10 @@ def setup(rank, world_size, port):
     ddp_rank = rank
     ddp_world_size = world_size
 
+
 def cleanup():
     dist.destroy_process_group()
+
 
 def spawn(entry, args=(), n_gpus=None, join=True):
     """
@@ -38,8 +41,12 @@ def spawn(entry, args=(), n_gpus=None, join=True):
         entry(0, 1, port, *args)
     elif n_gpus > 1:
         print(f'DDP: Setup DDP with {n_gpus} devices')
-        mp.spawn(entry,
-            args=(n_gpus, port,)+tuple(args),
+        mp.spawn(
+            entry,
+            args=(
+                n_gpus,
+                port,
+            ) + tuple(args),
             nprocs=n_gpus,
             daemon=False,
             join=join,
@@ -47,12 +54,15 @@ def spawn(entry, args=(), n_gpus=None, join=True):
     else:
         raise Exception('no gpu')
 
+
 def barrier():
     return dist.barrier()
 
+
 def printable():
     global ddp_disabled, ddp_rank, ddp_world_size
-    return ddp_world_size == 1 or (ddp_rank==0) or ddp_disabled
+    return ddp_world_size == 1 or (ddp_rank == 0) or ddp_disabled
+
 
 def wrap_model(model, find_unused_paramters=False):
     global ddp_rank, ddp_world_size
@@ -60,16 +70,16 @@ def wrap_model(model, find_unused_paramters=False):
         return MimicDDP(model)
     else:
         print('DDP: Model wrapped', ddp_rank, find_unused_paramters)
-        return DDP(
-            model,
-            device_ids=[ddp_rank], 
-            find_unused_parameters=find_unused_paramters
-        )
+        return DDP(model,
+                   device_ids=[ddp_rank],
+                   find_unused_parameters=find_unused_paramters)
+
 
 class MimicDDP(nn.Module):
+
     def __init__(self, module) -> None:
         super().__init__()
         self.module = module
-    
+
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)

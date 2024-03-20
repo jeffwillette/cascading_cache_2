@@ -244,5 +244,7 @@ if __name__ == '__main__':
     loader = get_dataloader('valid', t, batch_size=1, max_length=768)
 
     for batch in tqdm.tqdm(loader):
+        ids, labels = batch["input_ids"], batch["labels"]
+        print(f"wikitext 2: {ids=} {labels=}")
         # print([(k, v.shape) for k, v in batch.items()])
         pass
