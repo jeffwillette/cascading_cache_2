@@ -779,7 +779,7 @@ class LlamaFlashAttention2(LlamaAttention):
         )
 
 
-class LlamaCustomAttention(LlamaAttention):
+class LlamaUMBCAttention(LlamaAttention):
 
     def __init__(self, config: LlamaConfig, layer_idx=None):
         super().__init__(config, layer_idx)
@@ -794,27 +794,125 @@ class LlamaCustomAttention(LlamaAttention):
         self.tree_dense_layers = []
         self.tree_high_k_layers = {}
 
-        # from reformer_pytorch import LSHAttention
-        # self.tree_reformer = LSHAttention(
-        #     dropout=config.attention_dropout,
-        #     bucket_size=self.tree_k,
-        #     n_hashes=8,
-        #     causal=True,
-        # )
+    # Adapted from LlamaAttention.forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional["TimberCache"] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        with timer("attention_layer"):
+            bsz, q_len, _ = hidden_states.size()
+            # assert hidden_states.dtype == torch.bfloat16
 
-        # from performer_pytorch import FastAttention
-        # if not os.environ.get('IGNORE_PERFORMER', '1') == '1':
-        #     dim_heads = config.hidden_size // config.num_attention_heads
-        #     default_dtype = torch.get_default_dtype()
-        #     torch.set_default_dtype(torch.float32)
-        #     self.tree_performer = FastAttention(
-        #         dim_heads=dim_heads,
-        #         nb_features=int(dim_heads *
-        #                         (dim_heads**0.5)),  # NOTE: this may lead OOM
-        #         # nb_features=dim_heads,
-        #         causal=True,
-        #     )
-        #     torch.set_default_dtype(default_dtype)
+            with timer("layer.qkv_proj"):
+                # hidden states contains sliding window
+                # sse out contains a pooling of all tokens inside and out of the window
+                # queries
+                raise NotImplementedError(
+                    "this implementation was abandoned, fix up if you want to reuse"
+                )
+                q, kv = hidden_states[:, :1], hidden_states[:, 1:]
+
+                query_states = self.q_proj(q)
+                key_states = self.k_proj(kv)
+                value_states = self.v_proj(kv)
+
+                query_states = query_states.view(bsz, q_len, self.num_heads,
+                                                 self.head_dim).transpose(
+                                                     1, 2)
+                key_states = key_states.view(bsz, q_len,
+                                             self.num_key_value_heads,
+                                             self.head_dim).transpose(1, 2)
+                value_states = value_states.view(bsz, q_len,
+                                                 self.num_key_value_heads,
+                                                 self.head_dim).transpose(
+                                                     1, 2)
+
+            with timer("layer.rope"):
+                kv_seq_len = key_states.shape[-2]
+                if past_key_value is not None:
+                    kv_seq_len += past_key_value.get_usable_length(
+                        kv_seq_len, self.layer_idx)
+                cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, position_ids)
+
+            with timer("layer.kv_update"):
+                if past_key_value is not None:
+                    cache_kwargs = {
+                        "sin": sin,
+                        "cos": cos
+                    }  # Specific to RoPE models
+                    key_states, value_states = past_key_value.update(
+                        key_states, value_states, self.layer_idx, cache_kwargs)
+
+                key_states = repeat_kv(key_states, self.num_key_value_groups)
+                value_states = repeat_kv(value_states,
+                                         self.num_key_value_groups)
+
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    )
+
+            # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+            # Reference: https://github.com/pytorch/pytorch/issues/112577.
+            if query_states.device.type == "cuda" and attention_mask is not None:
+                query_states = query_states.contiguous()
+                key_states = key_states.contiguous()
+                value_states = value_states.contiguous()
+
+            with timer("layer.flash"):
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=attention_mask,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d
+                    # that does not create a causal mask in case q_len == 1.
+                    is_causal=self.is_causal and attention_mask is None
+                    and q_len > 1,
+                )
+            if os.environ.get('CHECKOUT_STATES', '0') == '1':
+                os.makedirs('./cache/llama/', exist_ok=True)
+                torch.save(
+                    {
+                        'q': query_states,
+                        'k': key_states,
+                        'v': value_states,
+                        'out': attn_output,
+                    }, './cache/llama/qkvout.pth')
+                input('stored. press enter to continue >>> ')
+
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            attn_output = self.o_proj(attn_output)
+
+            return attn_output, None, past_key_value
+
+
+class LlamaCustomAttention(LlamaAttention):
+
+    def __init__(self, config: LlamaConfig, layer_idx=None):
+        super().__init__(config, layer_idx)
+
+        self.attention_method = 'none'
+        self.tree_k = 512
+        self.tree_block_size_q = 8
+        self.tree_block_size_k = 1
+        self.tree_using_context_avg = True
+        self.tree_dense_queries = 2048
+        self.tree_last_dense_queries = None
+        self.tree_dense_layers = []
+        self.tree_high_k_layers = {}
 
     # Adapted from LlamaAttention.forward
     def forward(
@@ -1087,6 +1185,7 @@ LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
     "flash_attention_2": LlamaFlashAttention2,
     # "sdpa": LlamaSdpaAttention,
+    "umbc": LlamaUMBCAttention,
     "sdpa": LlamaCustomAttention,
 }
 
@@ -1344,7 +1443,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size,
                                          self.padding_idx)
 
-        if self.config._use_umbc:
+        if hasattr(self.config, "_use_umbc") and self.config._use_umbc:
             self.sse = SlotSetEncoder(
                 K=config._umbc_slots,
                 dim=config.hidden_size,
@@ -1392,6 +1491,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        def mbc_seq_len():
+            if input_ids.size(1) < self.config._window:
+                return input_ids.size(1)
+
+            return self.config._umbc_slots + self.config._window
+
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError(
@@ -1399,14 +1504,12 @@ class LlamaModel(LlamaPreTrainedModel):
             )
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape[:2]
-            if self.config._use_umbc:
-                seq_length = self.config._umbc_slots + min(
-                    self.config._window, input_ids.shape[1])
+            if hasattr(self.config, "_use_umbc") and self.config._use_umbc:
+                seq_length = mbc_seq_len()
         elif inputs_embeds is not None:
             batch_size, seq_length = inputs_embeds.shape[:2]
-            if self.config._use_umbc:
-                seq_length = self.config._umbc_slots + min(
-                    self.config._window, input_ids.shape[1])
+            if hasattr(self.config, "_use_umbc") and self.config._use_umbc:
+                seq_length = mbc_seq_len()
         else:
             raise ValueError(
                 "You have to specify either input_ids or inputs_embeds")
@@ -1444,13 +1547,27 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # ------------------------------------------------------
         # if we are doing the umbc model, pool everything here
-        if hasattr(self, "sse"):
+        print(f"{inputs_embeds.size()=}")
+        sse_out = None
+        w = self.config._window
+        if hasattr(self, "sse") and inputs_embeds.size(1) >= w:
+            tokens = inputs_embeds[:, -w:]
+
             sse_out = self.sse(inputs_embeds)
+            inputs_embeds = torch.cat((tokens, sse_out), dim=1)
+            print(f"{sse_out.size()=}")
+            print(f"{inputs_embeds.size()=}")
 
-            cutoff = min(input_ids.shape[1], self.config._window)
-            inputs_embeds = inputs_embeds[:, -cutoff:]
+            # cutoff = min(input_ids.shape[1], self.config._window)
+            # print(f"{inputs_embeds.size()=}")
+            # tokens = inputs_embeds[:, -cutoff:]
 
-            inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
+            # if cutoff == self.config_window:
+            #     sse_inputs = inputs_embeds[:, :-cutoff]
+            #     sse_out = self.sse(sse_inputs)
+
+            # inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
+            # print(f"inputs_embeds after umbc: {inputs_embeds.size()=}")
         # ------------------------------------------------------
 
         if self._use_flash_attention_2:
@@ -1644,10 +1761,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
-            if self.model.config._use_umbc:
-                logits, labels = logits[
-                    ..., self.model.config._umbc_slots:, :], labels[
-                        ..., -self.model.config._window:]
+            if hasattr(self.model.config, "_use_umbc"
+                       ) and self.model.config._use_umbc and input_ids.size(
+                           1) >= self.config._window:
+                logits, labels = logits[..., -2:, :], labels[..., -2:]
 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

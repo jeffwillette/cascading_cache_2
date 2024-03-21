@@ -309,6 +309,42 @@ class SlotSetEncoder(MBCFunction):
         S_hat = self.norm_after(S_hat)
         return S_hat  # type: ignore
 
+    def forward_cumulative(self, X: T, S: OT = None, mask: OT = None) -> T:
+        """
+        X: (B, S, D)
+        output: (B, S, K, D)
+
+        items are cumulatively pooled so that the last output element contains
+        information from every element in the sequence.
+        """
+        B, T, D = X.size()
+
+        X = X.view(B * T, 1, D)
+
+        if mask is not None:
+            raise NotImplementedError(
+                "masking has not been implemented for umbc cumulative")
+
+        S, W, V = self.get_attn_v(X, S=S)
+        # W: (B * S, H, K, 1), C: (B * S, H, K, 1), V: (B * S, H, 1, D//H)
+
+        W = W.view(B, T, self.heads, self.slots.K, 1)
+        V = V.view(B, T, self.heads, 1, D // self.heads)
+
+        W = W.softmax(dim=-2)  # softmax over the slots
+        C = W.cumsum(dim=1)  # cumulative normalization constant
+
+        A = W * V  # outer product: (B, T, H, K, D//H)
+        A = A.cumsum(dim=1)
+        S_hat = A / (C + self.eps)
+
+        S_hat = S_hat.transpose(2,
+                                3)  # (B, T, H, K, D//H) --> (B, T, K, H, D//H)
+        S_hat = S_hat.reshape(B, T, self.slots.K, D)
+
+        S_hat = self.norm_after(S_hat)
+        return S_hat  # type: ignore
+
     def forward_mbc(
         self,
         X: T,
@@ -381,6 +417,13 @@ if __name__ == "__main__":
 
     x = torch.randn(32, 256, 128)
     out = sse(x)
+    out_cumulative = sse.forward_cumulative(x)
+    out_cumulative = out_cumulative[:, -1]
+
+    diff = (out - out_cumulative).abs().amax()
+    print(f"{out.size()=} {out_cumulative.size()=}")
+    print(f"max diff: {diff=}")
+
     out_mbc = sse.forward_mbc(x)
 
     diff = (out - out_mbc).abs().amax()

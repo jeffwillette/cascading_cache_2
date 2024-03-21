@@ -204,11 +204,11 @@ def evaluate_mmlu(args, model, tokenizer, subject_name):
             'accuracy': accuracy,
             'avg_seq_len': avg_seq_len,
             'elapsed': elapsed,
-            'k': args.k,
+             # 'k': args.k,
             'model': args.model,
-            'block_size_q': args.block_size_q,
-            'block_size_k': args.block_size_k,
-            'dense_queries': args.dense_queries,
+            # 'block_size_q': args.block_size_q,
+            # 'block_size_k': args.block_size_k,
+            # 'dense_queries': args.dense_queries,
             'results': results,
         }, f, indent=2)
         print('dumped', json_path)

@@ -193,7 +193,7 @@ def load_model(
 
     quant_config = transformers.BitsAndBytesConfig(
         load_in_4bit=True,
-        # bnb_4bit_compute_dtype=torch.bfloat16,
+        # bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_compute_dtype=torch.float32,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
@@ -331,64 +331,72 @@ class LabModule(pl.LightningModule):
         )
 
     def step_umbc(self, full_inputs, full_target, output_teacher):
-        i = torch.randint(8, self.config.seq_len + 1, size=(1, )).item()
-        cutoff = min(i, self.config.window - 1)
-        start, end = i - cutoff, i + 1
-        # print(f"\n\n{cutoff=} {start=} {end=}\n\n")
+        end = torch.randint(self.config.window,
+                            self.config.seq_len + 1,
+                            size=(1, )).item()
 
         inputs = full_inputs[:, :end]
         target = full_target[:, :end]
-
-        # print(
-        #     f"\n\n\niteration: {i} {inputs.size()=} {target.size()=}\n\n\n"
-        # )
 
         output = self(inputs,
                       target,
                       output_hidden_states=not self.config.disable_kd)
 
+        # TODO:
+        #  - remove _use_umbc from config because umbc should be controlled by the attention method setting
+        #  - fix all references to _use_umbc
+        #  - revert the training and attention back into the previous version where everything was pooled
+        #    and then attached into the attention values. It seems wasteful to compute all of that during training, 
+        #    but every other method seems to fail.
+        #  - if we go with the "pool everything" approach, then will test time caching work? What happes to the attention features at every layer.
+
+        #  - think about the triangle and rectangle in the notebook and decide where to start pooling and if it works for inference time
+
         loss_kd_hidden, loss_kd_logits = 0, 0
         if not self.config.disable_kd:
-            logits = output.logits
-            target = target[:, start:end]
-
-            for teacher_layer, student_layer in zip(
-                    output_teacher.hidden_states, output.hidden_states):
-
-                # print(
-                #     f"sanity check student and teacher layer before slicing: {student_layer.size()=} {teacher_layer.size()=} {cutoff=}"
-                # )
-                student_layer = student_layer[:, -(cutoff + 1):]
-                teacher_layer = teacher_layer[:, start:end]
-                # print(
-                #     f"sanity check student and teacher layer: {student_layer.size()=} {teacher_layer.size()=}"
-                # )
-
-                loss_kd_hidden += torch.nn.functional.mse_loss(
-                    student_layer.to(torch.float32),
-                    teacher_layer.to(torch.float32))
-            loss_kd_hidden = loss_kd_hidden / len(output_teacher.hidden_states)
-
-            # output logits were already truncated within the model
-            # print(
-            #     f"sanity check out logits kd (before slicing): {output_teacher.logits.size()=} {output.logits.size()}"
-            # )
-            teacher_logits = output_teacher.logits[:, start:end]
-            # print(
-            #     f"sanity check out logits kd: {teacher_logits.size()=} {output.logits.size()}"
-            # )
-
-            # print(
-            #     f"{output.logits.size()=} {logits.size()=} {teacher_logits.size()=}"
-            # )
-
-            loss_kd_logits = torch.nn.functional.kl_div(
-                output.logits.reshape(-1, logits.shape[-1]).to(
-                    torch.float32).log_softmax(-1),
-                teacher_logits.reshape(-1, logits.shape[-1]).to(
-                    torch.float32).softmax(-1),
-                reduction='batchmean',
+            raise NotImplementedError(
+                "changed the way this works. If you use this you need to redefine [start,cutoff]"
             )
+            # logits = output.logits
+            # target = target[:, start:end]
+
+            # for teacher_layer, student_layer in zip(
+            #         output_teacher.hidden_states, output.hidden_states):
+
+            #     # print(
+            #     #     f"sanity check student and teacher layer before slicing: {student_layer.size()=} {teacher_layer.size()=} {cutoff=}"
+            #     # )
+            #     student_layer = student_layer[:, -(cutoff + 1):]
+            #     teacher_layer = teacher_layer[:, start:end]
+            #     # print(
+            #     #     f"sanity check student and teacher layer: {student_layer.size()=} {teacher_layer.size()=}"
+            #     # )
+
+            #     loss_kd_hidden += torch.nn.functional.mse_loss(
+            #         student_layer.to(torch.float32),
+            #         teacher_layer.to(torch.float32))
+            # loss_kd_hidden = loss_kd_hidden / len(output_teacher.hidden_states)
+
+            # # output logits were already truncated within the model
+            # # print(
+            # #     f"sanity check out logits kd (before slicing): {output_teacher.logits.size()=} {output.logits.size()}"
+            # # )
+            # teacher_logits = output_teacher.logits[:, start:end]
+            # # print(
+            # #     f"sanity check out logits kd: {teacher_logits.size()=} {output.logits.size()}"
+            # # )
+
+            # # print(
+            # #     f"{output.logits.size()=} {logits.size()=} {teacher_logits.size()=}"
+            # # )
+
+            # loss_kd_logits = torch.nn.functional.kl_div(
+            #     output.logits.reshape(-1, logits.shape[-1]).to(
+            #         torch.float32).log_softmax(-1),
+            #     teacher_logits.reshape(-1, logits.shape[-1]).to(
+            #         torch.float32).softmax(-1),
+            #     reduction='batchmean',
+            # )
 
         loss = output.loss
         if not self.config.disable_kd:
@@ -442,6 +450,7 @@ class LabModule(pl.LightningModule):
             self.teacher.eval()
         self.model.train()
 
+        print("\n\n\n\n\nstarting training step\n\n\n\n\n")
         inputs, target = batch
         output_teacher = None
         if not self.config.disable_kd:
@@ -460,6 +469,7 @@ class LabModule(pl.LightningModule):
         self.model.eval()
 
         inputs, target = batch
+        print("\n\n\n\n\nstarting validation step\n\n\n\n\n")
 
         if self.config.method == "umbc":
             with torch.no_grad():
