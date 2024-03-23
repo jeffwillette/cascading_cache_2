@@ -187,7 +187,7 @@ def load_model(
 
     config = LlamaConfig.from_pretrained(model_id)
     config._attn_implementation = config.attn_implementation = 'sdpa'
-    config._use_umbc = train_config.method == "umbc"
+    config._umbc = train_config.method == "umbc"
     config._umbc_slots = train_config.slots
     config._window = train_config.window
 
@@ -319,21 +319,27 @@ class LabModule(pl.LightningModule):
     def forward(
         self,
         inputs,
-        target,
+        target=None,
         output_hidden_states=False,
         position_ids=None,
+        use_cache=False,
+        past_key_values=None,
     ):
         return self.model(
             inputs,
             labels=target,
             output_hidden_states=output_hidden_states,
             position_ids=position_ids,
+            use_cache=use_cache,
+            past_key_values=past_key_values,
         )
 
-    def step_umbc(self, full_inputs, full_target, output_teacher):
-        end = torch.randint(self.config.window,
-                            self.config.seq_len + 1,
-                            size=(1, )).item()
+    def step_umbc(self,
+                  full_inputs,
+                  full_target,
+                  output_teacher,
+                  subset="train"):
+        end = torch.randint(2, self.config.seq_len + 1, size=(1, )).item()
 
         inputs = full_inputs[:, :end]
         target = full_target[:, :end]
@@ -346,7 +352,7 @@ class LabModule(pl.LightningModule):
         #  - remove _use_umbc from config because umbc should be controlled by the attention method setting
         #  - fix all references to _use_umbc
         #  - revert the training and attention back into the previous version where everything was pooled
-        #    and then attached into the attention values. It seems wasteful to compute all of that during training, 
+        #    and then attached into the attention values. It seems wasteful to compute all of that during training,
         #    but every other method seems to fail.
         #  - if we go with the "pool everything" approach, then will test time caching work? What happes to the attention features at every layer.
 
@@ -402,19 +408,28 @@ class LabModule(pl.LightningModule):
         if not self.config.disable_kd:
             loss = loss * 0.1 + (loss_kd_hidden + loss_kd_logits) * 2.5
 
-        self.log_losses(loss, output.loss, loss_kd_hidden, loss_kd_logits)
+        self.log_losses(loss,
+                        output.loss,
+                        loss_kd_hidden,
+                        loss_kd_logits,
+                        subset="train")
         return loss
 
-    def log_losses(self, total, ce, kd_hidden=None, kd_logits=None):
-        self.log("train_loss_model", ce.item())
-        if not self.config.disable_kd:
-            if kd_hidden > 0:
-                self.log("train_loss_kd_hidden", kd_hidden.item())
-            if kd_logits > 0:
-                self.log("train_loss_kd_logits", kd_logits.item())
-        self.log("train_loss", total.item())
+    def log_losses(self,
+                   total,
+                   ce,
+                   kd_hidden=None,
+                   kd_logits=None,
+                   subset="train"):
+        self.log(f"{subset}_loss_model", ce.item())
+        # if not self.config.disable_kd:
+        #     if kd_hidden > 0:
+        #         self.log("train_loss_kd_hidden", kd_hidden.item())
+        #     if kd_logits > 0:
+        #         self.log("train_loss_kd_logits", kd_logits.item())
+        # self.log("train_loss", total.item())
 
-    def step_plain(self, inputs, target, output_teacher=None):
+    def step_plain(self, inputs, target, output_teacher=None, subset="train"):
         output = self(inputs,
                       target,
                       output_hidden_states=not self.config.disable_kd)
@@ -450,7 +465,6 @@ class LabModule(pl.LightningModule):
             self.teacher.eval()
         self.model.train()
 
-        print("\n\n\n\n\nstarting training step\n\n\n\n\n")
         inputs, target = batch
         output_teacher = None
         if not self.config.disable_kd:
@@ -459,18 +473,33 @@ class LabModule(pl.LightningModule):
                     inputs, output_hidden_states=not self.config.disable_kd)
 
         if self.config.method == "umbc":
-            loss = self.step_umbc(inputs, target, output_teacher)
+            loss = self.step_umbc(inputs,
+                                  target,
+                                  output_teacher,
+                                  subset="train")
             return loss
 
-        loss = self.step_plain(inputs, target)
+        loss = self.step_plain(inputs, target, subset="train")
         return loss
 
     def validation_step(self, batch, batch_idx):
         self.model.eval()
 
         inputs, target = batch
-        print("\n\n\n\n\nstarting validation step\n\n\n\n\n")
+        # output_teacher = None
+        # if not self.config.disable_kd:
+        #     with torch.no_grad():
+        #         output_teacher = self.teacher(
+        #             inputs, output_hidden_states=not self.config.disable_kd)
 
+        # if self.config.method == "umbc":
+        #     loss = self.step_umbc(inputs, target, output_teacher, subset="val")
+        #     return loss
+
+        # loss = self.step_plain(inputs, target, subset="val")
+        # return loss
+
+        past_key_values = None
         if self.config.method == "umbc":
             with torch.no_grad():
                 output_logits = torch.zeros(inputs.size(0),
@@ -479,15 +508,21 @@ class LabModule(pl.LightningModule):
                                             device=inputs.device)
 
                 for i in range(self.config.seq_len):
-                    cutoff = min(i, self.config.window - 1)
-                    start, end = i - cutoff, i + 1
+                    print(f"{i}", end=" ", flush=True)
                     # print(f"\n\n{cutoff=} {start=} {end=}\n\n")
 
-                    _inputs = inputs[:, :end]
-                    _target = target[:, start:end]
+                    _inputs = inputs[:, i:i + 1]
 
-                    output = self(_inputs, _target)
+                    output = self(
+                        _inputs,
+                        use_cache=True,
+                        past_key_values=past_key_values,
+                    )
                     output_logits[:, i] = output.logits[:, -1]
+                    past_key_values = output.past_key_values
+
+                    if i == 500:
+                        exit()
 
                 logits = output_logits[:, :-1].reshape(-1,
                                                        output_logits.size(-1))
@@ -589,7 +624,8 @@ def main(config: TrainConfig):
         strategy = DeepSpeedStrategy(config=deepspeed_config)
     else:
         devices = f"{d}"
-        strategy = DDPStrategy(find_unused_parameters=False, static_graph=True)
+        strategy = DDPStrategy(find_unused_parameters=False,
+                               static_graph=False)
         # strategy = "ddp_find_unused_parameters_false"
 
     if config.method == 'timber':
@@ -617,6 +653,14 @@ def main(config: TrainConfig):
     checkpoint_callback.CHECKPOINT_EQUALS_CHAR = '-'
     checkpoint_callback.FILE_EXTENSION = '.pth'
 
+    match config.dataset:
+        case "openwebtext":
+            check_val_every_n_epoch = 1000
+            val_check_interval = 20  # int means after 20 batches
+        case _:
+            check_val_every_n_epoch = 5
+            val_check_interval = 1.0  # float means after 100% of epoch
+
     trainer = pl.Trainer(
         log_every_n_steps=1,
         devices=devices,
@@ -624,10 +668,12 @@ def main(config: TrainConfig):
         strategy=strategy,
         # precision="bf16-mixed",
         precision="16-mixed",
+        # precision=32,
         default_root_dir=config.model_checkpoint_dir,
         accumulate_grad_batches=config.accumulation_steps,
         max_epochs=20,
-        check_val_every_n_epoch=20,
+        check_val_every_n_epoch=check_val_every_n_epoch,
+        val_check_interval=val_check_interval,
         max_steps=config.max_steps,
         logger=AimLogger(experiment="umbc-llm"),
         enable_checkpointing=True,

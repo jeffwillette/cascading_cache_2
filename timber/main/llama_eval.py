@@ -12,11 +12,10 @@ from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
 from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
 from timber.utils import seed, get_bench
-from attention_sinks import AutoModelForCausalLM as AutoModelAttentionSinkForCausalLM
 
 from timber.main.jobs.bench_single_layer import job_bench_single_layer
 from timber.main.jobs.ppl import job_ppl
-from timber.main.jobs.stream import job_stream
+# from timber.main.jobs.stream import job_stream
 from timber.main.jobs.mmlu import job_mmlu
 from timber.main.eval_args import eval_args, ArgsType
 
@@ -89,7 +88,7 @@ def load_model(args):
 
     config = LlamaConfig.from_pretrained(model_id)
     config._attn_implementation = config.attn_implementation = 'sdpa'
-    config._use_umbc = args.method == "umbc"
+    config._umbc = args.method == "umbc"
     config._umbc_slots = args.slots
     config._window = args.window
     infer_dtype = torch.float32
@@ -117,26 +116,14 @@ def load_model(args):
         trust_remote_code=True,
     )
 
-    if args.method in ["sink", "window"]:
-        sink_size = {"sink": 4, "window": 0}[args.method]
-        from_pretrained_kwargs["config"]._attn_implementation = "eager"
-
-        model = AutoModelAttentionSinkForCausalLM.from_pretrained(
-            model_id,
-            **from_pretrained_kwargs,
-            attention_sink_size=sink_size,
-            attention_sink_window_size=256,
-        )
-    else:
-        model = LlamaForCausalLM.from_pretrained(model_id,
-                                                 **from_pretrained_kwargs)
+    model = LlamaForCausalLM.from_pretrained(model_id,
+                                             **from_pretrained_kwargs)
 
     for m in model.modules():
         if hasattr(m, 'attention_method'):
             m.attention_method = args.method
 
-    if args.method not in ["none", "umbc", "sink"
-                           ] and args.checkpoint is not None:
+    if args.method not in ["none", "umbc"] and args.checkpoint is not None:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=True,
@@ -200,7 +187,8 @@ def main():
     if args.job == 'ppl':
         job_ppl(args, model, tokenizer, device)
     elif args.job == 'stream':
-        job_stream(args, model, tokenizer, device)
+        pass
+        # job_stream(args, model, tokenizer, device)
     elif args.job == 'mmlu':
         job_mmlu(args, model, tokenizer, device)
     elif args.job == 'bench_single_layer':

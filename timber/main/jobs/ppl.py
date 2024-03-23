@@ -61,7 +61,7 @@ def job_ppl(args, model, tokenizer, device):
                         # print(f"\n\n{cutoff=} {start=} {end=}\n\n")
 
                         _inputs = input_ids[:, :end]
-                        _target = target_ids[:, start:end]
+                        _target = target_ids[:, start:end+1]
 
                         output = model(_inputs, labels=_target)
                         output_logits[:, i] = output.logits[:, -1]

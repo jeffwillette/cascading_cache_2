@@ -244,9 +244,11 @@ class SlotSetEncoder(MBCFunction):
 
         # Normalization Term
         self.sqrt_dim = 1.0 / math.sqrt(dim // heads)
-        self.slots = Slots(K=K, h=dim, slot_type=slot_type)
 
-        self.sse_q = nn.Linear(dim, dim, bias=bias)
+        self.slots = nn.Embedding(K, dim)
+        # self.slots = Slots(K=K, h=dim, slot_type=slot_type)
+
+        # self.sse_q = nn.Linear(dim, dim, bias=bias)
         self.sse_v = nn.Linear(dim, dim, bias=bias)
         self.sse_k = nn.Linear(dim, dim, bias=bias)
 
@@ -255,14 +257,14 @@ class SlotSetEncoder(MBCFunction):
 
         self.norm_after = nn.LayerNorm(dim) if ln_after else nn.Identity()
 
-        self.register_buffer(
-            "x_prev",
-            torch.zeros(max_batch, self.heads, K, self.dim // self.heads))
-        self.register_buffer("c_prev", torch.zeros(max_batch, self.heads, K,
-                                                   1))
+        # self.register_buffer(
+        #     "x_prev",
+        #     torch.zeros(max_batch, self.heads, K, self.dim // self.heads))
+        # self.register_buffer("c_prev", torch.zeros(max_batch, self.heads, K,
+        #                                            1))
 
     def sample_s(self) -> T:
-        S = self.slots()
+        S = self.slots.weight.unsqueeze(0)
         S = self.norm_slots(S)
         return S
 
