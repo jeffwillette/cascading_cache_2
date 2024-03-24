@@ -3,6 +3,7 @@ import os
 from lightning.pytorch.strategies import DDPStrategy
 import copy
 from dataclasses import asdict, dataclass
+from torchmetrics.text.perplexity import Perplexity
 from os import PathLike
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -339,71 +340,17 @@ class LabModule(pl.LightningModule):
                   full_target,
                   output_teacher,
                   subset="train"):
-        end = torch.randint(2, self.config.seq_len + 1, size=(1, )).item()
-
-        inputs = full_inputs[:, :end]
-        target = full_target[:, :end]
-
+        inputs = full_inputs
+        target = full_target
         output = self(inputs,
                       target,
                       output_hidden_states=not self.config.disable_kd)
-
-        # TODO:
-        #  - remove _use_umbc from config because umbc should be controlled by the attention method setting
-        #  - fix all references to _use_umbc
-        #  - revert the training and attention back into the previous version where everything was pooled
-        #    and then attached into the attention values. It seems wasteful to compute all of that during training,
-        #    but every other method seems to fail.
-        #  - if we go with the "pool everything" approach, then will test time caching work? What happes to the attention features at every layer.
-
-        #  - think about the triangle and rectangle in the notebook and decide where to start pooling and if it works for inference time
 
         loss_kd_hidden, loss_kd_logits = 0, 0
         if not self.config.disable_kd:
             raise NotImplementedError(
                 "changed the way this works. If you use this you need to redefine [start,cutoff]"
             )
-            # logits = output.logits
-            # target = target[:, start:end]
-
-            # for teacher_layer, student_layer in zip(
-            #         output_teacher.hidden_states, output.hidden_states):
-
-            #     # print(
-            #     #     f"sanity check student and teacher layer before slicing: {student_layer.size()=} {teacher_layer.size()=} {cutoff=}"
-            #     # )
-            #     student_layer = student_layer[:, -(cutoff + 1):]
-            #     teacher_layer = teacher_layer[:, start:end]
-            #     # print(
-            #     #     f"sanity check student and teacher layer: {student_layer.size()=} {teacher_layer.size()=}"
-            #     # )
-
-            #     loss_kd_hidden += torch.nn.functional.mse_loss(
-            #         student_layer.to(torch.float32),
-            #         teacher_layer.to(torch.float32))
-            # loss_kd_hidden = loss_kd_hidden / len(output_teacher.hidden_states)
-
-            # # output logits were already truncated within the model
-            # # print(
-            # #     f"sanity check out logits kd (before slicing): {output_teacher.logits.size()=} {output.logits.size()}"
-            # # )
-            # teacher_logits = output_teacher.logits[:, start:end]
-            # # print(
-            # #     f"sanity check out logits kd: {teacher_logits.size()=} {output.logits.size()}"
-            # # )
-
-            # # print(
-            # #     f"{output.logits.size()=} {logits.size()=} {teacher_logits.size()=}"
-            # # )
-
-            # loss_kd_logits = torch.nn.functional.kl_div(
-            #     output.logits.reshape(-1, logits.shape[-1]).to(
-            #         torch.float32).log_softmax(-1),
-            #     teacher_logits.reshape(-1, logits.shape[-1]).to(
-            #         torch.float32).softmax(-1),
-            #     reduction='batchmean',
-            # )
-
         loss = output.loss
         if not self.config.disable_kd:
             loss = loss * 0.1 + (loss_kd_hidden + loss_kd_logits) * 2.5
@@ -422,12 +369,6 @@ class LabModule(pl.LightningModule):
                    kd_logits=None,
                    subset="train"):
         self.log(f"{subset}_loss_model", ce.item())
-        # if not self.config.disable_kd:
-        #     if kd_hidden > 0:
-        #         self.log("train_loss_kd_hidden", kd_hidden.item())
-        #     if kd_logits > 0:
-        #         self.log("train_loss_kd_logits", kd_logits.item())
-        # self.log("train_loss", total.item())
 
     def step_plain(self, inputs, target, output_teacher=None, subset="train"):
         output = self(inputs,
@@ -486,49 +427,21 @@ class LabModule(pl.LightningModule):
         self.model.eval()
 
         inputs, target = batch
-        # output_teacher = None
-        # if not self.config.disable_kd:
-        #     with torch.no_grad():
-        #         output_teacher = self.teacher(
-        #             inputs, output_hidden_states=not self.config.disable_kd)
 
-        # if self.config.method == "umbc":
-        #     loss = self.step_umbc(inputs, target, output_teacher, subset="val")
-        #     return loss
-
-        # loss = self.step_plain(inputs, target, subset="val")
-        # return loss
-
-        past_key_values = None
         if self.config.method == "umbc":
+            past_key_values, all_logits = None, torch.Tensor().to(inputs.device)
             with torch.no_grad():
-                output_logits = torch.zeros(inputs.size(0),
-                                            inputs.size(1),
-                                            32000,
-                                            device=inputs.device)
-
-                for i in range(self.config.seq_len):
-                    print(f"{i}", end=" ", flush=True)
-                    # print(f"\n\n{cutoff=} {start=} {end=}\n\n")
-
-                    _inputs = inputs[:, i:i + 1]
-
+                for i in range(inputs.size(1)):
                     output = self(
-                        _inputs,
+                        inputs[:, i:i + 1],
                         use_cache=True,
                         past_key_values=past_key_values,
                     )
-                    output_logits[:, i] = output.logits[:, -1]
+                    print(f"{output.logits.size()=}")
                     past_key_values = output.past_key_values
-
-                    if i == 500:
-                        exit()
-
-                logits = output_logits[:, :-1].reshape(-1,
-                                                       output_logits.size(-1))
-                t = target[:, 1:].reshape(-1)
-                loss = torch.nn.functional.cross_entropy(logits, t)
-
+                    all_logits = torch.cat((all_logits, output.logits), dim=1)
+                    print(all_logits.size())
+                exit()
         else:
             with torch.no_grad():
                 output = self(inputs, target)
@@ -541,7 +454,6 @@ class LabModule(pl.LightningModule):
         self.validation_targets.append(target[:, 1:].cpu())
 
     def on_validation_epoch_end(self):
-        from torchmetrics.text.perplexity import Perplexity
         with torch.no_grad():
 
             device = f"cuda:{self.local_rank}"
@@ -554,7 +466,7 @@ class LabModule(pl.LightningModule):
                 calculator.update(preds.to(device), target.to(device))
             ppl = calculator.compute()
         ppl = ppl.item()
-        self.log("val/ppl", ppl)
+        self.log("val/ppl", ppl, sync_dist=True)
 
         self.validation_preds.clear()
         self.validation_targets.clear()

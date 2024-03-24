@@ -234,6 +234,7 @@ class SlotSetEncoder(MBCFunction):
         self.ln_slots = ln_slots  # never used
         self.slot_drop = slot_drop
         self.attn_act = attn_act
+        self.K = K
 
         self.slots: Slots
 
@@ -330,7 +331,7 @@ class SlotSetEncoder(MBCFunction):
         S, W, V = self.get_attn_v(X, S=S)
         # W: (B * S, H, K, 1), C: (B * S, H, K, 1), V: (B * S, H, 1, D//H)
 
-        W = W.view(B, T, self.heads, self.slots.K, 1)
+        W = W.view(B, T, self.heads, self.K, 1)
         V = V.view(B, T, self.heads, 1, D // self.heads)
 
         W = W.softmax(dim=-2)  # softmax over the slots
@@ -342,7 +343,7 @@ class SlotSetEncoder(MBCFunction):
 
         S_hat = S_hat.transpose(2,
                                 3)  # (B, T, H, K, D//H) --> (B, T, K, H, D//H)
-        S_hat = S_hat.reshape(B, T, self.slots.K, D)
+        S_hat = S_hat.reshape(B, T, self.K, D)
 
         S_hat = self.norm_after(S_hat)
         return S_hat  # type: ignore
