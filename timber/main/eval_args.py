@@ -18,6 +18,7 @@ class ArgsType:
     k: int = 512
     dense_queries: int = 0
     dense_layers: int = 3
+    chunk: int = 16
 
 
 def eval_args(
@@ -37,6 +38,7 @@ def eval_args(
     parser.add_argument('--max_tokens', type=int, default=512)
     parser.add_argument('--slots', default=32, type=int)
     parser.add_argument('--window', default=256, type=int)
+    parser.add_argument('--chunk', default=32, type=int)
 
     args = parser.parse_args()
     print(args)

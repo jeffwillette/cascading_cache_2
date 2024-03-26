@@ -86,10 +86,13 @@ def load_model(args):
     assert args.model in MODELS, MODELS.keys()
     model_id = MODELS[args.model]
 
+    # config = LlamaConfig.from_pretrained(model_id,
+    #                                      max_position_embeddings=4096 * 2)
     config = LlamaConfig.from_pretrained(model_id)
     config._attn_implementation = config.attn_implementation = 'sdpa'
     config._umbc = args.method == "umbc"
     config._umbc_slots = args.slots
+    config._umbc_chunk = args.chunk
     config._window = args.window
     infer_dtype = torch.float32
 
@@ -123,7 +126,7 @@ def load_model(args):
         if hasattr(m, 'attention_method'):
             m.attention_method = args.method
 
-    if args.method not in ["none", "umbc"] and args.checkpoint is not None:
+    if args.method not in ["none"] and args.checkpoint is not None:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=True,
@@ -140,7 +143,16 @@ def load_model(args):
                 'down_proj',
                 # 'input_layernorm', 'post_attention_layernorm'
             ],
-            modules_to_save=['input_layernorm', 'post_attention_layernorm'])
+            modules_to_save=[
+                'input_layernorm',
+                'post_attention_layernorm',
+                'sse_q',
+                "sse_k",
+                "sse_v",
+                "slots",
+                "norm_slots",
+                'norm_after',
+            ])
 
         model = prepare_model_for_kbit_training(model)
         model = get_peft_model(model, peft_config)
@@ -153,16 +165,18 @@ def load_model(args):
             x = state_dict[key]
             state_dict[key.strip('model.')] = x
             del state_dict[key]
-        result = model.load_state_dict(state_dict, strict=False)
+
+        result = model.load_state_dict(state_dict, strict=True)
         print('load result', result)
         model = model.to(infer_dtype)
         print('lora checkpoint loaded from', args.checkpoint)
-    elif args.method == "umbc":
-        if args.checkpoint is not None:
-            ckpt = torch.load(args.checkpoint, map_location="cpu")
+    # elif args.method == "umbc":
+    #     if args.checkpoint is not None:
+    #         ckpt = torch.load(args.checkpoint, map_location="cpu")
 
-        ckpt = {k[6:]: v for k, v in ckpt["state_dict"].items()}
-        model.load_state_dict(ckpt)
+    #     ckpt = {k[6:]: v for k, v in ckpt["state_dict"].items()}
+    #     print(f"loading umbc checkpoint: {args.checkpoint=}")
+    #     model.load_state_dict(ckpt, strict=True)
 
     elif args.method != 'none':
         for m in model.modules():

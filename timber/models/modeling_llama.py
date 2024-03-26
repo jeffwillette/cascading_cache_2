@@ -98,41 +98,6 @@ class UMBCSinkCache(Cache):
         self.cos_sin_cache = {}
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
 
-    @staticmethod
-    def _rotate_half(x):
-        x1 = x[..., :x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
-
-    def _apply_key_rotary_pos_emb(self, key_states: torch.Tensor,
-                                  cos: torch.Tensor,
-                                  sin: torch.Tensor) -> torch.Tensor:
-        rotated_key_states = (key_states *
-                              cos) + (self._rotate_half(key_states) * sin)
-        return rotated_key_states
-
-    def _get_rerotation_cos_sin(
-            self, key_states: torch.Tensor, cos: torch.Tensor,
-            sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if key_states.shape[-2] not in self.cos_sin_cache:
-            # Upcast to float32 temporarily for better accuracy
-            cos = cos.to(torch.float32)
-            sin = sin.to(torch.float32)
-
-            # Compute the cos and sin required for back- and forward-rotating to one position earlier in the sequence
-            original_cos = cos[self.num_sink_tokens + key_states.shape[-2]:]
-            shifted_cos = cos[self.num_sink_tokens:-key_states.shape[-2]]
-            original_sin = sin[self.num_sink_tokens + key_states.shape[-2]:]
-            shifted_sin = sin[self.num_sink_tokens:-key_states.shape[-2]]
-            rerotation_cos = original_cos * shifted_cos + original_sin * shifted_sin
-            rerotation_sin = -original_sin * shifted_cos + original_cos * shifted_sin
-
-            self.cos_sin_cache[key_states.shape[-2]] = (
-                rerotation_cos.to(key_states.dtype).unsqueeze(0),
-                rerotation_sin.to(key_states.dtype).unsqueeze(0),
-            )
-        return self.cos_sin_cache[key_states.shape[-2]]
-
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
         # Workaround to make 'key_states.shape[-2] + past_key_value.get_seq_length(self.layer_idx)' <= window_length
@@ -171,12 +136,7 @@ class UMBCSinkCache(Cache):
         """
         # Optional kwargs for `SinkCache` -- needed on models using RoPE. `partial_rotation_size` is used on models
         # with partially rotated position embeddings, like Phi or Persimmon.
-        sin = cache_kwargs.get("sin")
-        cos = cache_kwargs.get("cos")
-        using_rope = cos is not None and sin is not None
 
-        print("udpate called")
-        print(f"{sin.size()=} {cos.size()=}")
         # Update the number of seen tokens
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
@@ -190,7 +150,6 @@ class UMBCSinkCache(Cache):
         elif key_states.shape[-2] + self.get_seq_length(
                 layer_idx) < self.window_length:
             # Growing cache
-            print(f"growing cache")
             self.key_cache[layer_idx] = torch.cat(
                 [self.key_cache[layer_idx], key_states], dim=-2)
             self.value_cache[layer_idx] = torch.cat(
@@ -198,21 +157,10 @@ class UMBCSinkCache(Cache):
 
         else:
             # Shifting cache
-            print(f"shifting cache")
             keys_to_keep = self.key_cache[layer_idx][:, :,
                                                      -self.window_length +
                                                      self.num_sink_tokens +
                                                      key_states.shape[-2]:]
-            print(
-                f"{self.key_cache[layer_idx].size()=} {keys_to_keep.size()=}")
-
-            # On RoPE models, we need to recompute the Key rotation as the tokens are shifted
-            if using_rope:
-                rerotation_cos, rerotation_sin = self._get_rerotation_cos_sin(
-                    key_states, cos[:self.window_length],
-                    sin[:self.window_length])
-                keys_to_keep = self._apply_key_rotary_pos_emb(
-                    keys_to_keep, rerotation_cos, rerotation_sin)
 
             # Concatenate sink tokens, shifted & rotated tokens (if needed), and new tokens
             sink_keys = self.key_cache[layer_idx][:, :, :self.num_sink_tokens]
@@ -229,7 +177,6 @@ class UMBCSinkCache(Cache):
             self.value_cache[layer_idx] = torch.cat(
                 [sink_values, values_to_keep, value_states], dim=-2)
 
-        print(f"{self.key_cache[layer_idx].size()=}")
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
     def reorder_cache(self, beam_idx: torch.LongTensor):
@@ -397,6 +344,58 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_q(q, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    return q_embed
+
+
+def apply_rotary_pos_emb_k(k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return k_embed
 
 
 class LlamaMLP(nn.Module):
@@ -951,24 +950,25 @@ class LlamaSdpaAttention(LlamaAttention):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
                                          self.head_dim).transpose(1, 2)
 
-        print(f"before getting pos ids: {position_ids=}")
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        print(f"after getting pos ids: {cos.size()=} {sin.size()=}")
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin)
-
+        # get the cache before rotary embeddings are applied.
         # In case static cache is used, it is an instance attribute.
         past_key_value = getattr(self, "past_key_value", past_key_value)
 
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "cache_position": cache_position
-            }
             key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs)
+                key_states, value_states, self.layer_idx)
+
+        def get_position_ids():
+            if past_key_value is not None:
+                return torch.arange(past_key_value.get_seq_length(),
+                                    device=position_ids.device).unsqueeze(0)
+            return position_ids
+
+        cos, sin = self.rotary_emb(value_states, get_position_ids())
+        query_states = apply_rotary_pos_emb_q(query_states,
+                                              cos[:, -query_states.size(-2):],
+                                              sin[:, -query_states.size(-2):])
+        key_states = apply_rotary_pos_emb_k(key_states, cos, sin)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1408,21 +1408,39 @@ class LlamaModel(LlamaPreTrainedModel):
         if hasattr(self, "sse"):
             # B, S, D = inputs_embeds.size()
 
-            sse_out = self.sse.forward_cumulative(inputs_embeds)
+            if not use_cache:
+                start = kwargs["start"]
+                end = kwargs["end"]
 
-            start = kwargs["start"]
-            end = kwargs["end"]
+                sse_out = self.sse.forward_cumulative(
+                    inputs_embeds[:, :end], chunk_size=self.config._umbc_chunk)
 
-            inputs_embeds = inputs_embeds[:, start:end]
-            sse_out = sse_out[:, start:end]
-            B, S, D = inputs_embeds.size()
+                inputs_embeds = inputs_embeds[:, start:end]
+                sse_out = sse_out[:, start:end]
 
-            inputs_embeds = torch.cat((inputs_embeds.unsqueeze(2), sse_out),
-                                      dim=1)  # (B, S, 2, D)
-            inputs_embeds = inputs_embeds.view(B, S * 2, D)
-            # print(f"{inputs_embeds.size()=}")
-            # inputs_emebds = window_split(inputs_embeds,
-            #                              self.config._window * 2)
+                B, S, D = inputs_embeds.size()
+                s, sc = S // self.config._umbc_chunk, self.config._umbc_chunk
+                inputs_embeds = inputs_embeds.reshape(B, s, sc, D)
+
+                inputs_embeds = torch.cat((inputs_embeds, sse_out),
+                                          dim=-2)  # (B, S, 2, D)
+                inputs_embeds = inputs_embeds.view(B, -1, D)
+
+            else:
+                if not hasattr(self.sse, "x_prev"):
+                    self.sse.init_cache()
+
+                if not hasattr(self, "val_tokens_added"):
+                    self.val_tokens_added = 0
+
+                sse_out = self.sse.forward_mbc(inputs_embeds)
+
+                self.val_tokens_added += 1
+                if self.val_tokens_added % self.config._umbc_chunk == 0:
+                    inputs_embeds = torch.cat((inputs_embeds, sse_out),
+                                              dim=1)  # (B, S, 2, D)
+                    self.val_tokens_added = 0
+
         # ------------------------------------------------------
 
         def get_cache():
@@ -1432,8 +1450,8 @@ class LlamaModel(LlamaPreTrainedModel):
             if self.config._umbc and past_key_values is None:
                 # init a new cache
                 return UMBCSinkCache(
-                    self.config._window * 2,
-                    num_sink_tokens=0,
+                    self.config._window,
+                    num_sink_tokens=1,
                 )
             return DynamicCache.from_legacy_cache(past_key_values)
 
@@ -1441,7 +1459,6 @@ class LlamaModel(LlamaPreTrainedModel):
         if use_cache:  # kept for BC (cache positions)
             past_key_values = get_cache()
             past_seen_tokens = past_key_values.get_seq_length()
-            print(f"get seen tokens: {past_seen_tokens=}")
 
         if cache_position is None:
             if isinstance(past_key_values, StaticCache):
@@ -1459,16 +1476,19 @@ class LlamaModel(LlamaPreTrainedModel):
         causal_mask = self._update_causal_mask(attention_mask, inputs_embeds,
                                                cache_position)
 
-        # if self.config._umbc:
-        #     # make the causal mask have a sliding window
-        #     w = self.config._window * 2
-        #     window = causal_mask.transpose(-2, -1)
+        if self.config._umbc and not use_cache:
+            # make the causal mask have a sliding window
+            # w = self.config._window * 2
+            w = self.config._window
+            window = causal_mask.transpose(-2, -1)
+            # print(f"{window.size()=}")
 
-        #     d = window.size(-1)
-        #     m = torch.ones(d, d, dtype=torch.bool, device=window.device)
-        #     m = m.tril(-w).view(1, 1, d, d)
-        #     window = window * m
-        #     causal_mask = causal_mask + window
+            d = window.size(-1)
+            m = torch.ones(d, d, dtype=torch.bool, device=window.device)
+            m = m.tril(-w).view(1, 1, d, d)
+            # print(f"{window.size()=} {m.size()=}")
+            window = window * m
+            causal_mask = causal_mask + window
 
         # embed positions
         hidden_states = inputs_embeds
@@ -1690,17 +1710,25 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         # UMBC works on a sliding window with a cumulative pooling of tokens. So we need to finetune
         # the model to work with the sliding window. If we are training, we need to cut a portion of the
         # tokens with the size of the window.
+        # for training with a sliding window of size N, we need to consider a window of size 2N so that the first
+        # N in the window sequence has the previous N tokens to work with as well.
         # for val/test, the trainer should input only the necessary sequence length so we can get a prediction
         # at every time step.
+        B, S = input_ids.size()
         start, end = 0, input_ids.size(1)
-        if self.model.config._umbc and self.training:
-            start = torch.randint(0,
-                                  input_ids.size(1) -
-                                  self.model.config._window,
-                                  size=(1, )).item()
-            end = start + self.config._window
-            if labels is not None:
-                labels = labels[:, start:end]
+        # if self.model.config._umbc and self.training:
+        #     chnk = self.model.config._umbc_chunk
+        #     n_chnk = end // chnk
+
+        #     end = torch.randint(2, n_chnk + 1, size=(1, )).item()
+        #     # end = torch.randint(
+        #     #     self.model.config._window - 1,
+        #     #     input_ids.size(1),
+        #     #     size=(1, ),
+        #     # ).item()
+        #     start = max(0, end - (self.config._window * 2) - 1)
+        #     if labels is not None:
+        #         labels = labels[:, start:end]
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -1732,12 +1760,25 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         logits = logits.float()
 
         # mbc should ditch all the odd indexed logits which are pooling tokens
-        if self.model.config._umbc:
-            logits = logits[...,
-                            [i * 2 for i in range(logits.size(-2) // 2)], :]
+        if self.model.config._umbc and self.training:
+            _, _, D = logits.size()
+            # S = ((original sequence // chnk) + slots) * original_seq // chunk
+            chnk = self.model.config._umbc_chunk
+            slot = self.model.config._umbc_slots
+            s = S // self.model.config._umbc_chunk
+
+            logits = logits.reshape(B, s, chnk + slot, D)
+            logits = logits[:, :, :chnk].reshape(B, S, D)
+            # logits = logits[...,
+            #                 [i * 2 for i in range(logits.size(-2) // 2)], :]
+
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
+            if self.model.config._umbc:
+                start = max(0, logits.size(1) - self.config._window)
+                logits = logits[:, start:]
+                labels = labels[:, start:]
 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

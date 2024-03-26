@@ -52,7 +52,7 @@ class TrainConfig:
     using_fsdp: bool = False
     lr: float = 5e-5
     batch_size: int = 1
-    accumulation_steps: int = 2
+    accumulation_steps: int = 1
     lora_r: int = 32
     save_steps: int = 100
     dense_queries: int = None
@@ -70,6 +70,7 @@ class TrainConfig:
     model: str = 'qwen500m'
     disable_global_context: bool = False
     window: int = 256
+    chunks: int = 32
 
 
 class LabDataModule(pl.LightningDataModule):
@@ -190,6 +191,7 @@ def load_model(
     config._attn_implementation = config.attn_implementation = 'sdpa'
     config._umbc = train_config.method == "umbc"
     config._umbc_slots = train_config.slots
+    config._umbc_chunk = train_config.chunks
     config._window = train_config.window
 
     quant_config = transformers.BitsAndBytesConfig(
@@ -251,7 +253,7 @@ def load_model(
             else:
                 m._gradient_checkpointing_func = torch.utils.checkpoint.checkpoint
 
-    if method not in ["none", "umbc"]:
+    if method not in ["none"]:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -429,7 +431,8 @@ class LabModule(pl.LightningModule):
         inputs, target = batch
 
         if self.config.method == "umbc":
-            past_key_values, all_logits = None, torch.Tensor().to(inputs.device)
+            past_key_values, output_logits = None, torch.Tensor().to(
+                inputs.device)
             with torch.no_grad():
                 for i in range(inputs.size(1)):
                     output = self(
@@ -437,11 +440,20 @@ class LabModule(pl.LightningModule):
                         use_cache=True,
                         past_key_values=past_key_values,
                     )
-                    print(f"{output.logits.size()=}")
                     past_key_values = output.past_key_values
-                    all_logits = torch.cat((all_logits, output.logits), dim=1)
-                    print(all_logits.size())
-                exit()
+                    output_logits = torch.cat(
+                        (output_logits, output.logits[:, :1]), dim=1)
+
+                    print(i, end=" ", flush=True)
+                    # breaking so lightning check doesn't take forever
+                    if i == 100:
+                        target = target[:, :output_logits.size(1)]
+                        break
+
+                loss = torch.nn.functional.cross_entropy(
+                    output_logits[:, :-1].reshape(-1, output_logits.size(-1)),
+                    target[:, 1:].reshape(-1),
+                )
         else:
             with torch.no_grad():
                 output = self(inputs, target)
@@ -591,6 +603,7 @@ def main(config: TrainConfig):
         enable_checkpointing=True,
         fast_dev_run=config.dev_run,
         callbacks=[checkpoint_callback],
+        num_sanity_val_steps=2,
     )
 
     datamodule = LabDataModule(config=config)
@@ -634,6 +647,7 @@ if __name__ == "__main__":
     parser.add_argument('--block_size_k', default=2, type=int)
     parser.add_argument('--method', default='umbc', type=str)
     parser.add_argument('--window', default=256, type=int)
+    parser.add_argument('--chunk', default=32, type=int)
 
     args = parser.parse_args()
 
@@ -651,6 +665,7 @@ if __name__ == "__main__":
         disable_global_context=args.disable_global_context,
         window=args.window,
         slots=args.slots,
+        chunks=args.chunk,
     )
     if args.gradient_accumulation_steps > 0:
         train_config.accumulation_steps = args.gradient_accumulation_steps

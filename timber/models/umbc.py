@@ -235,6 +235,7 @@ class SlotSetEncoder(MBCFunction):
         self.slot_drop = slot_drop
         self.attn_act = attn_act
         self.K = K
+        self.max_batch = max_batch
 
         self.slots: Slots
 
@@ -257,12 +258,23 @@ class SlotSetEncoder(MBCFunction):
             normalized_shape=dim) if ln_slots else nn.Identity()
 
         self.norm_after = nn.LayerNorm(dim) if ln_after else nn.Identity()
+        self.init_cache()
 
-        # self.register_buffer(
-        #     "x_prev",
-        #     torch.zeros(max_batch, self.heads, K, self.dim // self.heads))
-        # self.register_buffer("c_prev", torch.zeros(max_batch, self.heads, K,
-        #                                            1))
+    def init_cache(self):
+        self.register_buffer(
+            "x_prev",
+            torch.zeros(self.max_batch,
+                        self.heads,
+                        self.K,
+                        self.dim // self.heads,
+                        device=self.sse_v.weight.device))
+        self.register_buffer(
+            "c_prev",
+            torch.zeros(self.max_batch,
+                        self.heads,
+                        self.K,
+                        1,
+                        device=self.sse_v.weight.device))
 
     def sample_s(self) -> T:
         S = self.slots.weight.unsqueeze(0)
@@ -312,7 +324,11 @@ class SlotSetEncoder(MBCFunction):
         S_hat = self.norm_after(S_hat)
         return S_hat  # type: ignore
 
-    def forward_cumulative(self, X: T, S: OT = None, mask: OT = None) -> T:
+    def forward_cumulative(self,
+                           X: T,
+                           S: OT = None,
+                           mask: OT = None,
+                           chunk_size=1) -> T:
         """
         X: (B, S, D)
         output: (B, S, K, D)
@@ -321,8 +337,11 @@ class SlotSetEncoder(MBCFunction):
         information from every element in the sequence.
         """
         B, T, D = X.size()
+        if T % chunk_size != 0:
+            raise ValueError(f"{T % chunk_size=} must be zero")
+        T, c = T // chunk_size, chunk_size
 
-        X = X.view(B * T, 1, D)
+        X = X.reshape(B * T, c, D)
 
         if mask is not None:
             raise NotImplementedError(
@@ -331,13 +350,14 @@ class SlotSetEncoder(MBCFunction):
         S, W, V = self.get_attn_v(X, S=S)
         # W: (B * S, H, K, 1), C: (B * S, H, K, 1), V: (B * S, H, 1, D//H)
 
-        W = W.view(B, T, self.heads, self.K, 1)
-        V = V.view(B, T, self.heads, 1, D // self.heads)
+        W = W.reshape(B, T, self.heads, self.K, c)
+        V = V.reshape(B, T, self.heads, c, D // self.heads)
 
         W = W.softmax(dim=-2)  # softmax over the slots
-        C = W.cumsum(dim=1)  # cumulative normalization constant
+        C = W.sum(dim=-1, keepdim=True).cumsum(
+            dim=1)  # cumulative normalization constant
 
-        A = W * V  # outer product: (B, T, H, K, D//H)
+        A = torch.einsum("bshkc,bshcd->bshkd", W, V)
         A = A.cumsum(dim=1)
         S_hat = A / (C + self.eps)
 
@@ -421,23 +441,43 @@ if __name__ == "__main__":
     x = torch.randn(32, 256, 128)
     out = sse(x)
     out_cumulative = sse.forward_cumulative(x)
-    out_cumulative = out_cumulative[:, -1]
+    last = out_cumulative[:, -1]
 
-    diff = (out - out_cumulative).abs().amax()
-    print(f"{out.size()=} {out_cumulative.size()=}")
+    diff = (out - last).abs().amax()
+    print(f"{out.size()=} {last.size()=}")
     print(f"max diff: {diff=}")
 
+    sse.init_cache()
     out_mbc = sse.forward_mbc(x)
-
-    diff = (out - out_mbc).abs().amax()
-    print(f"{out.size()=} {out_mbc.size()=}")
-    print(f"max diff: {diff=}")
-
     sse.post_forward_mbc_cleanup()
-    # for chnk in x.chunk(8, dim=1):
-    for chnk in x.chunk(256, dim=1):
-        out_mbc = sse.forward_mbc(chnk)
 
     diff = (out - out_mbc).abs().amax()
     print(f"{out.size()=} {out_mbc.size()=}")
     print(f"max diff: {diff=}")
+
+    chnked_out = []
+    for chnk in x.chunk(256, dim=1):
+        chnked_out.append(sse.forward_mbc(chnk))
+        out_mbc = chnked_out[-1]
+
+    diff = (out - out_mbc).abs().amax()
+    print(f"{out.size()=} {out_mbc.size()=}")
+    print(f"max diff: {diff=}")
+
+    for i in range(out_cumulative.size(1)):
+        chunked = chnked_out[i]
+        cumulative = out_cumulative[:, i]
+
+        diff = (chunked - cumulative).abs().amax()
+        print(f"max diff: {diff=}")
+
+    cumulative16 = sse.forward_cumulative(x, chunk_size=16)
+    cumulative32 = sse.forward_cumulative(x, chunk_size=32)
+    cumulative16 = torch.stack(
+        [cumulative16[:, i + (i + 1)] for i in range(256 // 32)], dim=1)
+
+    for i in range(cumulative32.size(1)):
+        s = cumulative16[:, i]
+        t = cumulative32[:, i]
+        diff = (s - t).abs().amax()
+        print(f"max diff: {diff=}")
