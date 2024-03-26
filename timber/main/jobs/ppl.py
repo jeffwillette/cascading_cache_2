@@ -65,10 +65,10 @@ def job_ppl(args, model, tokenizer, device):
 
                         output = model(
                             inputs,
-                            use_cache=True,
+                            use_cache=False,
                             past_key_values=past_key_values,
                         )
-                        output_logits[:, i] = output.logits[:, 0]
+                        output_logits[:, i] = output.logits[:, -1]
                         past_key_values = output.past_key_values
 
                         if i % 100 == 0:

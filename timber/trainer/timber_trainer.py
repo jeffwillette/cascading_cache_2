@@ -603,7 +603,7 @@ def main(config: TrainConfig):
         enable_checkpointing=True,
         fast_dev_run=config.dev_run,
         callbacks=[checkpoint_callback],
-        num_sanity_val_steps=2,
+        num_sanity_val_steps=0,
     )
 
     datamodule = LabDataModule(config=config)

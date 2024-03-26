@@ -90,12 +90,14 @@ class UMBCSinkCache(Cache):
             The number of sink tokens. See the original paper for more information.
     """
 
-    def __init__(self, window_length: int, num_sink_tokens: int) -> None:
+    def __init__(self, window_length: int, num_sink_tokens: int,
+                 slots: int) -> None:
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
         self.window_length = window_length
         self.num_sink_tokens = num_sink_tokens
         self.cos_sin_cache = {}
+        self.slots = slots
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
@@ -955,12 +957,26 @@ class LlamaSdpaAttention(LlamaAttention):
         past_key_value = getattr(self, "past_key_value", past_key_value)
 
         if past_key_value is not None:
+            key_states, key_slots = key_states[:, :, :-past_key_value.
+                                               slots], key_states[:, :,
+                                                                  -past_key_value
+                                                                  .slots:]
+            value_states, value_slots = value_states[:, :, :-past_key_value.
+                                                     slots], value_states[:, :,
+                                                                          -past_key_value
+                                                                          .
+                                                                          slots:]
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx)
 
+            key_states = torch.cat((key_states, key_slots), dim=2)
+            value_states = torch.cat((value_states, value_slots), dim=2)
+
         def get_position_ids():
             if past_key_value is not None:
-                return torch.arange(past_key_value.get_seq_length(),
+                # return torch.arange(past_key_value.get_seq_length(),
+                #                     device=position_ids.device).unsqueeze(0)
+                return torch.arange(key_states.size(2),
                                     device=position_ids.device).unsqueeze(0)
             return position_ids
 
@@ -1408,39 +1424,28 @@ class LlamaModel(LlamaPreTrainedModel):
         if hasattr(self, "sse"):
             # B, S, D = inputs_embeds.size()
 
-            if not use_cache:
+            if not use_cache and self.training:
                 start = kwargs["start"]
                 end = kwargs["end"]
 
-                sse_out = self.sse.forward_cumulative(
-                    inputs_embeds[:, :end], chunk_size=self.config._umbc_chunk)
+                sse_out = self.sse.forward(inputs_embeds[:, :start])
 
                 inputs_embeds = inputs_embeds[:, start:end]
-                sse_out = sse_out[:, start:end]
-
-                B, S, D = inputs_embeds.size()
-                s, sc = S // self.config._umbc_chunk, self.config._umbc_chunk
-                inputs_embeds = inputs_embeds.reshape(B, s, sc, D)
-
-                inputs_embeds = torch.cat((inputs_embeds, sse_out),
-                                          dim=-2)  # (B, S, 2, D)
-                inputs_embeds = inputs_embeds.view(B, -1, D)
-
+                # sse_out = sse_out[:, start:end]
+                inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
             else:
                 if not hasattr(self.sse, "x_prev"):
                     self.sse.init_cache()
 
-                if not hasattr(self, "val_tokens_added"):
-                    self.val_tokens_added = 0
+                if not hasattr(self.sse, "past_pools"):
+                    self.sse.past_pools = []
 
                 sse_out = self.sse.forward_mbc(inputs_embeds)
+                self.sse.past_pools = self.sse.past_pools[:self.config.
+                                                          _window] + [sse_out]
 
-                self.val_tokens_added += 1
-                if self.val_tokens_added % self.config._umbc_chunk == 0:
-                    inputs_embeds = torch.cat((inputs_embeds, sse_out),
-                                              dim=1)  # (B, S, 2, D)
-                    self.val_tokens_added = 0
-
+                if len(self.sse.past_pools) > self.config._window:
+                    inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
         # ------------------------------------------------------
 
         def get_cache():
@@ -1451,7 +1456,8 @@ class LlamaModel(LlamaPreTrainedModel):
                 # init a new cache
                 return UMBCSinkCache(
                     self.config._window,
-                    num_sink_tokens=1,
+                    num_sink_tokens=4,
+                    slots=self.config._umbc_slots,
                 )
             return DynamicCache.from_legacy_cache(past_key_values)
 
@@ -1476,19 +1482,21 @@ class LlamaModel(LlamaPreTrainedModel):
         causal_mask = self._update_causal_mask(attention_mask, inputs_embeds,
                                                cache_position)
 
-        if self.config._umbc and not use_cache:
-            # make the causal mask have a sliding window
-            # w = self.config._window * 2
-            w = self.config._window
-            window = causal_mask.transpose(-2, -1)
-            # print(f"{window.size()=}")
+        # if self.config._umbc and not use_cache:
+        #     # make the causal mask have a sliding window
+        #     # w = self.config._window * 2
+        #     w = self.config._window
+        #     window = causal_mask.transpose(-2, -1)
+        #     # print(f"{window.size()=}")
 
-            d = window.size(-1)
-            m = torch.ones(d, d, dtype=torch.bool, device=window.device)
-            m = m.tril(-w).view(1, 1, d, d)
-            # print(f"{window.size()=} {m.size()=}")
-            window = window * m
-            causal_mask = causal_mask + window
+        #     d = window.size(-1)
+        #     m = torch.ones(d, d, dtype=torch.bool, device=window.device)
+        #     m = m.tril(-w).view(1, 1, d, d)
+        #     # print(f"{window.size()=} {m.size()=}")
+        #     window = window * m
+        #     causal_mask = causal_mask + window
+        #     # keep what will be the sink tokens
+        #     causal_mask[:, :, 4:, :4] = 0
 
         # embed positions
         hidden_states = inputs_embeds
@@ -1715,7 +1723,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         # for val/test, the trainer should input only the necessary sequence length so we can get a prediction
         # at every time step.
         B, S = input_ids.size()
-        start, end = 0, input_ids.size(1)
+        start, end = 0, S
+        if self.training:
+            end = torch.randint(self.model.config._window * 2, S, size=(1, ))
+            start = end - self.model.config._window * 2
         # if self.model.config._umbc and self.training:
         #     chnk = self.model.config._umbc_chunk
         #     n_chnk = end // chnk
@@ -1760,25 +1771,30 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         logits = logits.float()
 
         # mbc should ditch all the odd indexed logits which are pooling tokens
-        if self.model.config._umbc and self.training:
-            _, _, D = logits.size()
-            # S = ((original sequence // chnk) + slots) * original_seq // chunk
-            chnk = self.model.config._umbc_chunk
-            slot = self.model.config._umbc_slots
-            s = S // self.model.config._umbc_chunk
+        # if self.model.config._umbc and self.training:
+        #     _, _, D = logits.size()
+        #     # S = ((original sequence // chnk) + slots) * original_seq // chunk
+        #     chnk = self.model.config._umbc_chunk
+        #     slot = self.model.config._umbc_slots
+        #     s = S // self.model.config._umbc_chunk
 
-            logits = logits.reshape(B, s, chnk + slot, D)
-            logits = logits[:, :, :chnk].reshape(B, S, D)
-            # logits = logits[...,
-            #                 [i * 2 for i in range(logits.size(-2) // 2)], :]
+        #     logits = logits.reshape(B, s, chnk + slot, D)
+        #     logits = logits[:, :, :chnk].reshape(B, S, D)
+        #     # logits = logits[...,
+        #     #                 [i * 2 for i in range(logits.size(-2) // 2)], :]
 
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
             if self.model.config._umbc:
-                start = max(0, logits.size(1) - self.config._window)
-                logits = logits[:, start:]
-                labels = labels[:, start:]
+                # print(f"before: {logits.size()=} {labels.size()=}")
+                logits = logits[:, self.config._umbc_slots:]
+                # start = max(0, logits.size(1) - self.config._window)
+                # logits = logits[:, start:]
+                labels = labels[:, start:end]
+                # print(
+                #     f"after: {logits.size()=} {labels.size()=} {start=} {end=}"
+                # )
 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
