@@ -51,7 +51,7 @@ def job_ppl(args, model, tokenizer, device):
 
                 nlls.append(neg_log_likelihood.cpu())
 
-            elif args.method == "umbc":
+            elif args.method == "umbc-old":
                 with torch.no_grad():
                     model.model.model.sse.post_forward_mbc_cleanup()
                     output_logits = torch.zeros(input_ids.size(0),
@@ -79,6 +79,29 @@ def job_ppl(args, model, tokenizer, device):
                                            1].view(-1),
                             )
                             print(f"intermediate ce: {ce.item()}")
+
+                    logits = output_logits[:, :-1].reshape(
+                        -1, output_logits.size(-1))
+                    t = target_ids[:, 1:].reshape(-1)
+                    loss = torch.nn.functional.cross_entropy(logits, t)
+                    nlls.append(loss.cpu())
+                    model.model.model.sse.post_forward_mbc_cleanup()
+            elif args.method == "umbc":
+                with torch.no_grad():
+                    model.model.model.sse.post_forward_mbc_cleanup()
+                    output_logits = torch.zeros(input_ids.size(0),
+                                                input_ids.size(1),
+                                                32000,
+                                                device=input_ids.device)
+                    w = args.window
+                    n_chnks = input_ids.size(1) // w
+                    loss = []
+                    for i in range(n_chnks):
+                        start = i * w
+                        end = (i + 1) * w
+                        inp = input_ids[:, :end]
+                        output = model(inp)
+                        output_logits[:, start:end] = output.logits[:, -w:]
 
                     logits = output_logits[:, :-1].reshape(
                         -1, output_logits.size(-1))

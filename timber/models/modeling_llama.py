@@ -1424,15 +1424,16 @@ class LlamaModel(LlamaPreTrainedModel):
         if hasattr(self, "sse"):
             # B, S, D = inputs_embeds.size()
 
-            if not use_cache and self.training:
-                start = kwargs["start"]
-                end = kwargs["end"]
+            if not use_cache:
+                token_start = kwargs["token_start"]
+                sse_end = kwargs["sse_end"]
 
-                sse_out = self.sse.forward(inputs_embeds[:, :start])
-
-                inputs_embeds = inputs_embeds[:, start:end]
-                # sse_out = sse_out[:, start:end]
-                inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
+                # print(f"{token_start=} {sse_end=}")
+                if sse_end > 0:
+                    # print(f"using UMBC")
+                    sse_out = self.sse.forward(inputs_embeds[:, :sse_end])
+                    inputs_embeds = inputs_embeds[:, token_start:]
+                    inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
             else:
                 if not hasattr(self.sse, "x_prev"):
                     self.sse.init_cache()
@@ -1521,6 +1522,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     output_attentions,
                     use_cache,
                     cache_position,
+                    use_reentrant=False,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1715,31 +1717,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                                 self.config.output_hidden_states)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # UMBC works on a sliding window with a cumulative pooling of tokens. So we need to finetune
-        # the model to work with the sliding window. If we are training, we need to cut a portion of the
-        # tokens with the size of the window.
-        # for training with a sliding window of size N, we need to consider a window of size 2N so that the first
-        # N in the window sequence has the previous N tokens to work with as well.
-        # for val/test, the trainer should input only the necessary sequence length so we can get a prediction
-        # at every time step.
-        B, S = input_ids.size()
-        start, end = 0, S
-        if self.training:
-            end = torch.randint(self.model.config._window * 2, S, size=(1, ))
-            start = end - self.model.config._window * 2
-        # if self.model.config._umbc and self.training:
-        #     chnk = self.model.config._umbc_chunk
-        #     n_chnk = end // chnk
-
-        #     end = torch.randint(2, n_chnk + 1, size=(1, )).item()
-        #     # end = torch.randint(
-        #     #     self.model.config._window - 1,
-        #     #     input_ids.size(1),
-        #     #     size=(1, ),
-        #     # ).item()
-        #     start = max(0, end - (self.config._window * 2) - 1)
-        #     if labels is not None:
-        #         labels = labels[:, start:end]
+        w = self.model.config._window
+        sse_end = max(0, input_ids.size(1) - w)
+        token_start = max(0, input_ids.size(1) - 2 * w)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -1753,8 +1733,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            start=start,
-            end=end,
+            token_start=token_start,
+            sse_end=sse_end,
         )
 
         hidden_states = outputs[0]
@@ -1787,14 +1767,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         if labels is not None:
             # Shift so that tokens < n predict n
             if self.model.config._umbc:
-                # print(f"before: {logits.size()=} {labels.size()=}")
-                logits = logits[:, self.config._umbc_slots:]
-                # start = max(0, logits.size(1) - self.config._window)
-                # logits = logits[:, start:]
-                labels = labels[:, start:end]
-                # print(
-                #     f"after: {logits.size()=} {labels.size()=} {start=} {end=}"
-                # )
+                logits = logits[:, -w:]
+                labels = labels[:, -w:]
 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

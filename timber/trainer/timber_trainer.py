@@ -318,6 +318,7 @@ class LabModule(pl.LightningModule):
         self.validation_targets = []
 
         self.config = config
+        # self.automatic_optimization = config.method != "umbc"
 
     def forward(
         self,
@@ -342,26 +343,30 @@ class LabModule(pl.LightningModule):
                   full_target,
                   output_teacher,
                   subset="train"):
-        inputs = full_inputs
-        target = full_target
-        output = self(inputs,
-                      target,
-                      output_hidden_states=not self.config.disable_kd)
 
-        loss_kd_hidden, loss_kd_logits = 0, 0
-        if not self.config.disable_kd:
-            raise NotImplementedError(
-                "changed the way this works. If you use this you need to redefine [start,cutoff]"
-            )
-        loss = output.loss
-        if not self.config.disable_kd:
-            loss = loss * 0.1 + (loss_kd_hidden + loss_kd_logits) * 2.5
+        # opt = self.optimizers()
 
-        self.log_losses(loss,
-                        output.loss,
-                        loss_kd_hidden,
-                        loss_kd_logits,
-                        subset="train")
+        w = self.config.window
+        n_chnks = full_inputs.size(1) // self.config.window
+        loss = []
+        for i in range(n_chnks):
+            end = (i + 1) * w
+            inp, tgt = full_inputs[:, :end], full_target[:, :end]
+            output = self(inp,
+                          tgt,
+                          output_hidden_states=not self.config.disable_kd)
+
+            # if i != 0:
+            #     self.manual_backward(output.loss)
+
+            loss += [output.loss]
+
+        # opt.step()
+        # opt.zero_grad()
+
+        loss = torch.mean(torch.stack(loss))
+
+        self.log_losses(loss, output.loss, 0, 0, subset="train")
         return loss
 
     def log_losses(self,
@@ -631,7 +636,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable_kd', action='store_true')
     parser.add_argument('--dev_run', action='store_true')
     parser.add_argument('--disable_global_context', action='store_true')
-    parser.add_argument('--gradient_accumulation_steps', default=-1, type=int)
+    parser.add_argument('--accumulation_steps', default=-1, type=int)
     parser.add_argument('--batch_size', default=-1, type=int)
     parser.add_argument('--lora_r', default=-1, type=int)
     parser.add_argument('--lr', default=-1, type=float)
@@ -667,8 +672,8 @@ if __name__ == "__main__":
         slots=args.slots,
         chunks=args.chunk,
     )
-    if args.gradient_accumulation_steps > 0:
-        train_config.accumulation_steps = args.gradient_accumulation_steps
+    if args.accumulation_steps > 0:
+        train_config.accumulation_steps = args.accumulation_steps
     if args.lora_r > 0:
         train_config.lora_r = args.lora_r
     if args.lr > 0:
