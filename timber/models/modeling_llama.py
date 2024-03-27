@@ -1422,31 +1422,24 @@ class LlamaModel(LlamaPreTrainedModel):
         # ------------------------------------------------------
         # if we are doing the umbc model, pool everything here
         if hasattr(self, "sse"):
-            # B, S, D = inputs_embeds.size()
-
             if not use_cache:
                 token_start = kwargs["token_start"]
                 sse_end = kwargs["sse_end"]
+                w = self.config._window
 
-                # print(f"{token_start=} {sse_end=}")
                 if sse_end > 0:
-                    # print(f"using UMBC")
-                    sse_out = self.sse.forward(inputs_embeds[:, :sse_end])
+                    if self.training:
+                        sse_out = self.sse.forward(inputs_embeds[:, :sse_end])
+                    else:
+                        # for evaluation, we do not need to recompute the graph on every iteration.
+                        sse_input = inputs_embeds[:, sse_end - w:sse_end]
+                        sse_out = self.sse.forward_mbc(sse_input)
+
                     inputs_embeds = inputs_embeds[:, token_start:]
                     inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
-            else:
-                if not hasattr(self.sse, "x_prev"):
-                    self.sse.init_cache()
-
-                if not hasattr(self.sse, "past_pools"):
-                    self.sse.past_pools = []
-
-                sse_out = self.sse.forward_mbc(inputs_embeds)
-                self.sse.past_pools = self.sse.past_pools[:self.config.
-                                                          _window] + [sse_out]
-
-                if len(self.sse.past_pools) > self.config._window:
-                    inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
+            else:  # generation
+                raise NotImplementedError(
+                    "implement the caching version of UMBC model")
         # ------------------------------------------------------
 
         def get_cache():
@@ -1482,22 +1475,6 @@ class LlamaModel(LlamaPreTrainedModel):
 
         causal_mask = self._update_causal_mask(attention_mask, inputs_embeds,
                                                cache_position)
-
-        # if self.config._umbc and not use_cache:
-        #     # make the causal mask have a sliding window
-        #     # w = self.config._window * 2
-        #     w = self.config._window
-        #     window = causal_mask.transpose(-2, -1)
-        #     # print(f"{window.size()=}")
-
-        #     d = window.size(-1)
-        #     m = torch.ones(d, d, dtype=torch.bool, device=window.device)
-        #     m = m.tril(-w).view(1, 1, d, d)
-        #     # print(f"{window.size()=} {m.size()=}")
-        #     window = window * m
-        #     causal_mask = causal_mask + window
-        #     # keep what will be the sink tokens
-        #     causal_mask[:, :, 4:, :4] = 0
 
         # embed positions
         hidden_states = inputs_embeds
@@ -1749,19 +1726,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         else:
             logits = self.lm_head(hidden_states)
         logits = logits.float()
-
-        # mbc should ditch all the odd indexed logits which are pooling tokens
-        # if self.model.config._umbc and self.training:
-        #     _, _, D = logits.size()
-        #     # S = ((original sequence // chnk) + slots) * original_seq // chunk
-        #     chnk = self.model.config._umbc_chunk
-        #     slot = self.model.config._umbc_slots
-        #     s = S // self.model.config._umbc_chunk
-
-        #     logits = logits.reshape(B, s, chnk + slot, D)
-        #     logits = logits[:, :, :chnk].reshape(B, S, D)
-        #     # logits = logits[...,
-        #     #                 [i * 2 for i in range(logits.size(-2) // 2)], :]
 
         loss = None
         if labels is not None:

@@ -29,10 +29,9 @@ def job_ppl(args, model, tokenizer, device):
         encodings = torch.load(cache_path)
 
     max_length = model.config.max_position_embeddings
-    max_length = stride = args.stride if args.stride > 0 else model.config.max_position_embeddings
-    # if model.model.config._umbc:
-    #     max_length = stride = max_length // 2
+    # max_length = stride = args.stride if args.stride > 0 else model.config.max_position_embeddings
     seq_len = encodings.size(1)
+    max_length = stride = seq_len
 
     nlls = []
     prev_end_loc = 0
@@ -51,75 +50,31 @@ def job_ppl(args, model, tokenizer, device):
 
                 nlls.append(neg_log_likelihood.cpu())
 
-            elif args.method == "umbc-old":
-                with torch.no_grad():
-                    model.model.model.sse.post_forward_mbc_cleanup()
-                    output_logits = torch.zeros(input_ids.size(0),
-                                                input_ids.size(1),
-                                                32000,
-                                                device=input_ids.device)
-
-                    past_key_values = None
-                    for i in tqdm(range(target_ids.size(1))):
-                        inputs = input_ids[:, i:i + 1]
-
-                        output = model(
-                            inputs,
-                            use_cache=False,
-                            past_key_values=past_key_values,
-                        )
-                        output_logits[:, i] = output.logits[:, -1]
-                        past_key_values = output.past_key_values
-
-                        if i % 100 == 0:
-                            ce = torch.nn.functional.cross_entropy(
-                                output_logits[:, :-1].reshape(
-                                    -1, output_logits.size(-1)),
-                                target_ids[:, 1:output_logits.size(1) +
-                                           1].view(-1),
-                            )
-                            print(f"intermediate ce: {ce.item()}")
-
-                    logits = output_logits[:, :-1].reshape(
-                        -1, output_logits.size(-1))
-                    t = target_ids[:, 1:].reshape(-1)
-                    loss = torch.nn.functional.cross_entropy(logits, t)
-                    nlls.append(loss.cpu())
-                    model.model.model.sse.post_forward_mbc_cleanup()
             elif args.method == "umbc":
                 with torch.no_grad():
                     model.model.model.sse.post_forward_mbc_cleanup()
-                    output_logits = torch.zeros(input_ids.size(0),
-                                                input_ids.size(1),
-                                                32000,
-                                                device=input_ids.device)
+
                     w = args.window
                     n_chnks = input_ids.size(1) // w
-                    loss = []
-                    for i in range(n_chnks):
-                        start = i * w
-                        end = (i + 1) * w
-                        inp = input_ids[:, :end]
-                        output = model(inp)
-                        output_logits[:, start:end] = output.logits[:, -w:]
+                    with tqdm(range(n_chnks)) as pbar2:
+                        for i in pbar2:
+                            start, end = i * w, (i + 1) * w
+                            inp = input_ids[:, :end]
+                            output = model(inp, use_cache=False)
 
-                    logits = output_logits[:, :-1].reshape(
-                        -1, output_logits.size(-1))
-                    t = target_ids[:, 1:].reshape(-1)
-                    loss = torch.nn.functional.cross_entropy(logits, t)
-                    nlls.append(loss.cpu())
+                            logits = output.logits[:, -w:]
+                            targets = target_ids[:, start:end]
+                            nll = torch.nn.functional.cross_entropy(
+                                logits[:, :-1].reshape(-1, logits.size(-1)),
+                                targets[:, 1:].reshape(-1),
+                            )
+                            nlls += [nll.cpu()]
+
+                            ppl = torch.exp(
+                                torch.stack(nlls).mean()).item()
+                            pbar2.set_description(f"{ppl=:.6f}")
+
                     model.model.model.sse.post_forward_mbc_cleanup()
-            elif args.method == "umbc-full-eval":
-                model.model.sse.post_forward_mbc_cleanup()
-
-                with torch.no_grad():
-                    outputs = model(input_ids,
-                                    labels=target_ids,
-                                    use_cache=False)
-                    neg_log_likelihood = outputs.loss
-
-                nlls.append(neg_log_likelihood.cpu())
-                print(torch.exp(neg_log_likelihood.cpu()).item())
 
             prev_end_loc = end_loc
             ppl = torch.exp(torch.stack(nlls).mean()).item()
