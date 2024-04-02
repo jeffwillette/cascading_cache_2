@@ -37,4 +37,6 @@ HIP_DENSE_LAYERS=3 HIP_K=256 CUDA_VISIBLE_DEVICES=0 python timber/main/llama_eva
 
 # UMBC
 
-PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python timber/trainer/timber_trainer.py --dataset openwebtext --batch_size 1 --slots 1 --method umbc --window 32 --seq_len 128 --model llama1.3b --max_steps 10000 --disable_kd --dev_run
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python timber/trainer/timber_trainer.py --model llama1.3b --disable_kd --batch_size 1 --max_steps 10000 --dataset openwebtext --slots 32 --window 256 --method umbc --chunk 32 --seq_len 32768 --accumulation_steps 16
+
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=7 python timber/main/llama_eval.py --job ppl --method umbc --slots 32 --window 256 --model llama1.3b --lora_r 8 --checkpoint ./checkpoint/llama1.3b-openwebtext-131072-epoch-00-step-2.pth

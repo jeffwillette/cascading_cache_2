@@ -70,11 +70,10 @@ def job_ppl(args, model, tokenizer, device):
                             )
                             nlls += [nll.cpu()]
 
-                            ppl = torch.exp(
-                                torch.stack(nlls).mean()).item()
+                            ppl = torch.exp(torch.stack(nlls).mean()).item()
                             pbar2.set_description(f"{ppl=:.6f}")
 
-                    model.model.model.sse.post_forward_mbc_cleanup()
+                    model.model.model.model.sse.post_forward_mbc_cleanup()
 
             prev_end_loc = end_loc
             ppl = torch.exp(torch.stack(nlls).mean()).item()

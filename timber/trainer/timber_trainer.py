@@ -1,9 +1,12 @@
 import gc
 import os
+from torch import nn
 from lightning.pytorch.strategies import DDPStrategy
 import copy
 from dataclasses import asdict, dataclass
+from tqdm import tqdm
 from torchmetrics.text.perplexity import Perplexity
+from timber.trainer.scheduler import LinearWarmupCosineAnnealingLR
 from os import PathLike
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -13,8 +16,7 @@ import torch.onnx
 import lightning as pl
 import transformers
 from lightning import Trainer
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.callbacks import EarlyStopping
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, GradientAccumulationScheduler
 from aim.pytorch_lightning import AimLogger
 from pytorch_lightning.profilers import PyTorchProfiler
 from torch.utils.data import Subset
@@ -48,13 +50,13 @@ torch.set_float32_matmul_precision('high')
 @dataclass
 class TrainConfig:
     dev_run: bool = False
-    disable_kd: bool = False
+    kd: bool = True
     using_fsdp: bool = False
-    lr: float = 5e-5
+    lr: float = 1e-4
     batch_size: int = 1
     accumulation_steps: int = 1
     lora_r: int = 32
-    save_steps: int = 100
+    save_steps: int = 10
     dense_queries: int = None
     seq_len: int = 1024
     max_steps: int = -1
@@ -238,17 +240,9 @@ def load_model(
     for m in model.modules():
         if hasattr(m, 'attention_method'):
             m.attention_method = method
-            m.tree_k = train_config.k
-            m.tree_block_size_q = train_config.block_size_q
-            m.tree_block_size_k = train_config.block_size_k
-            if train_config.dense_queries is None:
-                train_config.dense_queries = train_config.k
-            m.tree_dense_queries = train_config.dense_queries
-            m.tree_using_context_avg = not train_config.disable_global_context
         if hasattr(m, 'gradient_checkpointing'):
             m.gradient_checkpointing = True
             if train_config.using_fsdp:
-                # m._gradient_checkpointing_func = deepspeed.checkpointing.checkpoint
                 m._gradient_checkpointing_func = torch.utils.checkpoint.checkpoint
             else:
                 m._gradient_checkpointing_func = torch.utils.checkpoint.checkpoint
@@ -318,6 +312,7 @@ class LabModule(pl.LightningModule):
         self.validation_targets = []
 
         self.config = config
+        self.steps = {0: 1, 10: 2, 50: 4, 100: 8}
         # self.automatic_optimization = config.method != "umbc"
 
     def forward(
@@ -328,6 +323,7 @@ class LabModule(pl.LightningModule):
         position_ids=None,
         use_cache=False,
         past_key_values=None,
+        do_grad=True,
     ):
         return self.model(
             inputs,
@@ -336,38 +332,137 @@ class LabModule(pl.LightningModule):
             position_ids=position_ids,
             use_cache=use_cache,
             past_key_values=past_key_values,
+            do_grad=do_grad,
         )
 
-    def step_umbc(self,
-                  full_inputs,
-                  full_target,
-                  output_teacher,
-                  subset="train"):
+    # def on_before_optimizer_step(self, optimizer):
+    #     print(f"before optimizer step: {self.trainer.global_step=}")
 
-        # opt = self.optimizers()
+    def set_accumulate_grad_batches(self) -> int:
+        accumulate_grad_batches = 1
+        for iter_step in reversed(self.steps):
+            # print(f"set accumulate: {self.trainer.global_step=}")
+            if self.trainer.global_step >= iter_step:
+                accumulate_grad_batches = self.steps[iter_step]
+                break
+        self.trainer.accumulate_grad_batches = accumulate_grad_batches
+
+    def step_umbc_minibatch(
+        self,
+        full_inputs,
+        full_target,
+        output_teacher,
+        subset="train",
+        batch_idx=0,
+    ):
+
+        self.set_accumulate_grad_batches()
 
         w = self.config.window
         n_chnks = full_inputs.size(1) // self.config.window
-        loss = []
-        for i in range(n_chnks):
+        grad_chunks = torch.arange(n_chnks)[:3]
+
+        # we must include the 0 index as a grad chunk otherwise
+        # checkpointing func gets mad
+        if 0 not in grad_chunks:
+            grad_chunks[0] = 0
+
+        self.model.model.model.sse.post_forward_mbc_cleanup()
+        # self.model.model.sse.post_forward_mbc_cleanup()
+
+        pbar = range(n_chnks)
+        if self.local_rank == 0:
+            pbar = tqdm(range(n_chnks))
+
+        grad_loss, total_loss = [], []
+        for i in pbar:
             end = (i + 1) * w
             inp, tgt = full_inputs[:, :end], full_target[:, :end]
-            output = self(inp,
-                          tgt,
-                          output_hidden_states=not self.config.disable_kd)
+            with torch.autograd.set_grad_enabled(i in grad_chunks):
+                output = self(
+                    inp,
+                    tgt,
+                    output_hidden_states=False,
+                    do_grad=i in grad_chunks,
+                )
 
-            # if i != 0:
-            #     self.manual_backward(output.loss)
+            total_loss += [output.loss]
+            if i in grad_chunks:
+                grad_loss += [output.loss]
 
-            loss += [output.loss]
+        grad_loss = torch.stack(grad_loss).mean()
+        total_loss = torch.stack(total_loss).mean()
+        self.log_losses(total_loss, output.loss, 0, 0, subset="train")
+        return grad_loss
 
-        # opt.step()
-        # opt.zero_grad()
+    def step_umbc(
+        self,
+        full_inputs,
+        full_target,
+        output_teacher,
+        subset="train",
+        batch_idx=0,
+    ):
 
-        loss = torch.mean(torch.stack(loss))
+        self.set_accumulate_grad_batches()
+        opt = self.optimizers()
+        sch = self.lr_schedulers()
 
+        w = self.config.window
+        n_chnks = full_inputs.size(1) // self.config.window
+
+        self.model.model.model.sse.post_forward_mbc_cleanup()
+        # self.model.model.sse.post_forward_mbc_cleanup()
+
+        pbar = range(n_chnks)
+        if self.local_rank == 0:
+            pbar = tqdm(range(n_chnks))
+
+        loss = []
+        for i in pbar:
+            end = (i + 1) * w
+            inp, tgt = full_inputs[:, :end], full_target[:, :end]
+            # seems like gradient checkpinting breaks if we do not
+            # require grad on chunk 0 (unknown reason)
+            output = self(
+                inp,
+                tgt,
+                output_hidden_states=False,
+                do_grad=True,
+            )
+
+            l = output.loss / (self.trainer.accumulate_grad_batches * n_chnks)
+            self.manual_backward(l)
+            loss += [output.loss.detach()]
+
+        if (batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
+            self.clip_gradients(opt,
+                                gradient_clip_val=1.0,
+                                gradient_clip_algorithm="norm")
+
+            opt.step()
+            opt.zero_grad()
+            sch.step()
+
+        loss = torch.stack(loss).mean()
         self.log_losses(loss, output.loss, 0, 0, subset="train")
         return loss
+
+    # def on_before_backward(self, loss):
+    #     print("\n\non before backward\n\n")
+    #     for name, p in self.model.named_parameters():
+    #         if p.requires_grad:
+    #             print(name, p.requires_grad, p.shape, p.dtype)
+    #             if p.grad is not None:
+    #                 print(p.grad)
+
+    # def on_after_backward(self):
+    #     print("\n\non after backward\n\n")
+    #     for name, p in self.model.named_parameters():
+    #         if p.requires_grad:
+    #             print(name, p.requires_grad, p.shape, p.dtype)
+    #             if p.grad is not None:
+    #                 print(p.grad)
 
     def log_losses(self,
                    total,
@@ -375,15 +470,13 @@ class LabModule(pl.LightningModule):
                    kd_hidden=None,
                    kd_logits=None,
                    subset="train"):
-        self.log(f"{subset}_loss_model", ce.item())
+        self.log(f"{subset}_loss_model", total.item(), sync_dist=True)
 
     def step_plain(self, inputs, target, output_teacher=None, subset="train"):
-        output = self(inputs,
-                      target,
-                      output_hidden_states=not self.config.disable_kd)
+        output = self(inputs, target, output_hidden_states=self.config.kd)
 
         loss_kd_hidden, loss_kd_logits = 0, 0
-        if not self.config.disable_kd:
+        if self.config.kd:
             logits = output.logits
             for teacher_layer, student_layer in zip(
                     output_teacher.hidden_states, output.hidden_states):
@@ -402,7 +495,7 @@ class LabModule(pl.LightningModule):
             )
 
         loss = output.loss
-        if not self.config.disable_kd:
+        if self.config.kd:
             loss = loss * 0.1 + (loss_kd_hidden + loss_kd_logits) * 2.5
 
         self.log_losses(loss, output.loss, loss_kd_hidden, loss_kd_logits)
@@ -415,16 +508,26 @@ class LabModule(pl.LightningModule):
 
         inputs, target = batch
         output_teacher = None
-        if not self.config.disable_kd:
+        if self.config.kd:
             with torch.no_grad():
                 output_teacher = self.teacher(
-                    inputs, output_hidden_states=not self.config.disable_kd)
+                    inputs, output_hidden_states=self.config.kd)
 
         if self.config.method == "umbc":
-            loss = self.step_umbc(inputs,
-                                  target,
-                                  output_teacher,
-                                  subset="train")
+            loss = self.step_umbc_minibatch(
+                inputs,
+                target,
+                output_teacher,
+                subset="train",
+                batch_idx=batch_idx,
+            )
+            # loss = self.step_umbc(
+            #     inputs,
+            #     target,
+            #     output_teacher,
+            #     subset="train",
+            #     batch_idx=batch_idx,
+            # )
             return loss
 
         loss = self.step_plain(inputs, target, subset="train")
@@ -436,29 +539,35 @@ class LabModule(pl.LightningModule):
         inputs, target = batch
 
         if self.config.method == "umbc":
-            past_key_values, output_logits = None, torch.Tensor().to(
-                inputs.device)
-            with torch.no_grad():
-                for i in range(inputs.size(1)):
-                    output = self(
-                        inputs[:, i:i + 1],
-                        use_cache=True,
-                        past_key_values=past_key_values,
-                    )
-                    past_key_values = output.past_key_values
-                    output_logits = torch.cat(
-                        (output_logits, output.logits[:, :1]), dim=1)
 
-                    print(i, end=" ", flush=True)
-                    # breaking so lightning check doesn't take forever
-                    if i == 100:
-                        target = target[:, :output_logits.size(1)]
-                        break
+            w = self.config.window
+            n_chnks = inputs.size(1) // self.config.window
+            # self.model.model.model.sse.post_forward_mbc_cleanup()
+            self.model.model.sse.post_forward_mbc_cleanup()
+            loss, output_logits = [], []
 
-                loss = torch.nn.functional.cross_entropy(
-                    output_logits[:, :-1].reshape(-1, output_logits.size(-1)),
-                    target[:, 1:].reshape(-1),
+            pbar = range(n_chnks)
+            if self.local_rank == 0:
+                pbar = tqdm(range(n_chnks), leave=False)
+
+            for i in pbar:
+                end = (i + 1) * w
+                inp, tgt = inputs[:, :end], target[:, :end]
+                # seems like gradient checkpinting breaks if we do not
+                # require grad on chunk 0 (unknown reason)
+                output = self(
+                    inp,
+                    tgt,
+                    output_hidden_states=False,
+                    do_grad=False,
                 )
+
+                loss += [output.loss]
+                output_logits += [output.logits]
+
+            loss = torch.mean(torch.stack(loss))
+            output_logits = torch.cat(output_logits, dim=1)
+
         else:
             with torch.no_grad():
                 output = self(inputs, target)
@@ -500,7 +609,7 @@ class LabModule(pl.LightningModule):
             self.model = load_model(train_config=sconfig,
                                     method=sconfig.method,
                                     device=self.local_rank)
-            if not self.config.disable_kd:
+            if self.config.kd:
                 self.teacher = load_model(train_config=tconfig,
                                           method='none',
                                           device=self.local_rank)
@@ -510,13 +619,38 @@ class LabModule(pl.LightningModule):
     def configure_optimizers(self):
         params = []
         for name, p in self.model.named_parameters():
-            # print(name, p.requires_grad, p.shape, p.dtype)
             if p.requires_grad:
+                # print(name, p.requires_grad, p.shape, p.dtype)
                 params.append(p)
+
         if self.config.using_fsdp:
-            return DeepSpeedCPUAdam(params, lr=self.config.lr)
+            raise NotImplementedError()
+            # return DeepSpeedCPUAdam(params, lr=self.config.lr)
         # return DeepSpeedCPUAdam(params, lr=self.config.lr)
-        return torch.optim.AdamW(params, lr=self.config.lr)
+
+        opt = torch.optim.AdamW(
+            params,
+            lr=self.config.lr,
+            betas=(0.99, 0.999),
+        )
+
+        scheduler = LinearWarmupCosineAnnealingLR(
+            opt,
+            warmup_epochs=50,
+            max_epochs=1000,
+            warmup_start_lr=1e-6,
+            eta_min=1e-6,
+        )
+
+        out = {
+            "optimizer": opt,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step"
+            }
+        }
+
+        return out
 
 
 def main(config: TrainConfig):
@@ -555,14 +689,13 @@ def main(config: TrainConfig):
         devices = f"{d}"
         strategy = DDPStrategy(find_unused_parameters=False,
                                static_graph=False)
-        # strategy = "ddp_find_unused_parameters_false"
 
     if config.method == 'timber':
         filename = f'llama32k-{config.dataset}-{config.seq_len}-bq{config.block_size_q}-bk{config.block_size_k}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'none':
         filename = f'llama32k-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
     elif config.method == 'umbc':
-        filename = f'llama1.3b-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
+        filename = f'llama1.3b-{config.dataset}-{config.seq_len}-slots-{config.slots}-lora-r-{config.lora_r}-window-{config.window}-{{epoch:02d}}-{{step}}'
     elif config.method == 'reformer':
         filename = f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'performer':
@@ -579,6 +712,7 @@ def main(config: TrainConfig):
         every_n_train_steps=config.save_steps,
         enable_version_counter=False,
     )
+
     checkpoint_callback.CHECKPOINT_EQUALS_CHAR = '-'
     checkpoint_callback.FILE_EXTENSION = '.pth'
 
@@ -601,6 +735,7 @@ def main(config: TrainConfig):
         default_root_dir=config.model_checkpoint_dir,
         accumulate_grad_batches=config.accumulation_steps,
         max_epochs=20,
+        # gradient_clip_val=1.0,
         check_val_every_n_epoch=check_val_every_n_epoch,
         val_check_interval=val_check_interval,
         max_steps=config.max_steps,
@@ -633,7 +768,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--model', default='llama32k', type=str)
     parser.add_argument('--using_fsdp', action='store_true')
-    parser.add_argument('--disable_kd', action='store_true')
+    parser.add_argument('--kd', action='store_true')
     parser.add_argument('--dev_run', action='store_true')
     parser.add_argument('--disable_global_context', action='store_true')
     parser.add_argument('--accumulation_steps', default=-1, type=int)
@@ -659,7 +794,7 @@ if __name__ == "__main__":
     train_config = TrainConfig(
         dev_run=args.dev_run,
         using_fsdp=args.using_fsdp,
-        disable_kd=args.disable_kd,
+        kd=args.kd,
         dataset=args.dataset,
         load_from_checkpoint=args.checkpoint,
         k=args.k,

@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple, Union, Dict, Any
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import numpy as np
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
@@ -872,6 +873,14 @@ class LlamaFlashAttention2(LlamaAttention):
         )
 
 
+def apply_rotary_pos_emb_one(x, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # print(f"in apply one: {x.size()=} {cos.size()=} {sin.size()=}")
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    x_embed = (x * cos) + (rotate_half(x) * sin)
+    return x_embed
+
+
 class LlamaSdpaAttention(LlamaAttention):
     """
     Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
@@ -888,6 +897,7 @@ class LlamaSdpaAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
                Optional[Tuple[torch.Tensor]]]:
 
@@ -900,6 +910,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                **kwargs,
             )
 
         return self.forward_umbc(
@@ -910,9 +921,146 @@ class LlamaSdpaAttention(LlamaAttention):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            **kwargs,
         )
 
     def forward_umbc(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+
+        window = kwargs["window"]
+        slots = kwargs["slots"]
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads,
+                                         self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
+                                     self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
+                                         self.head_dim).transpose(1, 2)
+
+        # get the cache before rotary embeddings are applied.
+        # In case static cache is used, it is an instance attribute.
+        past_key_value = getattr(self, "past_key_value", past_key_value)
+
+        if past_key_value is not None:
+            key_states, key_slots = key_states[:, :, :-past_key_value.
+                                               slots], key_states[:, :,
+                                                                  -past_key_value
+                                                                  .slots:]
+            value_states, value_slots = value_states[:, :, :-past_key_value.
+                                                     slots], value_states[:, :,
+                                                                          -past_key_value
+                                                                          .
+                                                                          slots:]
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx)
+
+            key_states = torch.cat((key_states, key_slots), dim=2)
+            value_states = torch.cat((value_states, value_slots), dim=2)
+
+        def get_position_ids():
+            if past_key_value is not None:
+                return torch.arange(window + slots,
+                                    device=position_ids.device).unsqueeze(0)
+            return position_ids
+
+        cos, sin = self.rotary_emb(value_states, get_position_ids())
+
+        B, H, Q, D = query_states.size()
+        _, _, K, _ = key_states.size()
+
+        # print(
+        #     f"{query_states.size()=} {key_states.size()=} {value_states.size()=} {cos.size()=} {sin.size()=}"
+        # )
+
+        p = apply_rotary_pos_emb_one
+        scale = np.sqrt(query_states.size(-1))
+
+        qslots = p(query_states[:, :, :slots], cos[:, :slots], sin[:, :slots])
+        kslots = p(key_states[:, :, :slots], cos[:, :slots], sin[:, :slots])
+
+        qkslot = torch.einsum("bhxd,bhyd->bhxy", qslots / np.sqrt(scale),
+                              (kslots / np.sqrt(scale)))  # (B, H, slot, slot)
+
+        # print(f"{qkslot.size()=} {value_states[:, :, :slots].size()=}")
+        outslots = torch.einsum(
+            "bhxy,bhyz->bhxz",
+            qkslot.softmax(dim=-1),
+            value_states[:, :, :slots],
+        )
+
+        vals_out = [outslots]
+        # print(f"\n\nnew iter\n\n")
+        for i in range(slots, value_states.size(-2)):
+            k_start, k_end = max(slots, i - window +
+                                 1), i + 1  # key token (not slots)
+
+            # print(f"{i=} {k_start=} {k_end=}")
+
+            q = p(query_states[:, :, i:i + 1], cos[:, i:i + 1], sin[:,
+                                                                    i:i + 1])
+            k = p(key_states[:, :, k_start:k_end], cos[:, k_start:k_end],
+                  sin[:, k_start:k_end])
+
+            # this is a single row of query/key multiplication in attention matrix
+            qk = (q / np.sqrt(scale) * (k / np.sqrt(scale))).sum(dim=-1)
+            qkslots = (q / np.sqrt(scale) *
+                       (kslots / np.sqrt(scale))).sum(dim=-1)
+
+            # print(f"{q.size()=} {k.size()=} {qk.size()=} {qkslots.size()=}")
+            attn_row = torch.cat((qkslots, qk),
+                                 dim=-1).unsqueeze(-2)  # (B, H, 1, K+window)
+            attn_row = attn_row.softmax(dim=-1)
+
+            vals = torch.cat(
+                (value_states[:, :, :slots], value_states[:, :,
+                                                          k_start:k_end]),
+                dim=-2)
+            # print(f"{attn_row.size()=} {vals.size()=}")
+
+            vals_out += [torch.einsum("bhxy,bhyz->bhxz", attn_row, vals)]
+
+        attn_output = torch.cat(vals_out, dim=-2)
+        # print(f"{attn_output.size()} {value_states.size()=}")
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+    def forward_umbc_sdpa(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1416,31 +1564,35 @@ class LlamaModel(LlamaPreTrainedModel):
             )
             use_cache = False
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
         # ------------------------------------------------------
         # if we are doing the umbc model, pool everything here
+        do_grad, sse_end = self.training, 0
         if hasattr(self, "sse"):
+            kwargs["slots"] = self.config._umbc_slots
+            kwargs["window"] = self.config._window
             if not use_cache:
                 token_start = kwargs["token_start"]
                 sse_end = kwargs["sse_end"]
+                do_grad = kwargs.get("do_grad", self.training)
                 w = self.config._window
 
-                if sse_end > 0:
-                    if self.training:
-                        sse_out = self.sse.forward(inputs_embeds[:, :sse_end])
-                    else:
-                        # for evaluation, we do not need to recompute the graph on every iteration.
-                        sse_input = inputs_embeds[:, sse_end - w:sse_end]
-                        sse_out = self.sse.forward_mbc(sse_input)
+                if inputs_embeds is None:
+                    inputs_embeds = self.embed_tokens(input_ids[:,
+                                                                token_start:])
 
-                    inputs_embeds = inputs_embeds[:, token_start:]
+                if sse_end > 0:
+                    sse_start = max(0, sse_end - w)
+                    sse_input = inputs_embeds[:, sse_start:sse_end]
+
+                    sse_out = self.sse.forward_mbc(sse_input)
+
                     inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
             else:  # generation
                 raise NotImplementedError(
                     "implement the caching version of UMBC model")
         # ------------------------------------------------------
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
         def get_cache():
             if isinstance(past_key_values, UMBCSinkCache):
@@ -1448,6 +1600,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if self.config._umbc and past_key_values is None:
                 # init a new cache
+                raise NotImplementedError("reimplement caching for UMBC")
                 return UMBCSinkCache(
                     self.config._window,
                     num_sink_tokens=4,
@@ -1476,6 +1629,9 @@ class LlamaModel(LlamaPreTrainedModel):
         causal_mask = self._update_causal_mask(attention_mask, inputs_embeds,
                                                cache_position)
 
+        if hasattr(self, "sse"):
+            causal_mask = self._umbc_update_causal_mask(causal_mask, sse_end)
+
         # embed positions
         hidden_states = inputs_embeds
 
@@ -1489,7 +1645,7 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states, )
 
-            if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training and do_grad:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -1500,6 +1656,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache,
                     cache_position,
                     use_reentrant=False,
+                    **kwargs,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1510,7 +1667,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
-                )
+                    **kwargs)
 
             hidden_states = layer_outputs[0]
 
@@ -1545,6 +1702,43 @@ class LlamaModel(LlamaPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+
+    def _umbc_update_causal_mask(self, causal_mask, sse_end):
+        w = self.config._window
+        s = self.config._umbc_slots
+
+        # this is the second chunk, block out the triangles in the first section
+        # of the window block
+        if causal_mask.size(-1) < s + 2 * w - 1:
+
+            # print(f"first chunk")
+            # size = (1, 1, w, w)
+            # mask = torch.ones(size,
+            #                   dtype=torch.bool,
+            #                   device=causal_mask.device).tril()
+            # print(f"sse chunk before: {sse_end=} {(causal_mask != 0).long()=}")
+            # causal_mask[:, :, :s, :s] = 0
+            # print(
+            #     f"sse chunk after mask: {sse_end=} {(causal_mask != 0).long()=}"
+            # )
+            return causal_mask
+
+        size = (1, 1, w, w)
+        mask = torch.ones(size, dtype=torch.bool,
+                          device=causal_mask.device).tril(-1)
+        # print(f"sse chunk before: {sse_end=} {(causal_mask != 0).long()=}")
+        # causal_mask[:, :, :s, :s] = 0
+        causal_mask[:, :, s:s + w - 1, s:s + w] = causal_mask.amin().item()
+        # print(
+        #     f"sse chunk after first mask mask: {sse_end=} {(causal_mask != 0).long()=}"
+        # )
+        # print(causal_mask.size())
+        m = causal_mask.amin().item() * mask.repeat(causal_mask.size(0), 1, 1,
+                                                    1)
+        causal_mask = causal_mask.clone()
+        causal_mask[:, :, s + w - 1:s + 2 * w, s:s + w] = m
+        # print(f"sse chunk after mask: {sse_end=} {(causal_mask != 0).long()=}")
+        return causal_mask
 
     # TODO: As of torch==2.2.0, the `attention_mask` passed to the model in `generate` is 2D and of dynamic length even when the static
     # KV cache is used. This is an issue for torch.compile which then recaptures cudagraphs at each decode steps due to the dynamic shapes.
@@ -1662,6 +1856,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1695,8 +1890,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         w = self.model.config._window
-        sse_end = max(0, input_ids.size(1) - w)
-        token_start = max(0, input_ids.size(1) - 2 * w)
+        token_start = max(0, input_ids.size(1) - 2 * w + 1)
+        sse_end = max(0, input_ids.size(1) - w + 1)
+        # print(f"{input_ids.size()=} {token_start=} {sse_end=}")
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -1712,6 +1908,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             cache_position=cache_position,
             token_start=token_start,
             sse_end=sse_end,
+            **kwargs,
         )
 
         hidden_states = outputs[0]

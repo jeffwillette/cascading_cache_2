@@ -25,7 +25,7 @@ class GradCorrecter(nn.Module):
 
         handles = []
         for n, p in self.named_parameters():
-            if "norm_after" not in n:
+            if "norm_after" not in n and p.requires_grad:
                 h = p.register_hook(backward_hook)
                 handles.append(h)
 

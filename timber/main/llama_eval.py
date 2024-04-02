@@ -170,13 +170,13 @@ def load_model(args):
         print('load result', result)
         model = model.to(infer_dtype)
         print('lora checkpoint loaded from', args.checkpoint)
-    # elif args.method == "umbc":
-    #     if args.checkpoint is not None:
-    #         ckpt = torch.load(args.checkpoint, map_location="cpu")
+    elif args.method == "umbc":
+        if args.checkpoint is not None:
+            ckpt = torch.load(args.checkpoint, map_location="cpu")
 
-    #     ckpt = {k[6:]: v for k, v in ckpt["state_dict"].items()}
-    #     print(f"loading umbc checkpoint: {args.checkpoint=}")
-    #     model.load_state_dict(ckpt, strict=True)
+        ckpt = {k[6:]: v for k, v in ckpt["state_dict"].items()}
+        print(f"loading umbc checkpoint: {args.checkpoint=}")
+        model.load_state_dict(ckpt, strict=True)
 
     elif args.method != 'none':
         for m in model.modules():

@@ -8,7 +8,7 @@ class OpenWebTextDataset(Dataset):
     def __init__(self, tokenizer, stride):
         self.tokenizer = tokenizer
         self.dataset = datasets.load_dataset('Skylion007/openwebtext')['train']
-        self.window_size = 20
+        self.window_size = 100
         self.stride = stride
 
     def __len__(self):
@@ -35,7 +35,10 @@ if __name__ == '__main__':
     import transformers
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         'togethercomputer/LLaMA-2-7B-32K')
-    ds = OpenWebTextDataset(tokenizer, 4096)
+    maxsize = 131072
+    ds = OpenWebTextDataset(tokenizer, maxsize)
 
+    print(f"{len(ds)=}")
     for ids, labels in ds:
-        print(ids.shape)
+        if ids.size(0) < maxsize:
+            print("increase window")
