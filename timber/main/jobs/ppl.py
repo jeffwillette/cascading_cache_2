@@ -52,7 +52,8 @@ def job_ppl(args, model, tokenizer, device):
 
             elif args.method == "umbc":
                 with torch.no_grad():
-                    model.model.model.sse.post_forward_mbc_cleanup()
+                    # model.model.model.sse.post_forward_mbc_cleanup()
+                    model.model.sse.post_forward_mbc_cleanup()
 
                     w = args.window
                     n_chnks = input_ids.size(1) // w
@@ -73,7 +74,8 @@ def job_ppl(args, model, tokenizer, device):
                             ppl = torch.exp(torch.stack(nlls).mean()).item()
                             pbar2.set_description(f"{ppl=:.6f}")
 
-                    model.model.model.model.sse.post_forward_mbc_cleanup()
+                    # model.model.model.model.sse.post_forward_mbc_cleanup()
+                    model.model.sse.post_forward_mbc_cleanup()
 
             prev_end_loc = end_loc
             ppl = torch.exp(torch.stack(nlls).mean()).item()
