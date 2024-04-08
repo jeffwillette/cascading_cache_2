@@ -223,7 +223,7 @@ class SlotSetEncoder(MBCFunction):
                  attn_act: str = "slot-sigmoid",
                  eps: float = EPS,
                  ln_after: bool = True,
-                 max_batch: int = 32):
+                 max_batch: int = 64):
         super().__init__()
         self.name = "SlotSetEncoder"
         self.dim = dim

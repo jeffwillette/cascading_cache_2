@@ -55,13 +55,13 @@ class TrainConfig:
     lr: float = 1e-4
     batch_size: int = 1
     accumulation_steps: int = 1
-    lora_r: int = 32
+    lora_r: int = 0
     save_steps: int = 10
     dense_queries: int = None
     seq_len: int = 1024
     max_steps: int = -1
     model_checkpoint_dir: str = "./checkpoint"
-    dataset: str = 'wikitext2'
+    dataset: str = 'wikitext103'
     load_from_checkpoint: str = None
     k: int = 512
     slots: int = 32
@@ -209,6 +209,7 @@ def load_model(
             "slots",
             "norm_slots",
             "norm_after",
+            "_beta",
             # "input_layernorm",
             # "post_attention_layernorm",
             # "norm",
@@ -233,9 +234,13 @@ def load_model(
     if train_config.method == "umbc":
         # bitsandbytes somehow did not ignore this module and I could never figure out why.
         # just reinit the parameters to get rid of large values and NaN's
-        model.model.sse.slots.reset_parameters()
-        model.model.sse.norm_slots.reset_parameters()
-        model.model.sse.norm_after.reset_parameters()
+
+        for lyr in model.model.layers:
+            attn = lyr.self_attn
+            attn.sse.slots.reset_parameters()
+            attn.sse.norm_slots.reset_parameters()
+            attn.sse.norm_after.reset_parameters()
+            attn.reset_beta()
 
     for m in model.modules():
         if hasattr(m, 'attention_method'):
@@ -247,7 +252,8 @@ def load_model(
             else:
                 m._gradient_checkpointing_func = torch.utils.checkpoint.checkpoint
 
-    if method not in ["none"]:
+    if method not in ["none"] and train_config.lora_r > 0:
+        print("adding Lora")
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -265,14 +271,8 @@ def load_model(
                 # 'input_layernorm', 'post_attention_layernorm'
             ],
             modules_to_save=[
-                'input_layernorm',
-                'post_attention_layernorm',
-                'sse_q',
-                "sse_k",
-                "sse_v",
-                "slots",
-                "norm_slots",
-                'norm_after',
+                'input_layernorm', 'post_attention_layernorm', 'sse_q',
+                "sse_k", "sse_v", "slots", "norm_slots", 'norm_after', "_beta"
             ])
 
         model = prepare_model_for_kbit_training(
@@ -312,8 +312,8 @@ class LabModule(pl.LightningModule):
         self.validation_targets = []
 
         self.config = config
-        self.steps = {0: 1, 10: 2, 50: 4, 100: 8}
-        # self.automatic_optimization = config.method != "umbc"
+        self.steps = {0: 8, 10: 16, 50: 32, 100: 64}
+        self.automatic_optimization = config.method != "umbc"
 
     def forward(
         self,
@@ -341,13 +341,12 @@ class LabModule(pl.LightningModule):
     def set_accumulate_grad_batches(self) -> int:
         accumulate_grad_batches = 1
         for iter_step in reversed(self.steps):
-            # print(f"set accumulate: {self.trainer.global_step=}")
             if self.trainer.global_step >= iter_step:
                 accumulate_grad_batches = self.steps[iter_step]
                 break
         self.trainer.accumulate_grad_batches = accumulate_grad_batches
 
-    def step_umbc_minibatch(
+    def step_umbc_single(
         self,
         full_inputs,
         full_target,
@@ -356,44 +355,87 @@ class LabModule(pl.LightningModule):
         batch_idx=0,
     ):
 
-        self.set_accumulate_grad_batches()
+        # self.set_accumulate_grad_batches()
 
-        w = self.config.window
-        n_chnks = full_inputs.size(1) // self.config.window
-        grad_chunks = torch.arange(n_chnks)[:3]
+        # w = self.config.window
+        # n_chnks = full_inputs.size(1) // self.config.window
+        # grad_chunks = torch.arange(n_chnks)[:3]
 
-        # we must include the 0 index as a grad chunk otherwise
-        # checkpointing func gets mad
-        if 0 not in grad_chunks:
-            grad_chunks[0] = 0
+        # # we must include the 0 index as a grad chunk otherwise
+        # # checkpointing func gets mad
+        # if 0 not in grad_chunks:
+        #     grad_chunks[0] = 0
 
-        self.model.model.model.sse.post_forward_mbc_cleanup()
-        # self.model.model.sse.post_forward_mbc_cleanup()
+        opt = self.optimizers()
 
-        pbar = range(n_chnks)
+        model = self.model.model if self.config.lora_r == 0 else self.model.model.model
+        for lyr in model.layers:
+            lyr.self_attn.sse.post_forward_mbc_cleanup()
+
+        rng = full_inputs.size(1) - 1
+        pbar = range(rng)
         if self.local_rank == 0:
-            pbar = tqdm(range(n_chnks))
+            pbar = tqdm(range(rng))
 
-        grad_loss, total_loss = [], []
+        total_loss = []
+        grads_done = 0
+        past_key_values = None
+        add = self.config.window + self.config.slots
+        grad_chunks = add + torch.randperm(full_inputs.size(1) - add)[:64]
         for i in pbar:
-            end = (i + 1) * w
-            inp, tgt = full_inputs[:, :end], full_target[:, :end]
-            with torch.autograd.set_grad_enabled(i in grad_chunks):
+            inp, tgt = full_inputs[:, i:i + 1], full_target[:, i + 1:i + 2]
+            grad = i in grad_chunks
+            with torch.autograd.set_grad_enabled(grad):
                 output = self(
                     inp,
-                    tgt,
                     output_hidden_states=False,
-                    do_grad=i in grad_chunks,
+                    use_cache=True,
+                    past_key_values=past_key_values,
                 )
+                past_key_values = output.past_key_values
 
-            total_loss += [output.loss]
-            if i in grad_chunks:
-                grad_loss += [output.loss]
+            loss = torch.nn.functional.cross_entropy(
+                output.logits.view(-1, output.logits.size(-1)),
+                tgt.view(-1),
+            )
 
-        grad_loss = torch.stack(grad_loss).mean()
-        total_loss = torch.stack(total_loss).mean()
-        self.log_losses(total_loss, output.loss, 0, 0, subset="train")
-        return grad_loss
+            total_loss += [loss.detach()]
+            if grad:
+                self.manual_backward(loss / 32)
+                grads_done += 1
+
+                for i, (k, v) in enumerate(
+                        zip(past_key_values.key_cache,
+                            past_key_values.value_cache)):
+                    past_key_values.key_cache[i] = past_key_values.key_cache[
+                        i].detach()
+                    past_key_values.value_cache[
+                        i] = past_key_values.value_cache[i].detach()
+
+                if grads_done == 32:
+                    self.clip_gradients(opt,
+                                        gradient_clip_val=1.0,
+                                        gradient_clip_algorithm="norm")
+                    opt.step()
+                    opt.zero_grad()
+
+                    # sch = self.lr_schedulers()
+                    # sch.step()
+                    beta_stats = {}
+                    for i, lyr in enumerate(model.layers):
+                        lyr.self_attn.beta_step()
+                        mu, var = lyr.self_attn.get_beta_stats()
+                        beta_stats[f"beta_layer_{i}_mu"] = mu
+                        beta_stats[f"beta_layer_{i}_var"] = var
+                    self.log_dict(beta_stats,
+                                  on_step=True,
+                                  rank_zero_only=True)
+
+                    loss = torch.stack(total_loss).mean().exp()
+                    self.log_losses(loss, 0, 0, 0, subset="train")
+                    return loss
+
+        return loss
 
     def step_umbc(
         self,
@@ -404,15 +446,16 @@ class LabModule(pl.LightningModule):
         batch_idx=0,
     ):
 
-        self.set_accumulate_grad_batches()
+        # self.set_accumulate_grad_batches()
         opt = self.optimizers()
         sch = self.lr_schedulers()
 
         w = self.config.window
         n_chnks = full_inputs.size(1) // self.config.window
 
-        self.model.model.model.sse.post_forward_mbc_cleanup()
-        # self.model.model.sse.post_forward_mbc_cleanup()
+        model = self.model.model if self.config.lora_r == 0 else self.model.model.model
+        for lyr in model.layers:
+            lyr.self_attn.post_forward_mbc_cleanup()
 
         pbar = range(n_chnks)
         if self.local_rank == 0:
@@ -444,7 +487,8 @@ class LabModule(pl.LightningModule):
             opt.zero_grad()
             sch.step()
 
-        loss = torch.stack(loss).mean()
+        loss = torch.exp(torch.stack(loss).mean())
+        print(f"loss: {loss.item()=}")
         self.log_losses(loss, output.loss, 0, 0, subset="train")
         return loss
 
@@ -470,7 +514,10 @@ class LabModule(pl.LightningModule):
                    kd_hidden=None,
                    kd_logits=None,
                    subset="train"):
-        self.log(f"{subset}_loss_model", total.item(), sync_dist=True)
+        self.log(f"{subset}_loss_model",
+                 total.item(),
+                 sync_dist=True,
+                 on_step=True)
 
     def step_plain(self, inputs, target, output_teacher=None, subset="train"):
         output = self(inputs, target, output_hidden_states=self.config.kd)
@@ -514,20 +561,13 @@ class LabModule(pl.LightningModule):
                     inputs, output_hidden_states=self.config.kd)
 
         if self.config.method == "umbc":
-            loss = self.step_umbc_minibatch(
+            loss = self.step_umbc_single(
                 inputs,
                 target,
                 output_teacher,
                 subset="train",
                 batch_idx=batch_idx,
             )
-            # loss = self.step_umbc(
-            #     inputs,
-            #     target,
-            #     output_teacher,
-            #     subset="train",
-            #     batch_idx=batch_idx,
-            # )
             return loss
 
         loss = self.step_plain(inputs, target, subset="train")
@@ -540,30 +580,38 @@ class LabModule(pl.LightningModule):
 
         if self.config.method == "umbc":
 
-            w = self.config.window
-            n_chnks = inputs.size(1) // self.config.window
-            # self.model.model.model.sse.post_forward_mbc_cleanup()
-            self.model.model.sse.post_forward_mbc_cleanup()
+            model = self.model.model if self.config.lora_r == 0 else self.model.model.model
+            for lyr in model.layers:
+                lyr.self_attn.sse.post_forward_mbc_cleanup()
+
             loss, output_logits = [], []
 
-            pbar = range(n_chnks)
+            rng = inputs.size(1) - 1
+            pbar = range(rng)
             if self.local_rank == 0:
-                pbar = tqdm(range(n_chnks), leave=False)
+                pbar = tqdm(range(rng), leave=False)
 
+            past_key_values = None
             for i in pbar:
-                end = (i + 1) * w
-                inp, tgt = inputs[:, :end], target[:, :end]
-                # seems like gradient checkpinting breaks if we do not
-                # require grad on chunk 0 (unknown reason)
-                output = self(
-                    inp,
-                    tgt,
-                    output_hidden_states=False,
-                    do_grad=False,
+                inp, tgt = inputs[:, i:i + 1], target[:, i + 1:i + 2]
+                output = self(inp,
+                              output_hidden_states=False,
+                              do_grad=False,
+                              use_cache=True,
+                              past_key_values=past_key_values)
+                past_key_values = output.past_key_values
+
+                ce = torch.nn.functional.cross_entropy(
+                    output.logits.view(-1, output.logits.size(-1)),
+                    tgt.view(-1),
                 )
 
-                loss += [output.loss]
+                loss += [ce]
                 output_logits += [output.logits]
+
+                if i % 100 == 0 and self.local_rank == 0:
+                    ppl = torch.exp(torch.mean(torch.stack(loss)))
+                    pbar.set_description(f"ppl: {ppl:.4f}")
 
             loss = torch.mean(torch.stack(loss))
             output_logits = torch.cat(output_logits, dim=1)
@@ -634,23 +682,25 @@ class LabModule(pl.LightningModule):
             betas=(0.99, 0.999),
         )
 
-        scheduler = LinearWarmupCosineAnnealingLR(
-            opt,
-            warmup_epochs=50,
-            max_epochs=1000,
-            warmup_start_lr=1e-6,
-            eta_min=1e-6,
-        )
+        return opt
 
-        out = {
-            "optimizer": opt,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step"
-            }
-        }
+        # scheduler = LinearWarmupCosineAnnealingLR(
+        #     opt,
+        #     warmup_epochs=50,
+        #     max_epochs=1000,
+        #     warmup_start_lr=1e-6,
+        #     eta_min=1e-6,
+        # )
 
-        return out
+        # out = {
+        #     "optimizer": opt,
+        #     "lr_scheduler": {
+        #         "scheduler": scheduler,
+        #         "interval": "step"
+        #     }
+        # }
+
+        # return out
 
 
 def main(config: TrainConfig):
@@ -773,7 +823,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable_global_context', action='store_true')
     parser.add_argument('--accumulation_steps', default=-1, type=int)
     parser.add_argument('--batch_size', default=-1, type=int)
-    parser.add_argument('--lora_r', default=-1, type=int)
+    parser.add_argument('--lora_r', default=0, type=int)
     parser.add_argument('--lr', default=-1, type=float)
     parser.add_argument('--max_steps', default=-1, type=int)
     parser.add_argument('--dataset', default='wikitext103', type=str)

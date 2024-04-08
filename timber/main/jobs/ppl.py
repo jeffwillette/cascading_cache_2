@@ -53,29 +53,37 @@ def job_ppl(args, model, tokenizer, device):
             elif args.method == "umbc":
                 with torch.no_grad():
                     # model.model.model.sse.post_forward_mbc_cleanup()
-                    model.model.sse.post_forward_mbc_cleanup()
+                    mdl = model.model if args.lora_r == 0 else model.model.model
+                    for lyr in mdl.layers:
+                        lyr.self_attn.sse.post_forward_mbc_cleanup()
 
-                    w = args.window
-                    n_chnks = input_ids.size(1) // w
-                    with tqdm(range(n_chnks)) as pbar2:
+                    rng = input_ids.size(1) - 1
+                    past_key_values = None
+                    with tqdm(range(rng)) as pbar2:
                         for i in pbar2:
-                            start, end = i * w, (i + 1) * w
-                            inp = input_ids[:, :end]
-                            output = model(inp, use_cache=False)
+                            inp = input_ids[:, i:i + 1]
+                            output = model(
+                                inp,
+                                use_cache=True,
+                                past_key_values=past_key_values,
+                            )
 
-                            logits = output.logits[:, -w:]
-                            targets = target_ids[:, start:end]
+                            past_key_values = output.past_key_values
+
+                            logits = output.logits[:, -1:]
+                            targets = target_ids[:, i + 1:i + 2]
                             nll = torch.nn.functional.cross_entropy(
-                                logits[:, :-1].reshape(-1, logits.size(-1)),
-                                targets[:, 1:].reshape(-1),
+                                logits.reshape(-1, logits.size(-1)),
+                                targets.reshape(-1),
                             )
                             nlls += [nll.cpu()]
 
-                            ppl = torch.exp(torch.stack(nlls).mean()).item()
-                            pbar2.set_description(f"{ppl=:.6f}")
+                            if i % 100 == 0:
+                                ppl = torch.exp(torch.stack(nlls).mean()).item()
+                                pbar2.set_description(f"{ppl=:.6f}")
 
-                    # model.model.model.model.sse.post_forward_mbc_cleanup()
-                    model.model.sse.post_forward_mbc_cleanup()
+                    for lyr in mdl.layers:
+                        lyr.self_attn.sse.post_forward_mbc_cleanup()
 
             prev_end_loc = end_loc
             ppl = torch.exp(torch.stack(nlls).mean()).item()

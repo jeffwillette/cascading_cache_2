@@ -91,14 +91,11 @@ class UMBCSinkCache(Cache):
             The number of sink tokens. See the original paper for more information.
     """
 
-    def __init__(self, window_length: int, num_sink_tokens: int,
-                 slots: int) -> None:
+    def __init__(self, window_length: int, num_sink_tokens: int) -> None:
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
         self.window_length = window_length
         self.num_sink_tokens = num_sink_tokens
-        self.cos_sin_cache = {}
-        self.slots = slots
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
@@ -110,7 +107,7 @@ class UMBCSinkCache(Cache):
 
     def get_max_length(self) -> Optional[int]:
         """Returns the maximum sequence length of the cached states."""
-        return self.window_length
+        return self.window_length + self.num_sink_tokens
 
     def update(
         self,
@@ -139,7 +136,6 @@ class UMBCSinkCache(Cache):
         """
         # Optional kwargs for `SinkCache` -- needed on models using RoPE. `partial_rotation_size` is used on models
         # with partially rotated position embeddings, like Phi or Persimmon.
-
         # Update the number of seen tokens
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
@@ -151,7 +147,7 @@ class UMBCSinkCache(Cache):
             self.value_cache.append(value_states)
 
         elif key_states.shape[-2] + self.get_seq_length(
-                layer_idx) < self.window_length:
+                layer_idx) < self.get_max_length():
             # Growing cache
             self.key_cache[layer_idx] = torch.cat(
                 [self.key_cache[layer_idx], key_states], dim=-2)
@@ -162,7 +158,6 @@ class UMBCSinkCache(Cache):
             # Shifting cache
             keys_to_keep = self.key_cache[layer_idx][:, :,
                                                      -self.window_length +
-                                                     self.num_sink_tokens +
                                                      key_states.shape[-2]:]
 
             # Concatenate sink tokens, shifted & rotated tokens (if needed), and new tokens
@@ -174,7 +169,6 @@ class UMBCSinkCache(Cache):
                                                       num_sink_tokens]
             values_to_keep = self.value_cache[layer_idx][:, :,
                                                          -self.window_length +
-                                                         self.num_sink_tokens +
                                                          value_states.
                                                          shape[-2]:]
             self.value_cache[layer_idx] = torch.cat(
@@ -508,6 +502,44 @@ class LlamaAttention(nn.Module):
                                 self.hidden_size,
                                 bias=config.attention_bias)
         self._init_rope()
+
+        if self.config._umbc:
+            self.sse = SlotSetEncoder(
+                K=config._umbc_slots,
+                dim=config.hidden_size,
+                slot_type="deterministic",
+                heads=config.num_attention_heads,
+            )
+
+            self.register_buffer(
+                "_beta",
+                torch.tensor([1.0 for _ in range(config._umbc_slots)]))
+            # self._beta = nn.Parameter(
+            #     torch.Tensor([2.0 for _ in range(config._umbc_slots)]))
+
+    def reset_beta(self):
+        # torch.nn.init.constant_(self._beta, 2.0)
+        torch.nn.init.constant_(self._beta, 1.0)
+
+    def get_beta_stats(self):
+        return self._beta.data.mean().item(), self._beta.var().item()
+
+    def beta_step(self):
+        self._beta += -1/500
+
+    def beta(self):
+        beta = F.relu(self._beta)
+
+        return torch.cat(
+            (beta,
+             torch.ones(self.config._window,
+                        device=self._beta.device,
+                        dtype=self._beta.dtype))).view(1, 1, -1, 1)
+        # return torch.cat(
+        #     (torch.sigmoid(self._beta),
+        #      torch.ones(self.config._window,
+        #                 device=self._beta.device,
+        #                 dtype=self._beta.dtype))).view(1, 1, -1, 1)
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -952,9 +984,6 @@ class LlamaSdpaAttention(LlamaAttention):
                 cache_position=cache_position,
             )
 
-        window = kwargs["window"]
-        slots = kwargs["slots"]
-
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -968,95 +997,116 @@ class LlamaSdpaAttention(LlamaAttention):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
                                          self.head_dim).transpose(1, 2)
 
+        # print(f"at the beginning: {query_states.size()=} {key_states.size()=} {value_states.size()=}")
         # get the cache before rotary embeddings are applied.
         # In case static cache is used, it is an instance attribute.
         past_key_value = getattr(self, "past_key_value", past_key_value)
 
         if past_key_value is not None:
-            key_states, key_slots = key_states[:, :, :-past_key_value.
-                                               slots], key_states[:, :,
-                                                                  -past_key_value
-                                                                  .slots:]
-            value_states, value_slots = value_states[:, :, :-past_key_value.
-                                                     slots], value_states[:, :,
-                                                                          -past_key_value
-                                                                          .
-                                                                          slots:]
+            do_sse = past_key_value.get_seq_length(
+                self.layer_idx) + key_states.size(
+                    -2) >= past_key_value.get_max_length()
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx)
 
-            key_states = torch.cat((key_states, key_slots), dim=2)
-            value_states = torch.cat((value_states, value_slots), dim=2)
+            sse_keys, sse_values = None, None
+            if hasattr(self, "sse"):
+                if not use_cache:
+                    raise NotImplementedError("UMBC version must use cache")
+
+                sse_out = self.sse.forward_mbc(hidden_states)
+
+                if do_sse:
+                    sse_keys = self.k_proj(sse_out)
+                    sse_values = self.v_proj(sse_out)
+
+                    sse_keys = sse_keys.view(bsz, sse_keys.size(1),
+                                             self.num_heads,
+                                             self.head_dim).transpose(1, 2)
+                    sse_values = sse_values.view(bsz, sse_values.size(1),
+                                                 self.num_heads,
+                                                 self.head_dim).transpose(
+                                                     1, 2)
+
+                # key_states = torch.cat((key_states[:, :, :past_key_value.num_sink_tokens], sse_keys, key_states[:, :, past_key_value.num_sink_tokens:]), dim=2)
+                # value_states = torch.cat((value_states[:, :, :past_key_value.num_sink_tokens], sse_values, value_states[:, :, past_key_value.num_sink_tokens:]), dim=2)
+                # print(f"after cat: {query_states.size()=} {key_states.size()=} {value_states.size()=}")
+
+        include_n_sse = min(
+            self.config._umbc_slots,
+            max(0, past_key_value._seen_tokens - past_key_value.window_length))
 
         def get_position_ids():
             if past_key_value is not None:
-                return torch.arange(window + slots,
+                if sse_keys is None:
+                    return torch.arange(
+                        key_states.size(-2),
+                        device=position_ids.device).unsqueeze(0)
+                # return torch.arange(key_states.size(-2) + include_n_sse, device=position_ids.device).unsqueeze(0)
+                return torch.arange(key_states.size(-2),
                                     device=position_ids.device).unsqueeze(0)
             return position_ids
 
+        # print(f"{position_ids=}")
         cos, sin = self.rotary_emb(value_states, get_position_ids())
 
         B, H, Q, D = query_states.size()
         _, _, K, _ = key_states.size()
 
-        # print(
-        #     f"{query_states.size()=} {key_states.size()=} {value_states.size()=} {cos.size()=} {sin.size()=}"
-        # )
-
         p = apply_rotary_pos_emb_one
         scale = np.sqrt(query_states.size(-1))
 
-        qslots = p(query_states[:, :, :slots], cos[:, :slots], sin[:, :slots])
-        kslots = p(key_states[:, :, :slots], cos[:, :slots], sin[:, :slots])
+        # print(f"{query_states.size()=} {key_states.size()=} {value_states.size()=} {cos.size()=} {sin.size()=} {include_n_sse=}")
+        if sse_keys is not None:
+            # key_states = torch.cat((sse_keys[:, :, :include_n_sse], key_states), dim=-2)
+            # value_states = torch.cat((sse_values[:, :, :include_n_sse], value_states), dim=-2)
+            B, H, S, D = key_states.size()
+            beta = self.beta()
 
-        qkslot = torch.einsum("bhxd,bhyd->bhxy", qslots / np.sqrt(scale),
-                              (kslots / np.sqrt(scale)))  # (B, H, slot, slot)
-
-        # print(f"{qkslot.size()=} {value_states[:, :, :slots].size()=}")
-        outslots = torch.einsum(
-            "bhxy,bhyz->bhxz",
-            qkslot.softmax(dim=-1),
-            value_states[:, :, :slots],
-        )
-
-        vals_out = [outslots]
-        # print(f"\n\nnew iter\n\n")
-        for i in range(slots, value_states.size(-2)):
-            k_start, k_end = max(slots, i - window +
-                                 1), i + 1  # key token (not slots)
-
-            # print(f"{i=} {k_start=} {k_end=}")
-
-            q = p(query_states[:, :, i:i + 1], cos[:, i:i + 1], sin[:,
-                                                                    i:i + 1])
-            k = p(key_states[:, :, k_start:k_end], cos[:, k_start:k_end],
-                  sin[:, k_start:k_end])
-
-            # this is a single row of query/key multiplication in attention matrix
-            qk = (q / np.sqrt(scale) * (k / np.sqrt(scale))).sum(dim=-1)
-            qkslots = (q / np.sqrt(scale) *
-                       (kslots / np.sqrt(scale))).sum(dim=-1)
-
-            # print(f"{q.size()=} {k.size()=} {qk.size()=} {qkslots.size()=}")
-            attn_row = torch.cat((qkslots, qk),
-                                 dim=-1).unsqueeze(-2)  # (B, H, 1, K+window)
-            attn_row = attn_row.softmax(dim=-1)
-
-            vals = torch.cat(
-                (value_states[:, :, :slots], value_states[:, :,
-                                                          k_start:k_end]),
+            key_states = beta * key_states + (1 - beta) * torch.cat(
+                (sse_keys[:, :, :include_n_sse],
+                 torch.zeros(B,
+                             H,
+                             S - include_n_sse,
+                             D,
+                             device=key_states.device,
+                             dtype=key_states.dtype)),
                 dim=-2)
-            # print(f"{attn_row.size()=} {vals.size()=}")
+            value_states = beta * value_states + (1 - beta) * torch.cat(
+                (sse_values[:, :, :include_n_sse],
+                 torch.zeros(B,
+                             H,
+                             S - include_n_sse,
+                             D,
+                             device=key_states.device,
+                             dtype=key_states.dtype)),
+                dim=-2)
 
-            vals_out += [torch.einsum("bhxy,bhyz->bhxz", attn_row, vals)]
+        q = p(query_states, cos[:, -1:], sin[:, -1:])
+        k = p(key_states, cos, sin)
 
-        attn_output = torch.cat(vals_out, dim=-2)
-        # print(f"{attn_output.size()} {value_states.size()=}")
+        # k = torch.cat((k, sse_keys), dim=-2)
+        # value_states = torch.cat((value_states, sse_values), dim=-2)
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+        # print(f"{q.size()=} {k.size()=}")
 
-        attn_output = self.o_proj(attn_output)
+        atten = torch.einsum("bhxd,bhyd->bhxy", q / np.sqrt(scale),
+                             (k / np.sqrt(scale)))  # (B, H, slot, slot)
+
+        # mask = torch.zeros(k.size(-2), device=k.device, dtype=k.dtype)
+        # mask[-sse_keys.size(-2):] = -1e10
+        # print(mask)
+        # atten = atten + mask.view(1, 1, 1, -1)
+
+        atten = atten.softmax(dim=-1)
+        # print(f"{atten=} {mask=}")
+
+        # print(f"{atten.size()=} {value_states.size()=}")
+        out = torch.einsum("bhxy,bhyz->bhxz", atten, value_states)
+
+        out = out.transpose(1, 2).contiguous()
+        out = out.view(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(out)
 
         return attn_output, None, past_key_value
 
@@ -1164,8 +1214,7 @@ class LlamaSdpaAttention(LlamaAttention):
 
         return attn_output, None, past_key_value
 
-    # Adapted from LlamaAttention.forward
-    def forward_original(
+    def forward_original_backup(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1252,6 +1301,109 @@ class LlamaSdpaAttention(LlamaAttention):
 
         return attn_output, None, past_key_value
 
+    # Adapted from LlamaAttention.forward
+
+    def forward_original(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads,
+                                         self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
+                                     self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
+                                         self.head_dim).transpose(1, 2)
+
+        # In case static cache is used, it is an instance attribute.
+        past_key_value = getattr(self, "past_key_value", past_key_value)
+
+        def get_position_ids():
+            if past_key_value is not None:
+                # return torch.arange(past_key_value.get_seq_length(),
+                #                     device=position_ids.device).unsqueeze(0)
+                rng = min(
+                    past_key_value.get_max_length(),
+                    key_states.size(2) +
+                    past_key_value.get_seq_length(layer_idx=self.layer_idx))
+                return torch.arange(rng,
+                                    device=position_ids.device).unsqueeze(0)
+            return position_ids
+
+        cos, sin = self.rotary_emb(value_states, get_position_ids())
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {
+                "sin": sin,
+                "cos": cos,
+                "cache_position": cache_position
+            }
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs)
+
+        query_states = apply_rotary_pos_emb_one(query_states, cos[:, -1:],
+                                                sin[:, -1:])
+        key_states = apply_rotary_pos_emb_one(key_states, cos, sin)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        causal_mask = attention_mask
+        # if attention_mask is not None and cache_position is not None:
+        if attention_mask is not None:
+            causal_mask = causal_mask[:, :, :, :key_states.shape[-2]]
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and causal_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
 
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
@@ -1278,6 +1430,7 @@ class LlamaDecoderLayer(nn.Module):
                                             eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size,
                                                      eps=config.rms_norm_eps)
+        self.config = config
 
     def forward(
         self,
@@ -1507,14 +1660,6 @@ class LlamaModel(LlamaPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size,
                                          self.padding_idx)
 
-        if self.config._umbc:
-            self.sse = SlotSetEncoder(
-                K=config._umbc_slots,
-                dim=config.hidden_size,
-                slot_type="deterministic",
-                heads=config.num_attention_heads,
-            )
-
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(config, layer_idx)
             for layer_idx in range(config.num_hidden_layers)
@@ -1559,38 +1704,15 @@ class LlamaModel(LlamaPreTrainedModel):
             )
 
         if self.gradient_checkpointing and self.training and use_cache:
+            # logger.warning_once(
+            #     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            # )
+            # use_cache = False
             logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `gradient_checkpointing=False`."
             )
-            use_cache = False
+            self.gradient_checkpointing = False
 
-        # ------------------------------------------------------
-        # if we are doing the umbc model, pool everything here
-        do_grad, sse_end = self.training, 0
-        if hasattr(self, "sse"):
-            kwargs["slots"] = self.config._umbc_slots
-            kwargs["window"] = self.config._window
-            if not use_cache:
-                token_start = kwargs["token_start"]
-                sse_end = kwargs["sse_end"]
-                do_grad = kwargs.get("do_grad", self.training)
-                w = self.config._window
-
-                if inputs_embeds is None:
-                    inputs_embeds = self.embed_tokens(input_ids[:,
-                                                                token_start:])
-
-                if sse_end > 0:
-                    sse_start = max(0, sse_end - w)
-                    sse_input = inputs_embeds[:, sse_start:sse_end]
-
-                    sse_out = self.sse.forward_mbc(sse_input)
-
-                    inputs_embeds = torch.cat((sse_out, inputs_embeds), dim=1)
-            else:  # generation
-                raise NotImplementedError(
-                    "implement the caching version of UMBC model")
-        # ------------------------------------------------------
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -1600,11 +1722,10 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if self.config._umbc and past_key_values is None:
                 # init a new cache
-                raise NotImplementedError("reimplement caching for UMBC")
                 return UMBCSinkCache(
                     self.config._window,
-                    num_sink_tokens=4,
-                    slots=self.config._umbc_slots,
+                    # num_sink_tokens=0,
+                    num_sink_tokens=self.config._umbc_slots,
                 )
             return DynamicCache.from_legacy_cache(past_key_values)
 
@@ -1629,9 +1750,6 @@ class LlamaModel(LlamaPreTrainedModel):
         causal_mask = self._update_causal_mask(attention_mask, inputs_embeds,
                                                cache_position)
 
-        if hasattr(self, "sse"):
-            causal_mask = self._umbc_update_causal_mask(causal_mask, sse_end)
-
         # embed positions
         hidden_states = inputs_embeds
 
@@ -1645,7 +1763,7 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states, )
 
-            if self.gradient_checkpointing and self.training and do_grad:
+            if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -1702,43 +1820,6 @@ class LlamaModel(LlamaPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-
-    def _umbc_update_causal_mask(self, causal_mask, sse_end):
-        w = self.config._window
-        s = self.config._umbc_slots
-
-        # this is the second chunk, block out the triangles in the first section
-        # of the window block
-        if causal_mask.size(-1) < s + 2 * w - 1:
-
-            # print(f"first chunk")
-            # size = (1, 1, w, w)
-            # mask = torch.ones(size,
-            #                   dtype=torch.bool,
-            #                   device=causal_mask.device).tril()
-            # print(f"sse chunk before: {sse_end=} {(causal_mask != 0).long()=}")
-            # causal_mask[:, :, :s, :s] = 0
-            # print(
-            #     f"sse chunk after mask: {sse_end=} {(causal_mask != 0).long()=}"
-            # )
-            return causal_mask
-
-        size = (1, 1, w, w)
-        mask = torch.ones(size, dtype=torch.bool,
-                          device=causal_mask.device).tril(-1)
-        # print(f"sse chunk before: {sse_end=} {(causal_mask != 0).long()=}")
-        # causal_mask[:, :, :s, :s] = 0
-        causal_mask[:, :, s:s + w - 1, s:s + w] = causal_mask.amin().item()
-        # print(
-        #     f"sse chunk after first mask mask: {sse_end=} {(causal_mask != 0).long()=}"
-        # )
-        # print(causal_mask.size())
-        m = causal_mask.amin().item() * mask.repeat(causal_mask.size(0), 1, 1,
-                                                    1)
-        causal_mask = causal_mask.clone()
-        causal_mask[:, :, s + w - 1:s + 2 * w, s:s + w] = m
-        # print(f"sse chunk after mask: {sse_end=} {(causal_mask != 0).long()=}")
-        return causal_mask
 
     # TODO: As of torch==2.2.0, the `attention_mask` passed to the model in `generate` is 2D and of dynamic length even when the static
     # KV cache is used. This is an issue for torch.compile which then recaptures cudagraphs at each decode steps due to the dynamic shapes.
@@ -1889,9 +1970,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                                 self.config.output_hidden_states)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        w = self.model.config._window
-        token_start = max(0, input_ids.size(1) - 2 * w + 1)
-        sse_end = max(0, input_ids.size(1) - w + 1)
         # print(f"{input_ids.size()=} {token_start=} {sse_end=}")
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
@@ -1906,8 +1984,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            token_start=token_start,
-            sse_end=sse_end,
             **kwargs,
         )
 
@@ -1927,10 +2003,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
-            if self.model.config._umbc:
-                logits = logits[:, -w:]
-                labels = labels[:, -w:]
-
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
