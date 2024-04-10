@@ -11,6 +11,9 @@ from os import PathLike
 from pathlib import Path
 from dataclasses import dataclass, field
 
+from lightning.fabric import Fabric
+import gc
+
 import torch
 import torch.onnx
 import lightning as pl
@@ -242,6 +245,19 @@ def load_model(
             attn.sse.norm_after.reset_parameters()
             attn.reset_beta()
 
+        if train_config.init_from_checkpoint is not None:
+            print('loading from', train_config.init_from_checkpoint)
+            state_dict = torch.load(train_config.init_from_checkpoint,
+                                    map_location='cpu')['state_dict']
+            keys = list(state_dict.keys())
+            for key in keys:
+                x = state_dict[key]
+                state_dict[key[6:]] = x
+                del state_dict[key]
+            model.load_state_dict(state_dict)
+            print('UMBC checkpoint loaded from',
+                  train_config.init_from_checkpoint)
+
     for m in model.modules():
         if hasattr(m, 'attention_method'):
             m.attention_method = method
@@ -355,22 +371,13 @@ class LabModule(pl.LightningModule):
         batch_idx=0,
     ):
 
-        # self.set_accumulate_grad_batches()
-
-        # w = self.config.window
-        # n_chnks = full_inputs.size(1) // self.config.window
-        # grad_chunks = torch.arange(n_chnks)[:3]
-
-        # # we must include the 0 index as a grad chunk otherwise
-        # # checkpointing func gets mad
-        # if 0 not in grad_chunks:
-        #     grad_chunks[0] = 0
-
+        print("start of loop gc collect")
         opt = self.optimizers()
 
         model = self.model.model if self.config.lora_r == 0 else self.model.model.model
         for lyr in model.layers:
             lyr.self_attn.sse.post_forward_mbc_cleanup()
+            lyr.self_attn.beta_step()
 
         rng = full_inputs.size(1) - 1
         pbar = range(rng)
@@ -378,13 +385,14 @@ class LabModule(pl.LightningModule):
             pbar = tqdm(range(rng))
 
         total_loss = []
-        grads_done = 0
         past_key_values = None
         add = self.config.window + self.config.slots
-        grad_chunks = add + torch.randperm(full_inputs.size(1) - add)[:64]
+        # grad_chunks = add + torch.randperm(full_inputs.size(1) - add)[:64]
         for i in pbar:
             inp, tgt = full_inputs[:, i:i + 1], full_target[:, i + 1:i + 2]
-            grad = i in grad_chunks
+            # grad = i in grad_chunks
+            grad = fabric.broadcast(i > add and torch.rand(1).item() >= 0.98)
+
             with torch.autograd.set_grad_enabled(grad):
                 output = self(
                     inp,
@@ -401,8 +409,9 @@ class LabModule(pl.LightningModule):
 
             total_loss += [loss.detach()]
             if grad:
-                self.manual_backward(loss / 32)
-                grads_done += 1
+                beta_inv = 1 / (1 - model.layers[0].self_attn._beta[0])
+                # print(f"{beta_inv=} {loss=}")
+                self.manual_backward(beta_inv * loss / 32)
 
                 for i, (k, v) in enumerate(
                         zip(past_key_values.key_cache,
@@ -412,28 +421,26 @@ class LabModule(pl.LightningModule):
                     past_key_values.value_cache[
                         i] = past_key_values.value_cache[i].detach()
 
-                if grads_done == 32:
-                    self.clip_gradients(opt,
-                                        gradient_clip_val=1.0,
-                                        gradient_clip_algorithm="norm")
-                    opt.step()
-                    opt.zero_grad()
+        self.clip_gradients(opt,
+                            gradient_clip_val=1.0,
+                            gradient_clip_algorithm="norm")
+        opt.step()
+        opt.zero_grad()
 
-                    # sch = self.lr_schedulers()
-                    # sch.step()
-                    beta_stats = {}
-                    for i, lyr in enumerate(model.layers):
-                        lyr.self_attn.beta_step()
-                        mu, var = lyr.self_attn.get_beta_stats()
-                        beta_stats[f"beta_layer_{i}_mu"] = mu
-                        beta_stats[f"beta_layer_{i}_var"] = var
-                    self.log_dict(beta_stats,
-                                  on_step=True,
-                                  rank_zero_only=True)
+        # sch = self.lr_schedulers()
+        # sch.step()
+        beta_stats = {}
+        for i, lyr in enumerate(model.layers):
+            mu, var = lyr.self_attn.get_beta_stats()
+            beta_stats[f"beta_layer_{i}_mu"] = mu
+            beta_stats[f"beta_layer_{i}_var"] = var
 
-                    loss = torch.stack(total_loss).mean().exp()
-                    self.log_losses(loss, 0, 0, 0, subset="train")
-                    return loss
+        self.log_dict(beta_stats, on_step=True, rank_zero_only=True)
+
+        loss = torch.stack(total_loss).mean().exp()
+        self.log_losses(loss, 0, 0, 0, subset="train")
+        gc.collect()
+        print("after gc collect")
 
         return loss
 
@@ -679,7 +686,7 @@ class LabModule(pl.LightningModule):
         opt = torch.optim.AdamW(
             params,
             lr=self.config.lr,
-            betas=(0.99, 0.999),
+            betas=(0.9, 0.999),
         )
 
         return opt
@@ -707,6 +714,7 @@ def main(config: TrainConfig):
     os.makedirs(config.model_checkpoint_dir, exist_ok=True)
 
     d = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+
     if config.using_fsdp:
         devices = f"{d}"
         policy = {LlamaDecoderLayer}
@@ -841,6 +849,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Devices and num_nodes determine how many processes there are
+    d = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+    fabric = Fabric(devices=d, num_nodes=1)
+    fabric.launch()
+
     train_config = TrainConfig(
         dev_run=args.dev_run,
         using_fsdp=args.using_fsdp,
@@ -851,6 +864,7 @@ if __name__ == "__main__":
         block_size_q=args.block_size_q,
         block_size_k=args.block_size_k,
         method=args.method,
+        init_from_checkpoint=args.init_checkpoint,
         model=args.model,
         disable_global_context=args.disable_global_context,
         window=args.window,

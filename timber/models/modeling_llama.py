@@ -514,6 +514,7 @@ class LlamaAttention(nn.Module):
             self.register_buffer(
                 "_beta",
                 torch.tensor([1.0 for _ in range(config._umbc_slots)]))
+            self.register_buffer("_n", torch.tensor(1.0))
             # self._beta = nn.Parameter(
             #     torch.Tensor([2.0 for _ in range(config._umbc_slots)]))
 
@@ -525,7 +526,8 @@ class LlamaAttention(nn.Module):
         return self._beta.data.mean().item(), self._beta.var().item()
 
     def beta_step(self):
-        self._beta += -1/500
+        self._beta += -1 / 1000
+        self._n += 1
 
     def beta(self):
         beta = F.relu(self._beta)
@@ -955,6 +957,144 @@ class LlamaSdpaAttention(LlamaAttention):
             cache_position=cache_position,
             **kwargs,
         )
+
+    def forward_umbc_masker(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads,
+                                         self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
+                                     self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
+                                         self.head_dim).transpose(1, 2)
+
+        # print(f"at the beginning: {query_states.size()=} {key_states.size()=} {value_states.size()=}")
+        # get the cache before rotary embeddings are applied.
+        # In case static cache is used, it is an instance attribute.
+        past_key_value = getattr(self, "past_key_value", past_key_value)
+
+        if past_key_value is not None:
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx)
+
+            if hasattr(self, "sse"):
+                if not use_cache:
+                    raise NotImplementedError("UMBC version must use cache")
+
+                sse_out = self.sse.forward_mbc(hidden_states)
+
+                sse_keys = self.k_proj(sse_out)
+                sse_values = self.v_proj(sse_out)
+
+                sse_keys = sse_keys.view(bsz, sse_keys.size(1), self.num_heads,
+                                         self.head_dim).transpose(1, 2)
+                sse_values = sse_values.view(bsz, sse_values.size(1),
+                                             self.num_heads,
+                                             self.head_dim).transpose(1, 2)
+
+                B, H, K, D = key_states.size()
+                mask = torch.zeros(1,
+                                   1,
+                                   1,
+                                   K,
+                                   device=key_states.device,
+                                   dtype=key_states.dtype)
+
+                mask = torch.cat((
+                    mask,
+                    torch.ones(1,
+                               1,
+                               1,
+                               past_key_value.num_sink_tokens,
+                               device=mask.device,
+                               dtype=mask.dtype) * -5,
+                ),
+                                 dim=-1)
+
+                mask = mask * (1 - (self._n / 500))
+
+                key_states = torch.cat((key_states, sse_keys), dim=2)
+                value_states = torch.cat((value_states, sse_values), dim=2)
+
+                # print(
+                #     f"{mask.size()=} {key_states.size()=} {value_states.size()=} {self._n}"
+                # )
+
+        def get_position_ids():
+            if past_key_value is not None:
+                return torch.arange(key_states.size(-2),
+                                    device=position_ids.device).unsqueeze(0)
+            return position_ids
+
+        # print(f"{position_ids=}")
+        cos, sin = self.rotary_emb(value_states, get_position_ids())
+
+        B, H, Q, D = query_states.size()
+        _, _, K, _ = key_states.size()
+
+        p = apply_rotary_pos_emb_one
+        scale = np.sqrt(query_states.size(-1))
+
+        q_idx = -(past_key_value.num_sink_tokens + 1)
+        q = p(query_states, cos[:, q_idx:q_idx + 1], sin[:, q_idx:q_idx + 1])
+        k = p(key_states, cos, sin)
+
+        # k = torch.cat((k, sse_keys), dim=-2)
+        # value_states = torch.cat((value_states, sse_values), dim=-2)
+
+        # print(f"{q.size()=} {k.size()=}")
+
+        atten = torch.einsum("bhxd,bhyd->bhxy", q / np.sqrt(scale),
+                             (k / np.sqrt(scale)))  # (B, H, slot, slot)
+
+        # mask = torch.zeros(k.size(-2), device=k.device, dtype=k.dtype)
+        # mask[-sse_keys.size(-2):] = -1e10
+        # print(mask)
+        # atten = atten + mask.view(1, 1, 1, -1)
+        atten = atten + mask
+
+        atten = atten.softmax(dim=-1)
+        # print(f"{atten=} {mask=}")
+
+        # print(f"{atten.size()=} {value_states.size()=}")
+        out = torch.einsum("bhxy,bhyz->bhxz", atten, value_states)
+
+        out = out.transpose(1, 2).contiguous()
+        out = out.view(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(out)
+
+        return attn_output, None, past_key_value
 
     def forward_umbc(
         self,
