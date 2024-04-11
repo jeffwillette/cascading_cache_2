@@ -126,7 +126,7 @@ def load_model(args):
         if hasattr(m, 'attention_method'):
             m.attention_method = args.method
 
-    if args.method not in ["none", "umbc"] and args.checkpoint is not None:
+    if args.method not in ["none"] and args.checkpoint is not None:
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=True,

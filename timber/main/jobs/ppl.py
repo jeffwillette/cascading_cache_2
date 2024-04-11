@@ -50,24 +50,23 @@ def job_ppl(args, model, tokenizer, device):
 
                 nlls.append(neg_log_likelihood.cpu())
 
-            elif args.method == "umbc":
+            elif args.method in ["umbc", "sink"]:
                 with torch.no_grad():
                     # model.model.model.sse.post_forward_mbc_cleanup()
                     mdl = model.model if args.lora_r == 0 else model.model.model
-                    for lyr in mdl.layers:
-                        lyr.self_attn.sse.post_forward_mbc_cleanup()
+
+                    if args.method == "umbc":
+                        for lyr in mdl.layers:
+                            lyr.self_attn.sse.post_forward_mbc_cleanup()
 
                     rng = input_ids.size(1) - 1
                     past_key_values = None
                     with tqdm(range(rng)) as pbar2:
                         for i in pbar2:
                             inp = input_ids[:, i:i + 1]
-                            output = model(
-                                inp,
-                                use_cache=True,
-                                past_key_values=past_key_values,
-                            )
-
+                            output = model(inp,
+                                           use_cache=True,
+                                           past_key_values=past_key_values)
                             past_key_values = output.past_key_values
 
                             logits = output.logits[:, -1:]
@@ -79,11 +78,9 @@ def job_ppl(args, model, tokenizer, device):
                             nlls += [nll.cpu()]
 
                             if i % 100 == 0:
-                                ppl = torch.exp(torch.stack(nlls).mean()).item()
+                                ppl = torch.exp(
+                                    torch.stack(nlls).mean()).item()
                                 pbar2.set_description(f"{ppl=:.6f}")
-
-                    for lyr in mdl.layers:
-                        lyr.self_attn.sse.post_forward_mbc_cleanup()
 
             prev_end_loc = end_loc
             ppl = torch.exp(torch.stack(nlls).mean()).item()

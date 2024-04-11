@@ -182,8 +182,6 @@ class Slots(nn.Module):
 
         self.weight = nn.Embedding(self.K, self.h, **factory_kwargs)
 
-        self.reset_parameters()
-
     def reset_parameters(self):
         if self.slot_type == "random":
             nn.init.uniform_(self.mu.weight, -0.2, 0.2)
@@ -220,12 +218,18 @@ class SlotSetEncoder(MBCFunction):
                  heads: int = 4,
                  bias: bool = True,
                  slot_drop: float = 0.0,
-                 attn_act: str = "slot-sigmoid",
                  eps: float = EPS,
+                 chunks: int = 3,
                  ln_after: bool = True,
                  max_batch: int = 64):
         super().__init__()
+
+        if K % chunks != 0:
+            raise ValueError(
+                f"K should be evenly divisible by chunks: {K=} {chunks=}")
+
         self.name = "SlotSetEncoder"
+        self.chunks = chunks
         self.dim = dim
         self.eps = eps  # Additive epsilon for stability
         self.heads = heads  # number of attention heads
@@ -233,7 +237,6 @@ class SlotSetEncoder(MBCFunction):
         self.ln_after = ln_after
         self.ln_slots = ln_slots  # never used
         self.slot_drop = slot_drop
-        self.attn_act = attn_act
         self.K = K
         self.max_batch = max_batch
 
@@ -258,7 +261,16 @@ class SlotSetEncoder(MBCFunction):
             normalized_shape=dim) if ln_slots else nn.Identity()
 
         self.norm_after = nn.LayerNorm(dim) if ln_after else nn.Identity()
-        self.init_cache()
+
+    def reset_parameters(self):
+        self.slots.reset_parameters()
+        self.norm_slots.reset_parameters()
+        self.sse_v.reset_parameters()
+        self.sse_k.reset_parameters()
+
+        # self.norm_after.reset_parameters()
+        nn.init.constant_(self.norm_after.weight, 0.00)
+        nn.init.zeros_(self.norm_after.bias)
 
     def init_cache(self):
         self.register_buffer(
@@ -310,7 +322,11 @@ class SlotSetEncoder(MBCFunction):
 
         S, W, V = self.get_attn_v(X, S=S)  # W: (B, H, K, S) V: (B, H, S, D)
 
-        W = W.softmax(dim=-2)  # softmax over the slots
+        # perform the softmax over the individual qkv chunks
+        b, h, k, s = W.size()
+        W = W.view(b, h, self.chunks, k // self.chunks,
+                   s).softmax(dim=-2)  # softmax over the slots
+        W = W.view(b, h, k, s)
         C = W.sum(dim=-1, keepdim=True)  # cumulative normalization constant
 
         A = W / (C + self.eps)
@@ -353,7 +369,9 @@ class SlotSetEncoder(MBCFunction):
         W = W.reshape(B, T, self.heads, self.K, c)
         V = V.reshape(B, T, self.heads, c, D // self.heads)
 
+        W = W.reshape(B, T, self.heads, self.chunks, self.K // self.chunks, c)
         W = W.softmax(dim=-2)  # softmax over the slots
+        W = W.reshape(B, T, self.heads, self.K, c)
         C = W.sum(dim=-1, keepdim=True).cumsum(
             dim=1)  # cumulative normalization constant
 
@@ -374,6 +392,10 @@ class SlotSetEncoder(MBCFunction):
         grad: bool = True,
         mask: OT = None,
     ) -> Tuple[T, T]:
+
+        if not hasattr(self, "x_prev"):
+            self.init_cache()
+
         if mask is not None:
             mask = mask.repeat(self.heads, 1).unsqueeze(1)
 
@@ -411,7 +433,10 @@ class SlotSetEncoder(MBCFunction):
         """
         S, W, V = self.get_attn_v(X, S=S)
 
+        b, h, k, d = W.size()
+        W = W.view(b, h, self.chunks, k // self.chunks, d)
         W = W.softmax(dim=-2)  # softmax over the slots
+        W = W.view(b, h, k, d)
         C = W.sum(dim=-1, keepdim=True)  # cumulative normalization constant
 
         S_hat = torch.einsum("bhks,bhsd->bhkd", W, V)  # (B, H, K, D // H)
@@ -431,7 +456,7 @@ class SlotSetEncoder(MBCFunction):
 
 if __name__ == "__main__":
     sse = SlotSetEncoder(
-        K=16,
+        K=12,
         dim=128,
         slot_type="deterministic",
         bias=False,
@@ -445,7 +470,7 @@ if __name__ == "__main__":
 
     diff = (out - last).abs().amax()
     print(f"{out.size()=} {last.size()=}")
-    print(f"max diff: {diff=}")
+    print(f"max diff cumulative/full: {diff=}")
 
     sse.init_cache()
     out_mbc = sse.forward_mbc(x)
@@ -453,7 +478,7 @@ if __name__ == "__main__":
 
     diff = (out - out_mbc).abs().amax()
     print(f"{out.size()=} {out_mbc.size()=}")
-    print(f"max diff: {diff=}")
+    print(f"max diff forward_mbc/full: {diff=}")
 
     chnked_out = []
     for chnk in x.chunk(256, dim=1):
@@ -462,14 +487,14 @@ if __name__ == "__main__":
 
     diff = (out - out_mbc).abs().amax()
     print(f"{out.size()=} {out_mbc.size()=}")
-    print(f"max diff: {diff=}")
+    print(f"max diff forward_mbc_iter/full: {diff=}")
 
     for i in range(out_cumulative.size(1)):
         chunked = chnked_out[i]
         cumulative = out_cumulative[:, i]
 
         diff = (chunked - cumulative).abs().amax()
-        print(f"max diff: {diff=}")
+        print(f"max diff cumulative steps/full: {diff=}")
 
     cumulative16 = sse.forward_cumulative(x, chunk_size=16)
     cumulative32 = sse.forward_cumulative(x, chunk_size=32)

@@ -1,4 +1,3 @@
-import gc
 import os
 from torch import nn
 from lightning.pytorch.strategies import DDPStrategy
@@ -10,9 +9,6 @@ from timber.trainer.scheduler import LinearWarmupCosineAnnealingLR
 from os import PathLike
 from pathlib import Path
 from dataclasses import dataclass, field
-
-from lightning.fabric import Fabric
-import gc
 
 import torch
 import torch.onnx
@@ -76,6 +72,7 @@ class TrainConfig:
     disable_global_context: bool = False
     window: int = 256
     chunks: int = 32
+    comment: str = ""
 
 
 class LabDataModule(pl.LightningDataModule):
@@ -83,7 +80,7 @@ class LabDataModule(pl.LightningDataModule):
     def __init__(
         self,
         config: TrainConfig,
-        num_workers: int = 0,
+        num_workers: int = 4,
         data_dir: Path = "data",
         download: bool = True,
         train_size: float = 0.9,
@@ -141,9 +138,10 @@ class LabDataModule(pl.LightningDataModule):
             if stage == "fit" or stage is None:
 
                 def train_val_dataset(dataset, val_split=0.05):
-                    train_idx, val_idx = train_test_split(list(
-                        range(len(dataset))),
-                                                          test_size=val_split)
+                    train_idx, val_idx = train_test_split(
+                        list(range(len(dataset))),
+                        test_size=val_split,
+                    )
                     train = Subset(dataset, train_idx)
                     valid = Subset(dataset, val_idx)
                     return train, valid
@@ -158,6 +156,7 @@ class LabDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(self.train_data,
                           num_workers=self.num_workers,
+                          persistent_workers=True,
                           batch_size=self.bsize)
 
     def val_dataloader(self):
@@ -198,6 +197,7 @@ def load_model(
     config._umbc_slots = train_config.slots
     config._umbc_chunk = train_config.chunks
     config._window = train_config.window
+    config._sink = 4
 
     quant_config = transformers.BitsAndBytesConfig(
         load_in_4bit=True,
@@ -212,7 +212,6 @@ def load_model(
             "slots",
             "norm_slots",
             "norm_after",
-            "_beta",
             # "input_layernorm",
             # "post_attention_layernorm",
             # "norm",
@@ -240,10 +239,7 @@ def load_model(
 
         for lyr in model.model.layers:
             attn = lyr.self_attn
-            attn.sse.slots.reset_parameters()
-            attn.sse.norm_slots.reset_parameters()
-            attn.sse.norm_after.reset_parameters()
-            attn.reset_beta()
+            attn.sse.reset_parameters()
 
         if train_config.init_from_checkpoint is not None:
             print('loading from', train_config.init_from_checkpoint)
@@ -288,7 +284,7 @@ def load_model(
             ],
             modules_to_save=[
                 'input_layernorm', 'post_attention_layernorm', 'sse_q',
-                "sse_k", "sse_v", "slots", "norm_slots", 'norm_after', "_beta"
+                "sse_k", "sse_v", "slots", "norm_slots", 'norm_after'
             ])
 
         model = prepare_model_for_kbit_training(
@@ -328,8 +324,6 @@ class LabModule(pl.LightningModule):
         self.validation_targets = []
 
         self.config = config
-        self.steps = {0: 8, 10: 16, 50: 32, 100: 64}
-        self.automatic_optimization = config.method != "umbc"
 
     def forward(
         self,
@@ -339,7 +333,6 @@ class LabModule(pl.LightningModule):
         position_ids=None,
         use_cache=False,
         past_key_values=None,
-        do_grad=True,
     ):
         return self.model(
             inputs,
@@ -348,156 +341,54 @@ class LabModule(pl.LightningModule):
             position_ids=position_ids,
             use_cache=use_cache,
             past_key_values=past_key_values,
-            do_grad=do_grad,
         )
 
-    # def on_before_optimizer_step(self, optimizer):
-    #     print(f"before optimizer step: {self.trainer.global_step=}")
+    def on_before_optimizer_step(self, optimizer):
+        pass
+        # model = self.model.model if self.config.lora_r == 0 else self.model.model.model
+        # for lyr in model.layers:
+        #     if not hasattr(self, "checked_beta"):
+        #         print("stepping beta")
+        #         self.checked_beta = True
 
-    def set_accumulate_grad_batches(self) -> int:
-        accumulate_grad_batches = 1
-        for iter_step in reversed(self.steps):
-            if self.trainer.global_step >= iter_step:
-                accumulate_grad_batches = self.steps[iter_step]
-                break
-        self.trainer.accumulate_grad_batches = accumulate_grad_batches
+        #     lyr.self_attn.beta_step()
 
-    def step_umbc_single(
-        self,
-        full_inputs,
-        full_target,
-        output_teacher,
-        subset="train",
-        batch_idx=0,
-    ):
-
-        print("start of loop gc collect")
-        opt = self.optimizers()
-
-        model = self.model.model if self.config.lora_r == 0 else self.model.model.model
-        for lyr in model.layers:
-            lyr.self_attn.sse.post_forward_mbc_cleanup()
-            lyr.self_attn.beta_step()
-
-        rng = full_inputs.size(1) - 1
-        pbar = range(rng)
-        if self.local_rank == 0:
-            pbar = tqdm(range(rng))
-
-        total_loss = []
-        past_key_values = None
-        add = self.config.window + self.config.slots
-        # grad_chunks = add + torch.randperm(full_inputs.size(1) - add)[:64]
-        for i in pbar:
-            inp, tgt = full_inputs[:, i:i + 1], full_target[:, i + 1:i + 2]
-            # grad = i in grad_chunks
-            grad = fabric.broadcast(i > add and torch.rand(1).item() >= 0.98)
-
-            with torch.autograd.set_grad_enabled(grad):
-                output = self(
-                    inp,
-                    output_hidden_states=False,
-                    use_cache=True,
-                    past_key_values=past_key_values,
-                )
-                past_key_values = output.past_key_values
-
-            loss = torch.nn.functional.cross_entropy(
-                output.logits.view(-1, output.logits.size(-1)),
-                tgt.view(-1),
-            )
-
-            total_loss += [loss.detach()]
-            if grad:
-                beta_inv = 1 / (1 - model.layers[0].self_attn._beta[0])
-                # print(f"{beta_inv=} {loss=}")
-                self.manual_backward(beta_inv * loss / 32)
-
-                for i, (k, v) in enumerate(
-                        zip(past_key_values.key_cache,
-                            past_key_values.value_cache)):
-                    past_key_values.key_cache[i] = past_key_values.key_cache[
-                        i].detach()
-                    past_key_values.value_cache[
-                        i] = past_key_values.value_cache[i].detach()
-
-        self.clip_gradients(opt,
-                            gradient_clip_val=1.0,
-                            gradient_clip_algorithm="norm")
-        opt.step()
-        opt.zero_grad()
-
-        # sch = self.lr_schedulers()
-        # sch.step()
-        beta_stats = {}
-        for i, lyr in enumerate(model.layers):
-            mu, var = lyr.self_attn.get_beta_stats()
-            beta_stats[f"beta_layer_{i}_mu"] = mu
-            beta_stats[f"beta_layer_{i}_var"] = var
-
-        self.log_dict(beta_stats, on_step=True, rank_zero_only=True)
-
-        loss = torch.stack(total_loss).mean().exp()
-        self.log_losses(loss, 0, 0, 0, subset="train")
-        gc.collect()
-        print("after gc collect")
-
-        return loss
+        # print(f"before optimizer step: {self.trainer.global_step=}")
 
     def step_umbc(
         self,
-        full_inputs,
-        full_target,
+        inputs,
+        target,
         output_teacher,
         subset="train",
         batch_idx=0,
     ):
 
-        # self.set_accumulate_grad_batches()
-        opt = self.optimizers()
-        sch = self.lr_schedulers()
-
-        w = self.config.window
-        n_chnks = full_inputs.size(1) // self.config.window
-
         model = self.model.model if self.config.lora_r == 0 else self.model.model.model
-        for lyr in model.layers:
-            lyr.self_attn.post_forward_mbc_cleanup()
+        ln_affines = {}
+        for i, lyr in enumerate(model.layers):
+            weight = lyr.self_attn.sse.norm_after.weight
+            mu, sigma = weight.mean(), weight.std()
+            ln_affines[f"lnaffine_layer_{i}_mu"] = mu.item()
+            ln_affines[f"lnaffine_layer_{i}_std"] = sigma.item()
+        self.log_dict(ln_affines, on_step=True, rank_zero_only=True)
 
-        pbar = range(n_chnks)
-        if self.local_rank == 0:
-            pbar = tqdm(range(n_chnks))
+        output = self(
+            inputs,
+            output_hidden_states=False,
+        )
 
-        loss = []
-        for i in pbar:
-            end = (i + 1) * w
-            inp, tgt = full_inputs[:, :end], full_target[:, :end]
-            # seems like gradient checkpinting breaks if we do not
-            # require grad on chunk 0 (unknown reason)
-            output = self(
-                inp,
-                tgt,
-                output_hidden_states=False,
-                do_grad=True,
-            )
+        logits = output.logits[:, :-1]
+        tgt = target[:, 1:]
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, output.logits.size(-1)),
+            tgt.reshape(-1),
+        )
 
-            l = output.loss / (self.trainer.accumulate_grad_batches * n_chnks)
-            self.manual_backward(l)
-            loss += [output.loss.detach()]
-
-        if (batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
-            self.clip_gradients(opt,
-                                gradient_clip_val=1.0,
-                                gradient_clip_algorithm="norm")
-
-            opt.step()
-            opt.zero_grad()
-            sch.step()
-
-        loss = torch.exp(torch.stack(loss).mean())
-        print(f"loss: {loss.item()=}")
-        self.log_losses(loss, output.loss, 0, 0, subset="train")
+        self.log_losses(loss.exp().detach(), 0, 0, 0, subset="train")
         return loss
+        # beta = model.layers[0].self_attn.beta()
+        # return loss * (1 / beta)
 
     # def on_before_backward(self, loss):
     #     print("\n\non before backward\n\n")
@@ -568,7 +459,7 @@ class LabModule(pl.LightningModule):
                     inputs, output_hidden_states=self.config.kd)
 
         if self.config.method == "umbc":
-            loss = self.step_umbc_single(
+            loss = self.step_umbc(
                 inputs,
                 target,
                 output_teacher,
@@ -586,47 +477,13 @@ class LabModule(pl.LightningModule):
         inputs, target = batch
 
         if self.config.method == "umbc":
-
             model = self.model.model if self.config.lora_r == 0 else self.model.model.model
-            for lyr in model.layers:
-                lyr.self_attn.sse.post_forward_mbc_cleanup()
+            # for lyr in model.layers:
+            #     lyr.self_attn.sse.post_forward_mbc_cleanup()
 
-            loss, output_logits = [], []
-
-            rng = inputs.size(1) - 1
-            pbar = range(rng)
-            if self.local_rank == 0:
-                pbar = tqdm(range(rng), leave=False)
-
-            past_key_values = None
-            for i in pbar:
-                inp, tgt = inputs[:, i:i + 1], target[:, i + 1:i + 2]
-                output = self(inp,
-                              output_hidden_states=False,
-                              do_grad=False,
-                              use_cache=True,
-                              past_key_values=past_key_values)
-                past_key_values = output.past_key_values
-
-                ce = torch.nn.functional.cross_entropy(
-                    output.logits.view(-1, output.logits.size(-1)),
-                    tgt.view(-1),
-                )
-
-                loss += [ce]
-                output_logits += [output.logits]
-
-                if i % 100 == 0 and self.local_rank == 0:
-                    ppl = torch.exp(torch.mean(torch.stack(loss)))
-                    pbar.set_description(f"ppl: {ppl:.4f}")
-
-            loss = torch.mean(torch.stack(loss))
-            output_logits = torch.cat(output_logits, dim=1)
-
-        else:
-            with torch.no_grad():
-                output = self(inputs, target)
-                loss, output_logits = output.loss, output.logits
+        with torch.no_grad():
+            output = self(inputs, target)
+            loss, output_logits = output.loss, output.logits
 
         # evaluate both regular models and our model only on the last part of the windo
         self.log("val/loss", loss.item())
@@ -748,16 +605,17 @@ def main(config: TrainConfig):
         strategy = DDPStrategy(find_unused_parameters=False,
                                static_graph=False)
 
+    filename = "" if config.comment == "" else f"{config.comment}-"
     if config.method == 'timber':
-        filename = f'llama32k-{config.dataset}-{config.seq_len}-bq{config.block_size_q}-bk{config.block_size_k}-k{config.k}-{{epoch:02d}}-{{step}}'
+        filename += f'llama32k-{config.dataset}-{config.seq_len}-bq{config.block_size_q}-bk{config.block_size_k}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'none':
-        filename = f'llama32k-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
+        filename += f'llama32k-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
     elif config.method == 'umbc':
-        filename = f'llama1.3b-{config.dataset}-{config.seq_len}-slots-{config.slots}-lora-r-{config.lora_r}-window-{config.window}-{{epoch:02d}}-{{step}}'
+        filename += f'llama1.3b-{config.dataset}-{config.seq_len}-slots-{config.slots}-lora-r-{config.lora_r}-window-{config.window}-{{epoch:02d}}-{{step}}'
     elif config.method == 'reformer':
-        filename = f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-k{config.k}-{{epoch:02d}}-{{step}}'
+        filename += f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'performer':
-        filename = f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
+        filename += f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
     else:
         raise Exception()
 
@@ -770,6 +628,12 @@ def main(config: TrainConfig):
         every_n_train_steps=config.save_steps,
         enable_version_counter=False,
     )
+
+    accumulator = GradientAccumulationScheduler(scheduling={
+        0: 1,
+        100: 2,
+        500: 4
+    })
 
     checkpoint_callback.CHECKPOINT_EQUALS_CHAR = '-'
     checkpoint_callback.FILE_EXTENSION = '.pth'
@@ -791,7 +655,7 @@ def main(config: TrainConfig):
         precision="16-mixed",
         # precision=32,
         default_root_dir=config.model_checkpoint_dir,
-        accumulate_grad_batches=config.accumulation_steps,
+        # accumulate_grad_batches=config.accumulation_steps,
         max_epochs=20,
         # gradient_clip_val=1.0,
         check_val_every_n_epoch=check_val_every_n_epoch,
@@ -800,7 +664,7 @@ def main(config: TrainConfig):
         logger=AimLogger(experiment="umbc-llm"),
         enable_checkpointing=True,
         fast_dev_run=config.dev_run,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, accumulator],
         num_sanity_val_steps=0,
     )
 
@@ -844,6 +708,7 @@ if __name__ == "__main__":
     parser.add_argument('--block_size_q', default=16, type=int)
     parser.add_argument('--block_size_k', default=2, type=int)
     parser.add_argument('--method', default='umbc', type=str)
+    parser.add_argument('--comment', default='', type=str)
     parser.add_argument('--window', default=256, type=int)
     parser.add_argument('--chunk', default=32, type=int)
 
@@ -851,8 +716,6 @@ if __name__ == "__main__":
 
     # Devices and num_nodes determine how many processes there are
     d = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
-    fabric = Fabric(devices=d, num_nodes=1)
-    fabric.launch()
 
     train_config = TrainConfig(
         dev_run=args.dev_run,
@@ -870,6 +733,7 @@ if __name__ == "__main__":
         window=args.window,
         slots=args.slots,
         chunks=args.chunk,
+        comment=args.comment,
     )
     if args.accumulation_steps > 0:
         train_config.accumulation_steps = args.accumulation_steps

@@ -8,7 +8,7 @@ class OpenWebTextDataset(Dataset):
     def __init__(self, tokenizer, stride):
         self.tokenizer = tokenizer
         self.dataset = datasets.load_dataset('Skylion007/openwebtext')['train']
-        self.window_size = 100
+        self.window_size = 20
         self.stride = stride
 
     def __len__(self):
