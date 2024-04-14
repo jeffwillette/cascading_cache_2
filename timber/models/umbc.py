@@ -444,9 +444,10 @@ class SlotSetEncoder(MBCFunction):
         return S, S_hat, C  # type: ignore
 
     def post_forward_mbc_cleanup(self):
-        with torch.no_grad():
-            self.x_prev.zero_()
-            self.c_prev.zero_()
+        if hasattr(self, "x_prev"):
+            with torch.no_grad():
+                self.x_prev.zero_()
+                self.c_prev.zero_()
 
     def grad_correct(self, c: float) -> None:
         for n, p in self.named_parameters():

@@ -7,6 +7,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import argparse, json
 from transformers import TextStreamer
+from aim import Run
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
@@ -15,11 +16,23 @@ from timber.utils import seed, get_bench
 
 
 def job_ppl(args, model, tokenizer, device):
+    run = Run(experiment=args.method)
+    dataset = "wikitext"
+    run["hparams"] = {
+        "job": "ppl",
+        "method": args.method,
+        "dataset": dataset,
+        "sinks": args.sinks,
+        "cascades": args.cascades,
+        "window": args.window,
+        "slots": args.slots,
+    }
+
     os.makedirs('./cache', exist_ok=True)
     cache_path = './cache/llama_eval.pth'
     if not os.path.exists(cache_path):
         # test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        test = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
+        test = load_dataset(dataset, "wikitext-103-raw-v1", split="test")
         # test = load_dataset("openwebtext", split="train")
         print(test)
         encodings = tokenizer("\n\n".join(test["text"]),
@@ -43,14 +56,7 @@ def job_ppl(args, model, tokenizer, device):
             target_ids = input_ids.clone()
             target_ids[:, :-trg_len] = -100
 
-            if args.method != "umbc":
-                with torch.no_grad():
-                    outputs = model(input_ids, labels=target_ids)
-                    neg_log_likelihood = outputs.loss
-
-                nlls.append(neg_log_likelihood.cpu())
-
-            elif args.method in ["umbc", "sink"]:
+            if args.method in ["umbc", "sink"]:
                 with torch.no_grad():
                     # model.model.model.sse.post_forward_mbc_cleanup()
                     mdl = model.model if args.lora_r == 0 else model.model.model
@@ -64,9 +70,11 @@ def job_ppl(args, model, tokenizer, device):
                     with tqdm(range(rng)) as pbar2:
                         for i in pbar2:
                             inp = input_ids[:, i:i + 1]
-                            output = model(inp,
-                                           use_cache=True,
-                                           past_key_values=past_key_values)
+                            output = model(
+                                inp,
+                                use_cache=True,
+                                past_key_values=past_key_values,
+                            )
                             past_key_values = output.past_key_values
 
                             logits = output.logits[:, -1:]
@@ -77,10 +85,21 @@ def job_ppl(args, model, tokenizer, device):
                             )
                             nlls += [nll.cpu()]
 
-                            if i % 100 == 0:
+                            if i % 10 == 0:
                                 ppl = torch.exp(
                                     torch.stack(nlls).mean()).item()
+                                run.track(ppl,
+                                          name="ppl",
+                                          step=i,
+                                          context={"subset": "test"})
                                 pbar2.set_description(f"{ppl=:.6f}")
+
+            else:
+                with torch.no_grad():
+                    outputs = model(input_ids, labels=target_ids)
+                    neg_log_likelihood = outputs.loss
+
+                nlls.append(neg_log_likelihood.cpu())
 
             prev_end_loc = end_loc
             ppl = torch.exp(torch.stack(nlls).mean()).item()
@@ -92,7 +111,18 @@ def job_ppl(args, model, tokenizer, device):
     ppl = torch.exp(torch.stack(nlls).mean()).item()
 
     os.makedirs('./cache/llama_eval/', exist_ok=True)
-    with open(f'./cache/llama_eval/ppl-{args.method}.json', 'w') as f:
-        json.dump({'ppl': ppl}, f)
+    if args.method == "umbc":
+        with open(
+                f'./cache/llama_eval/ppl-{args.method}-sinks-{args.sinks}-window-{args.window}-slots-{args.slots}.json',
+                'w') as f:
+            json.dump({'ppl': ppl}, f)
+    elif args.method == "sink":
+        with open(
+                f'./cache/llama_eval/ppl-{args.method}-sinks-{args.sinks}-window-{args.window}.json',
+                'w') as f:
+            json.dump({'ppl': ppl}, f)
+    else:
+        with open(f'./cache/llama_eval/ppl-{args.method}.json', 'w') as f:
+            json.dump({'ppl': ppl}, f)
 
     print(f'PPL: {ppl:.4f}')

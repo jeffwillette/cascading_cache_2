@@ -16,8 +16,6 @@ class ArgsType:
     block_size_k: int = 2
     batch_size: int = 1
     k: int = 512
-    dense_queries: int = 0
-    dense_layers: int = 3
     chunk: int = 16
 
 
@@ -39,6 +37,8 @@ def eval_args(
     parser.add_argument('--slots', default=32, type=int)
     parser.add_argument('--window', default=256, type=int)
     parser.add_argument('--chunk', default=32, type=int)
+    parser.add_argument('--sinks', default=0, type=int)
+    parser.add_argument('--cascades', default=0, type=int)
 
     args = parser.parse_args()
     print(args)

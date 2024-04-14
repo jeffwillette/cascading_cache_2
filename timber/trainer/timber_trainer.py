@@ -11,6 +11,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 
 import torch
+import gc
 import torch.onnx
 import lightning as pl
 import transformers
@@ -156,7 +157,7 @@ class LabDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(self.train_data,
                           num_workers=self.num_workers,
-                          persistent_workers=True,
+                          persistent_workers=False,
                           batch_size=self.bsize)
 
     def val_dataloader(self):
@@ -343,18 +344,6 @@ class LabModule(pl.LightningModule):
             past_key_values=past_key_values,
         )
 
-    def on_before_optimizer_step(self, optimizer):
-        pass
-        # model = self.model.model if self.config.lora_r == 0 else self.model.model.model
-        # for lyr in model.layers:
-        #     if not hasattr(self, "checked_beta"):
-        #         print("stepping beta")
-        #         self.checked_beta = True
-
-        #     lyr.self_attn.beta_step()
-
-        # print(f"before optimizer step: {self.trainer.global_step=}")
-
     def step_umbc(
         self,
         inputs,
@@ -385,26 +374,9 @@ class LabModule(pl.LightningModule):
             tgt.reshape(-1),
         )
 
+        gc.collect()
         self.log_losses(loss.exp().detach(), 0, 0, 0, subset="train")
         return loss
-        # beta = model.layers[0].self_attn.beta()
-        # return loss * (1 / beta)
-
-    # def on_before_backward(self, loss):
-    #     print("\n\non before backward\n\n")
-    #     for name, p in self.model.named_parameters():
-    #         if p.requires_grad:
-    #             print(name, p.requires_grad, p.shape, p.dtype)
-    #             if p.grad is not None:
-    #                 print(p.grad)
-
-    # def on_after_backward(self):
-    #     print("\n\non after backward\n\n")
-    #     for name, p in self.model.named_parameters():
-    #         if p.requires_grad:
-    #             print(name, p.requires_grad, p.shape, p.dtype)
-    #             if p.grad is not None:
-    #                 print(p.grad)
 
     def log_losses(self,
                    total,
@@ -443,6 +415,7 @@ class LabModule(pl.LightningModule):
         if self.config.kd:
             loss = loss * 0.1 + (loss_kd_hidden + loss_kd_logits) * 2.5
 
+        gc.collect()
         self.log_losses(loss, output.loss, loss_kd_hidden, loss_kd_logits)
         return loss
 

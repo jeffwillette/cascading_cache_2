@@ -91,6 +91,8 @@ def load_model(args):
     config = LlamaConfig.from_pretrained(model_id)
     config._attn_implementation = config.attn_implementation = 'sdpa'
     config._umbc = args.method == "umbc"
+    config._sinks = args.sinks
+    config._cascades = args.cascades
     config._umbc_slots = args.slots
     config._umbc_chunk = args.chunk
     config._window = args.window
@@ -126,7 +128,8 @@ def load_model(args):
         if hasattr(m, 'attention_method'):
             m.attention_method = args.method
 
-    if args.method not in ["none"] and args.checkpoint is not None:
+    if args.lora_r > 0 and args.checkpoint is not None:
+        print("LoRA init")
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=True,
@@ -177,11 +180,6 @@ def load_model(args):
             ckpt = {k[6:]: v for k, v in ckpt["state_dict"].items()}
             print(f"loading umbc checkpoint: {args.checkpoint=}")
             model.load_state_dict(ckpt, strict=True)
-
-    elif args.method != 'none':
-        for m in model.modules():
-            if hasattr(m, 'attention_method'):
-                m.tree_using_context_avg = False
 
     model = model.eval()
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
