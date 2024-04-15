@@ -6,7 +6,8 @@ from typing import Literal, Optional
 @dataclass
 class ArgsType:
     model: Literal['llama32k', 'llama16b', 'qwen'] = 'llama32k'
-    job: Literal['ppl', 'mmlu', 'mmmu', 'stream', 'bench_single_layer'] = 'ppl'
+    job: Literal['ppl', 'ppl-memory', 'mmlu', 'mmmu', 'stream',
+                 'bench_single_layer'] = 'ppl'
     method: Literal['none', 'timber'] = 'timber'
     stride: int = -1
     lora_r: int = 32
