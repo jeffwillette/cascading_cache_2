@@ -16,6 +16,7 @@ from timber.utils import seed, get_bench
 from timber.main.jobs.bench_single_layer import job_bench_single_layer
 from timber.main.jobs.ppl import job_ppl
 from timber.main.jobs.ppl_memory import job_ppl_memory
+from timber.main.jobs.pg19 import job_ppl_pg19
 # from timber.main.jobs.stream import job_stream
 from timber.main.jobs.mmlu import job_mmlu
 from timber.main.eval_args import eval_args, ArgsType
@@ -194,7 +195,7 @@ def main():
     args = eval_args()
 
     assert args.job in [
-        'ppl', 'ppl-memory', 'stream', 'mmlu', 'bench_single_layer'
+        'ppl', 'ppl-pg19', 'ppl-memory', 'stream', 'mmlu', 'bench_single_layer'
     ]
 
     model, tokenizer, device = load_model(args)
@@ -203,6 +204,8 @@ def main():
         job_ppl(args, model, tokenizer, device)
     elif args.job == 'ppl-memory':
         job_ppl_memory(args, model, tokenizer, device)
+    elif args.job == 'ppl-pg19':
+        job_ppl_pg19(args, model, tokenizer, device)
     elif args.job == 'stream':
         pass
         # job_stream(args, model, tokenizer, device)

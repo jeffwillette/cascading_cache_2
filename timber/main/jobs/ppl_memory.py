@@ -15,27 +15,11 @@ from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
 from timber.utils import seed, get_bench
 
 
-class MockRun:
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def track(self, *args, **kwargs):
-        pass
-
-    def __setitem__(self, key, value):
-        pass
-
-    def __getitem__(self, key):
-        pass
-
-
-def job_ppl(args, model, tokenizer, device):
-    run = Run(experiment=args.method,
-              read_only=args.dev_run) if not args.dev_run else MockRun()
+def job_ppl_memory(args, model, tokenizer, device):
+    run = Run(experiment=args.method)
     dataset = "wikitext"
     run["hparams"] = {
-        "job": "ppl",
+        "job": "ppl-memory",
         "method": args.method,
         "dataset": dataset,
         "sinks": args.sinks,
@@ -62,7 +46,7 @@ def job_ppl(args, model, tokenizer, device):
     seq_len = encodings.size(1)
     max_length = stride = seq_len
 
-    nll, count = 0, 0
+    nlls = []
     prev_end_loc = 0
     with tqdm(range(0, seq_len, stride)[:args.count]) as pbar:
         for begin_loc in pbar:
@@ -81,9 +65,20 @@ def job_ppl(args, model, tokenizer, device):
                         for lyr in mdl.layers:
                             lyr.self_attn.sse.post_forward_mbc_cleanup()
 
-                    rng = input_ids.size(1) - 1
+                    # rng = input_ids.size(1) - 1
                     past_key_values = None
+                    rng = 3840 + 1024
                     with tqdm(range(rng)) as pbar2:
+                        for i in pbar2:
+                            inp = input_ids[:, i:i + 1]
+                            output = model(
+                                inp,
+                                use_cache=True,
+                                past_key_values=past_key_values,
+                            )
+                            past_key_values = output.past_key_values
+
+                    with tqdm(range(rng - 2048, rng - 1024)) as pbar2:
                         for i in pbar2:
                             inp = input_ids[:, i:i + 1]
                             output = model(
@@ -99,47 +94,47 @@ def job_ppl(args, model, tokenizer, device):
                                 logits.reshape(-1, logits.size(-1)),
                                 targets.reshape(-1),
                             )
-                            nll += nll.cpu()
-                            count += 1
+                            nlls += [nll.cpu()]
 
-                            if i % 100 == 0:
-                                ppl = torch.exp(nll / count).item()
+                            if i % 10 == 0:
+                                ppl = torch.exp(
+                                    torch.stack(nlls).mean()).item()
                                 run.track(ppl,
-                                          name="ppl",
+                                          name="ppl-memory",
                                           step=i,
                                           context={"subset": "test"})
                                 pbar2.set_description(f"{ppl=:.6f}")
 
             else:
-                raise NotImplementedError()
-                # with torch.no_grad():
-                #     outputs = model(input_ids, labels=target_ids)
-                #     neg_log_likelihood = outputs.loss
+                with torch.no_grad():
+                    outputs = model(input_ids, labels=target_ids)
+                    neg_log_likelihood = outputs.loss
 
-                # nlls.append(neg_log_likelihood.cpu())
+                nlls.append(neg_log_likelihood.cpu())
 
             prev_end_loc = end_loc
-            ppl = torch.exp(nll / count).item()
+            ppl = torch.exp(torch.stack(nlls).mean()).item()
             pbar.set_description(f"ppl: {ppl:.3f}")
 
             if end_loc == seq_len:
                 break
 
-    ppl = torch.exp(nll / count).item()
+    ppl = torch.exp(torch.stack(nlls).mean()).item()
 
     os.makedirs('./cache/llama_eval/', exist_ok=True)
     if args.method == "umbc":
         with open(
-                f'./cache/llama_eval/ppl-{args.method}-sinks-{args.sinks}-window-{args.window}-slots-{args.slots}.json',
+                f'./cache/llama_eval/ppl-memory-{args.method}-sinks-{args.sinks}-window-{args.window}-slots-{args.slots}.json',
                 'w') as f:
             json.dump({'ppl': ppl}, f)
     elif args.method == "sink":
         with open(
-                f'./cache/llama_eval/ppl-{args.method}-sinks-{args.sinks}-window-{args.window}.json',
+                f'./cache/llama_eval/ppl-memory-{args.method}-sinks-{args.sinks}-window-{args.window}.json',
                 'w') as f:
             json.dump({'ppl': ppl}, f)
     else:
-        with open(f'./cache/llama_eval/ppl-{args.method}.json', 'w') as f:
+        with open(f'./cache/llama_eval/ppl-memory-{args.method}.json',
+                  'w') as f:
             json.dump({'ppl': ppl}, f)
 
     print(f'PPL: {ppl:.4f}')
