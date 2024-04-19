@@ -1,10 +1,11 @@
 import torch
+from torch import nn
 from typing import List, Optional, Tuple, Dict, Any
 import warnings
 import numpy as np
 
 
-class SinkCache:
+class SinkCache(nn.Module):
     pass
 
 
@@ -17,15 +18,27 @@ class CascadingSinkCache(SinkCache):
         max_seq_len: int = 32,
         device: torch.device = "cpu",
     ) -> None:
+        super().__init__()
         self.max_seq_len = max_seq_len
         self.key_cache: List[torch.Tensor] = []
         self.score_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
         self.sink_keys: List[torch.Tensor] = []
         self.sink_values: List[torch.Tensor] = []
+        self.device = device
 
         self.cascades = max_seq_len // window_length
         self.do_cache = [True for _ in range(self.cascades)]
+        self.do_cache_every_n = [2**i for i in range(self.cascades)]
+        # self.do_cache = torch.tensor([True for _ in range(self.cascades)],
+        #                              device=device,
+        #                              dtype=torch.bool)
+
+        # self.do_cache_every_n = torch.tensor(
+        #     [2**i for i in range(self.cascades)],
+        #     device=device,
+        #     dtype=torch.long)
+
         self.beta = np.exp(-np.log(100) / window_length)
         self.num_sink_tokens = num_sink_tokens
 
@@ -42,17 +55,25 @@ class CascadingSinkCache(SinkCache):
 
         # index for positional encodings, this will be modified on
         # each return in order to grab the correct positional encoding indices.
-        self.pos_idx = torch.arange(max_seq_len, device=device)
-        self.tmp_arange = torch.arange(self.window_length, device=device)
-        self.sink_pos = torch.arange(self.num_sink_tokens, device=device)
-        print("INIT NLOGN FAST VERSION")
+        self.pos_idx = torch.arange(max_seq_len,
+                                    device=device,
+                                    dtype=torch.long)
+        self.tmp_arange = torch.arange(self.window_length,
+                                       device=device,
+                                       dtype=torch.long)
+        self.sink_pos = torch.arange(self.num_sink_tokens,
+                                     device=device,
+                                     dtype=torch.long)
+        # print("INIT NLOGN FAST VERSION")
 
     def set_cache_bools(self):
         # minus one because seen tokens is incremented before tokens are really added. Therefore we need to subtract that one
-        self.do_cache = [
-            (self._seen_tokens - 1 - self.num_sink_tokens) % 2**i == 0
-            for i, _ in enumerate(self.do_cache)
-        ]
+        for i, _ in enumerate(self.do_cache):
+            if (self._seen_tokens - 1 -
+                    self.num_sink_tokens) % self.do_cache_every_n[i] == 0:
+                self.do_cache[i] = True
+                continue
+            self.do_cache[i] = False
 
     def get_cascade_bounds(self, i):
         # if i == 0:
@@ -181,9 +202,11 @@ class CascadingSinkCache(SinkCache):
 
         # print(f"called update_segment for {cascade_idx=}")
         if len(self.start_indices[cascade_idx]) <= layer_idx:
-            self.start_indices[cascade_idx].append(0)
+            self.start_indices[cascade_idx].append(
+                torch.tensor(0, device=self.device, dtype=torch.long))
         if len(self._stored_tokens[cascade_idx]) <= layer_idx:
-            self._stored_tokens[cascade_idx].append(0)
+            self._stored_tokens[cascade_idx].append(
+                torch.tensor(0, device=self.device, dtype=torch.long))
 
         start_idx = self.start_indices[cascade_idx][layer_idx]
         stored = self._stored_tokens[cascade_idx][layer_idx]
@@ -1656,11 +1679,11 @@ class StaticSinkCache(SinkCache):
 
 
 if __name__ == "__main__":
-    window, sink = 10, 2
+    window, sink = 5, 2
     dim, head = 5, 4
     cache = CascadingSinkCache(window_length=window,
                                num_sink_tokens=sink,
-                               max_seq_len=1000)
+                               max_seq_len=100)
 
     slow_cache = CascadingSinkCacheSlow(window_length=window,
                                         num_sink_tokens=sink)
@@ -1693,7 +1716,7 @@ if __name__ == "__main__":
             argsort = torch.argsort(pos)
             k, v = k[:, :, argsort], v[:, :, argsort]
 
-            # print(f"after sort: {k}")
+            print(f"after sort: {k}")
             if not slow_k.size() == k.size():
                 print(f"{slow_k.size()=} {k.size()=}")
                 print(f"sizes not equal...\n{slow_k=} {k=}")
