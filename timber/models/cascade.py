@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple, Dict, Any
 import warnings
 import numpy as np
 from torch.nn import functional as F
+from timber.models.cuda_graph import make_graphed_callables
 
 
 class SinkCache(nn.Module):
@@ -407,6 +408,157 @@ class CascadingSinkCache(SinkCache):
         )
 
 
+# TODO: stopped here
+#  - make all functions class methods
+#  - make sure the conditions are met for no copy in cuda graph
+#  - do not access memory in GPU during CPU loop, or grab it all at once if needed.
+
+
+def append_to_cache(cascade_idx, input_key_states, input_value_states,
+                    input_score_states, sink_keys, sink_values, sink_pos,
+                    sink_mask, keys, values, pos, mask, scores, stored_sinks,
+                    start_indices, stored_tokens, cache_idx, score_idx,
+                    pos_idx, mask_idx, l, u, segment_len):
+
+    start_idx = torch.gather(start_indices, 0, cascade_idx)
+    # start_idx = start_indices[cascade_idx]
+    stored = torch.gather(stored_tokens, 0, cascade_idx)
+    s = start_idx + l
+
+    # we have empty room in this cache, so we need to shift the index
+    # forward by the number of tokens already stored.
+    s += stored
+
+    # we do not need to evict, find the end point and insert token
+    # since this cache is not full, the insert point will be start + stored_tokens
+
+    cache_idx_local = cache_idx * s
+    score_idx_local = score_idx * s
+    mask_idx_local = mask_idx * s
+
+    keys.scatter_(2, cache_idx_local, input_key_states)
+    values.scatter_(2, cache_idx_local, input_value_states)
+    scores.scatter_(0, score_idx_local, input_score_states)
+    mask.scatter_(3, mask_idx_local, 0)
+
+    stored_tokens += F.one_hot(cascade_idx, stored_tokens.size(0))
+    return (cascade_idx, input_key_states, input_value_states,
+            input_score_states, sink_keys, sink_values, sink_pos, sink_mask,
+            keys, values, pos, mask, scores, stored_sinks, start_indices,
+            stored_tokens, cache_idx, score_idx, pos_idx, mask_idx, l, u,
+            segment_len)
+
+
+def evict_from_cache(cascade_idx, input_key_states, input_value_states,
+                     input_score_states, sink_keys, sink_values, sink_pos,
+                     sink_mask, keys, values, pos, mask, scores, stored_sinks,
+                     start_indices, stored_tokens, cache_idx, score_idx,
+                     pos_idx, mask_idx, l, u, segment_len):
+
+    start_idx = torch.gather(start_indices, 0, cascade_idx)
+    s = start_idx + l
+
+    # we need to evict
+    # 1. find the oldest token (start point), remove it and
+    #    set input_key_state at that location
+
+    cache_idx_local = cache_idx * s
+    score_idx_local = score_idx * s
+
+    next_input_key_state = torch.gather(keys, 2, cache_idx_local).clone()
+    next_input_value_state = torch.gather(values, 2, cache_idx_local).clone()
+    next_input_score_state = torch.gather(scores, 0, score_idx_local).clone()
+
+    keys.scatter_(2, cache_idx_local, input_key_states)
+    values.scatter_(2, cache_idx_local, input_value_states)
+    scores.scatter_(0, score_idx_local, input_score_states)
+
+    # 2. rotate the start index.
+    # new_start_idx = (start_idx + 1) % segment_len (vectorized version of this)
+    start_indices = (start_indices + F.one_hot(
+        cascade_idx, start_indices.size(0))) % segment_len
+
+    # mask remains unchanged for this operation.
+    return (cascade_idx, next_input_key_state, next_input_value_state,
+            next_input_score_state, sink_keys, sink_values, sink_pos,
+            sink_mask, keys, values, pos, mask, scores, stored_sinks,
+            start_indices, stored_tokens, cache_idx, score_idx, pos_idx,
+            mask_idx, l, u, segment_len)
+
+
+def overwrite_cache(cascade_idx, input_key_states, input_value_states,
+                    input_score_states, sink_keys, sink_values, sink_pos,
+                    sink_mask, keys, values, pos, mask, scores, stored_sinks,
+                    start_indices, stored_tokens, cache_idx, score_idx,
+                    pos_idx, mask_idx, l, u, segment_len):
+    start_idx = torch.gather(start_indices, 0, cascade_idx)
+    s = start_idx + l
+
+    cache_idx_local = cache_idx * s
+    score_idx_local = score_idx * s
+
+    keys.scatter_(2, cache_idx_local, input_key_states)
+    values.scatter_(2, cache_idx_local, input_value_states)
+    scores.scatter_(0, score_idx_local, input_score_states)
+
+    return (cascade_idx, input_key_states, input_value_states,
+            input_score_states, sink_keys, sink_values, sink_pos, sink_mask,
+            keys, values, pos, mask, scores, stored_sinks, start_indices,
+            stored_tokens, cache_idx, score_idx, pos_idx, mask_idx, l, u,
+            segment_len)
+
+
+def update_segment_pos(cascade_idx, pos, pos_ub, start_indices, stored_tokens,
+                       l, u, seg_len, tmp_arange):
+    # l, u, seg_len = self.get_cascade_bounds(cascade_idx)
+    # u = min(u, l + stored_tokens[cascade_idx])
+    # seg_len = min(stored_tokens[cascade_idx], seg_len)
+    # start_idx = start_indices[cascade_idx]
+
+    # pos[0,
+    #     l:u] = (self.tmp_arange[:pos_ub] + (seg_len - start_idx)) % seg_len
+    # pos[0, l:u] += pos_ub - seg_len
+    # pos_ub = pos_ub - seg_len
+    # return cascade_idx, pos, pos_ub, stored_tokens, start_indices
+
+    u = torch.amin(
+        torch.cat((u, l + torch.gather(stored_tokens, 0, cascade_idx))))
+
+    seg_len = torch.amin(
+        torch.cat((torch.gather(stored_tokens, 0,
+                                cascade_idx).unsqueeze(0), seg_len)))
+    start_idx = torch.gather(start_indices, 0, cascade_idx)
+
+    tmp = (tmp_arange + (seg_len - start_idx)) % seg_len + (pos_ub - seg_len)
+    pos.scatter_(1, l + tmp_arange.unsqueeze(0), tmp.unsqueeze(0))
+    # pos[0, l:u] = (self.tmp_arange + (seg_len - start_idx)) % seg_len
+
+    pos_ub = pos_ub - seg_len
+    return cascade_idx, pos, pos_ub, stored_tokens, start_indices
+
+
+def add_sinks(input_key_states, input_value_states, input_score_states,
+              sink_keys, sink_values, sink_pos, sink_mask, keys, values, pos,
+              mask, scores, stored_sinks, start_indices, stored_tokens,
+              cache_idx, score_idx, pos_idx, mask_idx, l, u, segment_len):
+
+    cache_idx_local = cache_idx * stored_sinks
+    pos_idx_local = pos_idx * stored_sinks
+    mask_idx_local = mask_idx * stored_sinks
+
+    sink_keys.scatter_(2, cache_idx_local, input_key_states)
+    sink_values.scatter_(2, cache_idx_local, input_value_states)
+    sink_pos.scatter_(1, pos_idx_local, stored_sinks.expand_as(pos_idx_local))
+    sink_mask.scatter_(3, mask_idx_local, 0)
+
+    stored_sinks += 1
+
+    return (input_key_states, input_value_states, input_score_states,
+            sink_keys, sink_values, sink_pos, sink_mask, keys, values, pos,
+            mask, scores, stored_sinks, start_indices, stored_tokens,
+            cache_idx, score_idx, pos_idx, mask_idx, l, u, segment_len)
+
+
 class CascadingSinkCacheCompile(SinkCache):
 
     def __init__(
@@ -437,15 +589,19 @@ class CascadingSinkCacheCompile(SinkCache):
         self.sink_values: torch.Tensor
 
         self.cascades = max_seq_len // window_length
+        self.do_cache_cpu = torch.tensor([True for _ in range(self.cascades)],
+                                         dtype=torch.bool,
+                                         requires_grad=False)
         self.do_cache = torch.tensor([True for _ in range(self.cascades)],
                                      device=device,
-                                     dtype=torch.bool)
+                                     dtype=torch.bool,
+                                     requires_grad=False)
 
         print(f"{self.cascades=} {self.do_cache=}")
         self.do_cache_every_n = torch.tensor(
             [2**i for i in range(self.cascades)],
-            device=device,
             dtype=torch.long,
+            requires_grad=False,
         )
 
         self.beta = np.exp(-np.log(100) / window_length)
@@ -453,30 +609,39 @@ class CascadingSinkCacheCompile(SinkCache):
 
         self.window_length = window_length
         self._seen_tokens = torch.tensor(
-            0, device=device, dtype=torch.long
+            0, dtype=torch.long, requires_grad=False
         )  # Used in `generate` to keep tally of how many tokens the cache has seen
 
         self.stored_tokens = torch.tensor([0 for _ in range(self.cascades)],
                                           device=device,
-                                          dtype=torch.long)
-        self.stored_sinks = torch.tensor(0, device=device, dtype=torch.long)
+                                          dtype=torch.long,
+                                          requires_grad=False)
+        self.stored_sinks = torch.tensor(0,
+                                         device=device,
+                                         dtype=torch.long,
+                                         requires_grad=False)
 
         # each cascade will have start indices which are considered the beginning of
         # the cascade cache to avoid excessive concatenation.
         self.start_indices = torch.tensor([0 for _ in range(self.cascades)],
                                           device=device,
-                                          dtype=torch.long)
+                                          dtype=torch.long,
+                                          requires_grad=False)
 
         # index for positional encodings, this will be modified on
         # each return in order to grab the correct positional encoding indices.
-        self.pos = torch.zeros(max_seq_len, device=device,
-                               dtype=torch.long).view(1, -1)
+        self.pos = torch.zeros(max_seq_len,
+                               device=device,
+                               dtype=torch.long,
+                               requires_grad=False).view(1, -1)
         self.tmp_arange = torch.arange(self.window_length,
                                        device=device,
-                                       dtype=torch.long)
+                                       dtype=torch.long,
+                                       requires_grad=False)
         self.sink_pos = torch.zeros(self.num_sink_tokens,
                                     device=device,
-                                    dtype=torch.long).view(1, -1)
+                                    dtype=torch.long,
+                                    requires_grad=False).view(1, -1)
         print("INIT NLOGN FAST COMPILED VERSION")
 
         self.init_static_cache()
@@ -485,9 +650,24 @@ class CascadingSinkCacheCompile(SinkCache):
         B, H, S, D = self.max_batch_size, self.heads, self.max_seq_len, self.dim
         nsink, dev, dtp = self.num_sink_tokens, self.device, self.dtype
 
-        blank = torch.zeros(B, H, S, D, device=dev, dtype=dtp)
-        blank_scores = torch.zeros(self.max_seq_len, device=dev, dtype=dtp)
-        blank_sinks = torch.zeros(B, H, nsink, D, device=dev, dtype=dtp)
+        blank = torch.zeros(B,
+                            H,
+                            S,
+                            D,
+                            device=dev,
+                            dtype=dtp,
+                            requires_grad=False)
+        blank_scores = torch.zeros(self.max_seq_len,
+                                   device=dev,
+                                   dtype=dtp,
+                                   requires_grad=False)
+        blank_sinks = torch.zeros(B,
+                                  H,
+                                  nsink,
+                                  D,
+                                  device=dev,
+                                  dtype=dtp,
+                                  requires_grad=False)
 
         self.key_cache = blank.clone()
         self.value_cache = blank.clone()
@@ -495,75 +675,68 @@ class CascadingSinkCacheCompile(SinkCache):
         self.sink_keys = blank_sinks.clone()
         self.sink_values = blank_sinks.clone()
 
-        self.scatter_idx = torch.ones(1, device=self.device, dtype=torch.long)
+        self.scalar = torch.ones(1,
+                                 device=self.device,
+                                 dtype=torch.long,
+                                 requires_grad=False)
+        self.scatter_idx = torch.ones(1,
+                                      device=self.device,
+                                      dtype=torch.long,
+                                      requires_grad=False)
+
+        self.scatter_idx_cache = torch.ones(self.max_batch_size,
+                                            self.heads,
+                                            1,
+                                            self.dim,
+                                            device=self.device,
+                                            dtype=torch.long,
+                                            requires_grad=False)
 
         self.sink_pos_idx = torch.ones(1,
                                        self.num_sink_tokens,
                                        device=self.device,
-                                       dtype=torch.long)
+                                       dtype=torch.long,
+                                       requires_grad=False)
 
         self.sink_mask = torch.full((1, 1, 1, self.num_sink_tokens),
                                     torch.finfo(self.dtype).min,
                                     device=self.device,
-                                    dtype=self.dtype)
+                                    dtype=self.dtype,
+                                    requires_grad=False)
 
         self.mask = torch.full((1, 1, 1, self.max_seq_len),
                                torch.finfo(self.dtype).min,
                                device=self.device,
-                               dtype=self.dtype)
+                               dtype=self.dtype,
+                               requires_grad=False)
 
     def set_cache_bools(self):
         # minus one because seen tokens is incremented before tokens are really added. Therefore we need to subtract that one
-        for i, _ in enumerate(self.do_cache):
-            self.do_cache[i] = torch.cond(
-                (self._seen_tokens - 1 - self.num_sink_tokens) %
-                self.do_cache_every_n[i] == 0,
-                lambda x: torch.tensor(True, device=x.device, dtype=x.dtype),
-                lambda x: torch.tensor(False, device=x.device, dtype=x.dtype),
-                [self.do_cache[i]],
-            )
+        for i, _ in enumerate(self.do_cache_cpu):
+            if (self._seen_tokens - 1 -
+                    self.num_sink_tokens) % self.do_cache_every_n[i] == 0:
+                self.do_cache_cpu[i] = True
+                continue
+
+            self.do_cache_cpu[i] = False
+        self.do_cache.copy_(self.do_cache_cpu)
 
     def get_cascade_bounds(self, i):
-        # if i == 0:
-        #     return self.num_sink_tokens, self.window_length, self.window_length - self.num_sink_tokens
-        return self.window_length * i, self.window_length * (
-            i + 1), self.window_length
+        return self.scalar * self.window_length * i, self.scalar * self.window_length * (
+            i + 1), self.scalar * self.window_length
 
     def get_seq_length(self,
                        layer_idx: Optional[int] = 0,
                        cascade_idx: Optional[int] = -1) -> int:
-        return sum([v[layer_idx] for v in self._stored_tokens])
+        return sum([v for v in self.stored_tokens])
 
     def get_max_length(self) -> Optional[int]:
         return self.max_seq_len
 
-    def gs_slice(
-        self,
-        gather_idx,
-        gather_src,
-        scatter_idx,
-        scatter_src,
-        dst,
-    ):
-        # gathers from indices in dim 2 from src to out. indices should have the
-        # same number of dimensions as gather src in order to not resize out. In other
-        # words, this basically permutes according to indices and then we will rewrite
-        # what we need to with scatter later.
-        torch.gather(gather_src, 2, gather_idx, out=dst)
-        print(f"intermediate: {dst=}")
-
-        # scatter from src into dst (indices according to dst)
-        dst.scatter_(2, scatter_idx, scatter_src)
-        # dst = torch.scatter(dst, 2, scatter_idx, scatter_src)
-        print(f"final: {dst=}")
-        return dst
-
     def scat_idx(self, name: str):
         match name:
             case "cache":
-                return self.scatter_idx.view(1, 1, 1,
-                                             1).repeat(self.max_batch_size,
-                                                       self.heads, 1, self.dim)
+                return self.scatter_idx_cache
             case "pos":
                 return self.scatter_idx.view(1, 1)
             case "mask":
@@ -571,238 +744,9 @@ class CascadingSinkCacheCompile(SinkCache):
             case "score":
                 return self.scatter_idx.view(1)
 
-    def add_sinks(
-        self,
-        input_key_states,
-        input_value_states,
-        input_score_states,
-        sink_keys,
-        sink_values,
-        sink_pos,
-        sink_mask,
-        keys,
-        values,
-        pos,
-        mask,
-        scores,
-        stored_sinks,
-        start_indices,
-        stored_tokens,
-    ):
-
-        cache_idx = self.scat_idx("cache") * stored_sinks
-        pos_idx = self.scat_idx("pos") * stored_sinks
-        mask_idx = self.scat_idx("mask") * stored_sinks
-
-        sink_keys.scatter_(2, cache_idx, input_key_states)
-        sink_values.scatter_(2, cache_idx, input_key_states)
-        sink_pos.scatter_(1, pos_idx, stored_sinks.expand_as(pos_idx))
-        sink_mask.scatter_(3, mask_idx, 0)
-
-        stored_sinks += 1
-
-        return (
-            input_key_states,
-            input_value_states,
-            input_score_states,
-            sink_keys,
-            sink_values,
-            sink_pos,
-            sink_mask,
-            keys,
-            values,
-            pos,
-            mask,
-            scores,
-            stored_sinks,
-            start_indices,
-            stored_tokens,
-        )
-
-    def update_attention_scores(self, scores) -> None:
-        self.score_cache = self.beta * self.scores + (1 - self.beta) * scores
-
-    def do_cache_func(
-        self,
-        do_cache,
-        cascade_idx,
-        input_key_states,
-        input_value_states,
-        input_score_states,
-        sink_keys,
-        sink_values,
-        sink_pos,
-        sink_mask,
-        keys,
-        values,
-        pos,
-        mask,
-        scores,
-        stored_sinks,
-        start_indices,
-        stored_tokens,
-    ):
-        # if we are supposed to do the cache, then we need to check if we need
-        # to evict one token or not.
-        _, _, segment_len = self.get_cascade_bounds(cascade_idx)
-        return torch.cond(
-            stored_tokens[cascade_idx] < segment_len,
-            self.append_to_cache,
-            self.evict_from_cache,
-            (
-                do_cache,
-                cascade_idx,
-                input_key_states,
-                input_value_states,
-                input_score_states,
-                sink_keys,
-                sink_values,
-                sink_pos,
-                sink_mask,
-                keys,
-                values,
-                pos,
-                mask,
-                scores,
-                stored_sinks,
-                start_indices,
-                stored_tokens,
-            ),
-        )
-
-    def dont_do_cache_func(
-        self,
-        do_cache,
-        cascade_idx,
-        input_key_states,
-        input_value_states,
-        input_score_states,
-        sink_keys,
-        sink_values,
-        sink_pos,
-        sink_mask,
-        keys,
-        values,
-        pos,
-        mask,
-        scores,
-        stored_sinks,
-        start_indices,
-        stored_tokens,
-    ):
-        # print(f"called update_segment for {cascade_idx=}")
-        # start_idx = start_indices[cascade_idx]
-        # stored = stored_tokens[cascade_idx]
-        # l, u, segment_len = self.get_cascade_bounds(cascade_idx)
-        # # if we are not supposed to move the cache, but we were called
-        # # with states as an input. Then there are two possibilities:
-        # # 1. We are not supposed to do cache, but the length of this cache is zero.
-        # #    this may happen due to the do_cache input_values not lining up perfectly with powers of 2.
-        # #    In this case, we should add an element to the cache so it doesn't just get automatically evicted.
-        # s = start_idx + l
-        # if stored_tokens[cascade_idx] == 0:
-        #     s += stored
-        #     # we do not need to evict, find the end point and insert token
-        #     # since this cache is not full, the insert point will be start + stored_tokens
-        #     self.set_cache("input_key", s, s + 1, input_key_states)
-        #     self.set_cache("input_value", s, s + 1, input_value_states)
-        #     self.set_cache("input_score", s, s + 1, input_score_states)
-        #     self._stored_tokens[cascade_idx] += 1
-        #     return
-
-        # # 2. Since we know every cache has something in it, find the oldest thing
-        # #    in this cache, compare attention input_scores,
-        # #    and remove if needed.
-        # # oldest_idx = (start_idx - 1) % segment_len
-        # old_input_score = self.get_cache("input_score", s, s + 1)
-        # if old_input_score.item() / (1 - self.beta) >= score_states / (
-        #         1 - self.beta):
-        #     return  # old input_score is better, do nothing
-
-        # self.set_cache("input_key", s, s + 1, input_key_states)
-        # self.set_cache("input_value", s, s + 1, input_value_states)
-        # self.set_cache("input_score", s, s + 1, input_score_states)
-
-        return (
-            do_cache,
-            cascade_idx,
-            input_key_states,
-            input_value_states,
-            input_score_states,
-            sink_keys,
-            sink_values,
-            sink_pos,
-            sink_mask,
-            keys,
-            values,
-            pos,
-            mask,
-            scores,
-            stored_sinks,
-            start_indices,
-            stored_tokens,
-        )
-
-    def append_to_cache(
-        self,
-        do_cache,
-        cascade_idx,
-        input_key_states,
-        input_value_states,
-        input_score_states,
-        sink_keys,
-        sink_values,
-        sink_pos,
-        sink_mask,
-        keys,
-        values,
-        pos,
-        mask,
-        scores,
-        stored_sinks,
-        start_indices,
-        stored_tokens,
-    ):
-        start_idx = start_indices[cascade_idx]
-        stored = stored_tokens[cascade_idx]
-        l, u, segment_len = self.get_cascade_bounds(cascade_idx)
-        s = start_idx + l
-
-        # we have empty room in this cache, so we need to shift the index
-        # forward by the number of tokens already stored.
-        s += stored
-
-        # we do not need to evict, find the end point and insert token
-        # since this cache is not full, the insert point will be start + stored_tokens
-
-        cache_idx = self.scat_idx("cache") * s
-        score_idx = self.scat_idx("score") * s
-
-        keys.scatter_(2, cache_idx, input_key_states)
-        values.scatter_(2, cache_idx, input_value_states)
-        scores.scatter_(0, score_idx, input_score_states)
-
-        stored_tokens += F.one_hot(cascade_idx, stored_tokens.size(0))
-
-        return (
-            do_cache,
-            cascade_idx,
-            input_key_states,
-            input_value_states,
-            input_score_states,
-            sink_keys,
-            sink_values,
-            sink_pos,
-            sink_mask,
-            keys,
-            values,
-            pos,
-            mask,
-            scores,
-            stored_sinks,
-            start_indices,
-            stored_tokens,
-        )
+    def update_attention_scores(self, scores, layer_idx) -> None:
+        self.score_cache = self.beta * self.score_cache + (1 -
+                                                           self.beta) * scores
 
     def warn(self, args):
         warnings.warn(
@@ -810,237 +754,129 @@ class CascadingSinkCacheCompile(SinkCache):
         )
         return args
 
-    def evict_from_cache(
-        self,
-        do_cache,
-        cascade_idx,
-        input_key_states,
-        input_value_states,
-        input_score_states,
-        sink_keys,
-        sink_values,
-        sink_pos,
-        sink_mask,
-        keys,
-        values,
-        pos,
-        mask,
-        scores,
-        stored_sinks,
-        start_indices,
-        stored_tokens,
-    ):
-        start_idx = start_indices[cascade_idx]
-        l, u, segment_len = self.get_cascade_bounds(cascade_idx)
-        s = start_idx + l
+    def add_keys(self, input_key_states, input_value_states,
+                 input_score_states, sink_keys, sink_values, sink_pos,
+                 sink_mask, keys, values, pos, mask, scores, stored_sinks,
+                 start_indices, stored_tokens, cache_idx, score_idx, pos_idx,
+                 mask_idx, l, u, segment_len):
 
-        # we need to evict
-        # 1. find the oldest token (start point), remove it and
-        #    set input_key_state at that location
+        # in order to create the positional embeddings in teh same loop as
+        # the main logic, we must know if we are going to add anything to the
+        # cache or not which will change what happens to the positional embeddings.
+        pos_ub = self.stored_tokens.sum()
+        add_to_cache = self.do_cache.sum() * self.window_length > pos_ub
+        eager_add = self.do_cache.sum() * self.window_length == pos_ub
+        if add_to_cache or eager_add:
+            pos_ub += 1
 
-        cache_idx = self.scat_idx("cache") * s
-        score_idx = self.scat_idx("score") * s
+        stored_tokens_cpu = stored_tokens.cpu()
 
-        next_input_key_state = torch.gather(keys, 2, cache_idx).clone()
-        next_input_value_state = torch.gather(values, 2, cache_idx).clone()
-        next_input_score_state = torch.gather(scores, 0, score_idx).clone()
-
-        keys.scatter_(2, cache_idx, input_key_states)
-        values.scatter_(2, cache_idx, input_value_states)
-        scores.scatter_(0, score_idx, input_score_states)
-
-        # 2. increment the start point by one, being mindful of
-        #    the upper bound.
-        new_start_idx = (start_idx + 1) % segment_len
-        start_indices += new_start_idx * F.one_hot(cascade_idx,
-                                                   start_indices.size(0))
-
-        # 3. since we evicted a token, we need to move it along for the
-        #    next cascade layer to deal with recursively (if there is a next cascade layer)
-
-        return torch.cond(
-            # (cascade_idx + 1) <= (self.cascades - 1),
-            # (cascade_idx) <= (do_cache.size(0) - 1),
-            u == self.max_seq_len,
-            self.update_segment,
-            self.warn,
-            (
-                do_cache,
-                cascade_idx + 1,
-                next_input_key_state,
-                next_input_value_state,
-                next_input_score_state,
-                sink_keys,
-                sink_values,
-                sink_pos,
-                sink_mask,
-                keys,
-                values,
-                pos,
-                mask,
-                scores,
-                stored_sinks,
-                start_indices,
-                stored_tokens,
-            ),
-        )
-
-    def update_segment(
-        self,
-        do_cache,
-        cascade_idx,
-        input_key_states,
-        input_value_states,
-        input_score_states,
-        sink_keys,
-        sink_values,
-        sink_pos,
-        sink_mask,
-        keys,
-        values,
-        pos,
-        mask,
-        scores,
-        stored_sinks,
-        start_indices,
-        stored_tokens,
-    ):
-        return torch.cond(
-            cascade_idx < do_cache.size(0) and do_cache[cascade_idx],
-            self.do_cache_func,
-            self.dont_do_cache_func,
-            (
-                do_cache,
-                cascade_idx,
-                input_key_states,
-                input_value_states,
-                input_score_states,
-                sink_keys,
-                sink_values,
-                sink_pos,
-                sink_mask,
-                keys,
-                values,
-                pos,
-                mask,
-                scores,
-                stored_sinks,
-                start_indices,
-                stored_tokens,
-            ),
-        )
-
-    def add_keys(
-        self,
-        input_key_states,
-        input_value_states,
-        input_score_states,
-        sink_keys,
-        sink_values,
-        sink_pos,
-        sink_mask,
-        keys,
-        values,
-        pos,
-        mask,
-        scores,
-        stored_sinks,
-        start_indices,
-        stored_tokens,
-    ):
-        cascade_idx = torch.tensor(0, device=self.device, dtype=torch.long)
-        return self.update_segment(
-            self.do_cache,
-            cascade_idx,
-            input_key_states,
-            input_value_states,
-            input_score_states,
-            sink_keys,
-            sink_values,
-            sink_pos,
-            sink_mask,
-            keys,
-            values,
-            pos,
-            mask,
-            scores,
-            stored_sinks,
-            start_indices,
-            stored_tokens,
-        )
-
-        # TODO: delete bc will be returned from fucn above
-        key_states = self.get_cache("key", layer_idx, 0, self.get_max_length())
-        value_states = self.get_cache("value", layer_idx, 0,
-                                      self.get_max_length())
-        # if layer_idx == 0:
-        #     print(f"before updating: {self.pos_idx[:end]=}")
-
-        pos_ub = end
-        # print(
-        #     f"{pos_ub=}\n{self.pos_idx=}\n{self.start_indices=}\n{self._stored_tokens=}"
-        # )
-        pos_idx = self.pos_idx[:pos_ub]
         for i in range(self.cascades):
-            if self._stored_tokens[i, layer_idx] == 0:
-                break
+            l, u, segment_len = self.get_cascade_bounds(i)
+            cascade_idx = torch.tensor(i, device=self.device, dtype=torch.long)
 
-            l, u, seg_len = self.get_cascade_bounds(i)
-            # print(f"before minimum {u=} {seg_len=}")
-            u = min(u, l + self._stored_tokens[i, layer_idx])
-            seg_len = min(self._stored_tokens[i, layer_idx], seg_len)
-            start_idx = self.start_indices[i, layer_idx]
+            o = (cascade_idx, input_key_states, input_value_states,
+                 input_score_states, sink_keys, sink_values, sink_pos,
+                 sink_mask, keys, values, pos, mask, scores, stored_sinks,
+                 start_indices, stored_tokens, cache_idx, score_idx, pos_idx,
+                 mask_idx, l, u, segment_len)
 
-            # print(f"lower bound: {l} upper bound: {u} {seg_len=} {start_idx=}")
-            # print(f"{self.tmp_arange=}")
+            if self.do_cache_cpu[i]:
 
-            # print(
-            #     f"befor emodulo {pos_idx[l:u]=} {self.tmp_arange[:pos_ub]=} {start_idx=} {seg_len=}"
-            # )
-            # rotate the
+                if stored_tokens_cpu[i] < segment_len:
+                    (_, input_key_states, input_value_states,
+                     input_score_states, sink_keys, sink_values, sink_pos,
+                     sink_mask, keys, values, pos, mask, scores, stored_sinks,
+                     start_indices, stored_tokens, cache_idx, score_idx,
+                     pos_idx, mask_idx, l, u,
+                     segment_len) = self.append_to_cache(*o)
 
-            # if self.do_cache[i]:
-            # pos_idx[l:u] = (self.tmp_arange[:pos_ub] + start_idx) % seg_len
-            pos_idx[l:u] = (self.tmp_arange[:pos_ub] +
-                            (seg_len - start_idx)) % seg_len
-            # print(f"after modulo: {pos_idx=}")
-            pos_idx[l:u] += pos_ub - seg_len
-            # print(f"after subtract: {pos_idx=}")
-            pos_ub = pos_ub - seg_len
-            # print(f"pos idx for cascade: {i=} {pos_idx[l:u]=}")
+                    # these are used for positional embedding update func
+                    _, pos, pos_ub, _, _ = self.update_segment_pos(
+                        cascade_idx, pos, pos_ub, start_indices, stored_tokens,
+                        l, u, segment_len, self.tmp_arange)
+                    break
+                else:
+                    (_, input_key_states, input_value_states,
+                     input_score_states, sink_keys, sink_values, sink_pos,
+                     sink_mask, keys, values, pos, mask, scores, stored_sinks,
+                     start_indices, stored_tokens, cache_idx, score_idx,
+                     pos_idx, mask_idx, l, u,
+                     segment_len) = self.evict_from_cache(*o)
 
-        mask = None
-        sink_mask = None
-        if create_mask:
-            mask = torch.zeros(self.max_seq_len,
-                               device=self.device,
-                               dtype=self.dtype)
-            mask[end:] = -1e4  # torch.finfo(self.dtype).min
-            mask = mask.view(self.max_batch_size, 1, 1, self.max_seq_len)
-            pos_idx = self.pos_idx
-            pos_idx[end:] = 0
+                    # these are used for positional embedding update func
+                    _, pos, pos_ub, _, _ = self.update_segment_pos(
+                        cascade_idx, pos, pos_ub, start_indices, stored_tokens,
+                        l, u, segment_len, self.tmp_arange)
+                    # since we evicted a token, we need to move it along for the
+                    # next cascade layer to deal with recursively (if there is a next cascade layer)
 
-            sink_mask = torch.zeros(self.num_sink_tokens,
-                                    device=self.device,
-                                    dtype=self.dtype)
+                    if i + 1 > (self.cascades - 1):
+                        break
+            else:
+                if stored_tokens_cpu[i] == 0:
+                    # if we are not supposed to move the cache, but we were called
+                    # with states as an input. Then there are two possibilities:
+                    # 1. We are not supposed to do cache, but the length of this cache is zero.
+                    #    this may happen due to the do_cache input_values not lining up perfectly with powers of 2.
+                    #    In this case, we should add an element to the cache so it doesn't just get automatically evicted.
+                    (_, input_key_states, input_value_states,
+                     input_score_states, sink_keys, sink_values, sink_pos,
+                     sink_mask, keys, values, pos, mask, scores, stored_sinks,
+                     start_indices, stored_tokens, cache_idx, score_idx,
+                     pos_idx, mask_idx, l, u,
+                     segment_len) = self.append_to_cache(*o)
 
-            sink_mask = sink_mask.view(self.max_batch_size, 1, 1,
-                                       self.num_sink_tokens)
-        else:
-            key_states = key_states[:, :, :end]
-            value_states = value_states[:, :, :end]
-            pos_idx = self.pos_idx[:end]
+                    # these are used for positional embedding update func
+                    _, pos, pos_ub, _, _ = self.update_segment_pos(
+                        cascade_idx, pos, pos_ub, start_indices, stored_tokens,
+                        l, u, segment_len, self.tmp_arange)
+                    break
+                else:
+                    # 2. Since we know this cache has something in it, and we are not to do caching,
+                    #    find the oldest thing in this cache, compare attention input_scores,
+                    #    and remove if needed.
 
-        return (
-            self.get_cache("sink_keys", layer_idx, 0, self.num_sink_tokens),
-            self.get_cache("sink_values", layer_idx, 0, self.num_sink_tokens),
-            self.sink_pos.unsqueeze(0),
-            sink_mask,
-            key_states,
-            value_states,
-            pos_idx.unsqueeze(0) + self.num_sink_tokens,
-            mask,
-        )
+                    s = start_indices[i] + l
+
+                    score_idx = self.scat_idx("score") * s
+                    old_input_score = torch.gather(scores, 0,
+                                                   score_idx) / (1 - self.beta)
+                    if old_input_score >= input_score_states / (1 - self.beta):
+                        # old input_score is better, do nothing.
+                        # break onstead of cotinue because this stops the cascade
+                        break
+
+                    (_, input_key_states, input_value_states,
+                     input_score_states, sink_keys, sink_values, sink_pos,
+                     sink_mask, keys, values, pos, mask, scores, stored_sinks,
+                     start_indices, stored_tokens, cache_idx, score_idx,
+                     pos_idx, mask_idx, l, u,
+                     segment_len) = self.overwrite_cache(*o)
+
+                    _, pos, pos_ub, _, _ = self.update_segment_pos(
+                        cascade_idx, pos, pos_ub, start_indices, stored_tokens,
+                        l, u, segment_len, self.tmp_arange)
+
+        # pos_ub = stored_tokens.sum()  # same as get_Seq_len
+        # for i in range(self.cascades):
+        #     if stored_tokens[i] == 0:
+        #         break
+
+        #     l, u, seg_len = self.get_cascade_bounds(i)
+        #     u = min(u, l + stored_tokens[i])
+        #     seg_len = min(stored_tokens[i], seg_len)
+        #     start_idx = start_indices[i]
+
+        #     pos[0, l:u] = (self.tmp_arange[:pos_ub] +
+        #                    (seg_len - start_idx)) % seg_len
+        #     pos[0, l:u] += pos_ub - seg_len
+        #     pos_ub = pos_ub - seg_len
+
+        return (input_key_states, input_value_states, input_score_states,
+                sink_keys, sink_values, sink_pos, sink_mask, keys, values, pos,
+                mask, scores, stored_sinks, start_indices, stored_tokens,
+                cache_idx, score_idx, pos_idx, mask_idx, l, u, segment_len)
 
     def update(
         self,
@@ -1052,43 +888,39 @@ class CascadingSinkCacheCompile(SinkCache):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         self._seen_tokens += key_states.shape[-2]
-
         self.set_cache_bools()
-
-        print(f"{self.do_cache=}")
 
         score_states = torch.zeros(1,
                                    device=key_states.device,
-                                   dtype=key_states.dtype)
+                                   dtype=key_states.dtype,
+                                   requires_grad=False)
 
+        cache_idx = self.scat_idx("cache")
+        score_idx = self.scat_idx("score")
+        pos_idx = self.scat_idx("pos")
+        mask_idx = self.scat_idx("mask")
+        l, u, segment_len = self.get_cascade_bounds(0)
+
+        o = (key_states, value_states, score_states, self.sink_keys,
+             self.sink_values, self.sink_pos, self.sink_mask, self.key_cache,
+             self.value_cache, self.pos, self.mask, self.score_cache,
+             self.stored_sinks, self.start_indices, self.stored_tokens,
+             cache_idx, score_idx, pos_idx, mask_idx, l, u, segment_len)
+
+        if self.stored_sinks < self.num_sink_tokens:
+            o = add_sinks(*o)
+        else:
+            o = self.add_keys(*o)
+
+        (_, _, _, sink_keys, sink_values, sink_pos, sink_mask, keys, values,
+         pos, mask, scores, stored_sinks, start_indices, stored_tokens,
+         cache_idx, score_idx, pos_idx, mask_idx, l, u, segment_len) = o
+
+        pos[:, stored_tokens.sum():] = -self.num_sink_tokens
         # print(f"\n\n\nbefore")
         # print(
         #     f"{self.sink_keys=}\n{self.sink_values=}\n{self.sink_pos=}\n{self.sink_mask=}"
         # )
-
-        _, _, _, _, sink_keys, sink_values, sink_pos, sink_mask, keys, values, pos, mask, scores, stored_sinks, start_indices, stored_tokens =\
-                torch.cond(
-                    self.stored_sinks < self.num_sink_tokens,
-                    self.add_sinks,
-                    self.add_keys,
-                    (
-                        key_states,
-                        value_states,
-                        score_states,
-                        self.sink_keys,
-                        self.sink_values,
-                        self.sink_pos,
-                        self.sink_mask,
-                        self.key_cache,
-                        self.value_cache,
-                        self.pos,
-                        self.mask,
-                        self.score_cache,
-                        self.stored_sinks,
-                        self.start_indices,
-                        self.stored_tokens,
-                    ),
-                )
 
         self.sink_keys = sink_keys
         self.sink_values = sink_values
@@ -1100,7 +932,7 @@ class CascadingSinkCacheCompile(SinkCache):
         self.mask = mask
         self.score_cache = scores
         self.stored_sinks = stored_sinks
-        self.start_indies = start_indices
+        self.start_indices = start_indices
         self.stored_tokens = stored_tokens
 
         # print(f"\n\n\nafter")
@@ -1115,7 +947,7 @@ class CascadingSinkCacheCompile(SinkCache):
             self.sink_mask,
             self.key_cache,
             self.value_cache,
-            self.pos,
+            self.pos + self.num_sink_tokens,
             self.mask,
         )
 
@@ -1900,35 +1732,6 @@ class StaticSinkCache(SinkCache):
                 layer_idx].index_select(0, beam_idx.to(device))
 
 
-def gs_slice(gather_idx, gather_src, scatter_idx, scatter_src, dst):
-    # gathers from indices in dim 2 from src to out. indices should have the
-    # same number of dimensions as gather src in order to not resize out. In other
-    # words, this basically permutes according to indices and then we will rewrite
-    # what we need to with scatter later.
-    torch.gather(gather_src, 2, gather_idx, out=dst)
-    print(f"intermediate: {dst=}")
-
-    # scatter from src into dst (indices according to dst)
-    dst.scatter_(2, scatter_idx, scatter_src)
-    # dst = torch.scatter(dst, 2, scatter_idx, scatter_src)
-    print(f"final: {dst=}")
-    return dst
-
-
-def test_gs_slice():
-    out = torch.zeros(1, 1, 10, 2)
-    gather_idx = torch.arange(10).view(1, 1, 10, 1).repeat(1, 1, 1, 2)
-    gather_idx[0, 0, -1] = 9
-    gather_src = torch.ones(1, 1, 10, 2)
-    scatter_src = torch.ones(1, 1, 10, 2) * 2
-    scatter_idx = torch.tensor([9]).view(1, 1, 1, 1).repeat(1, 1, 1, 2)
-
-    print(f"{gather_idx=} {gather_src=} {scatter_idx=} {scatter_src=} {out=}")
-    gs_slice(gather_idx, gather_src, scatter_idx, scatter_src, out)
-    print(out)
-    exit()
-
-
 def test_non_compiled():
     window, sink = 2, 2
     dim, head, layers = 1, 1, 1
@@ -2013,10 +1816,357 @@ def test_non_compiled():
     print(f"{slow_times=} {fast_times=}")
 
 
+def compile_cache(
+    window,
+    sink,
+    dim,
+    head,
+    max_seq,
+    device,
+    dtype,
+):
+
+    cascade_idx = torch.tensor(0,
+                               device=device,
+                               dtype=torch.long,
+                               requires_grad=False)
+    input_key_states = torch.randn(1,
+                                   head,
+                                   1,
+                                   dim,
+                                   device=device,
+                                   dtype=dtype,
+                                   requires_grad=False)
+    input_value_states = torch.randn(1,
+                                     head,
+                                     1,
+                                     dim,
+                                     device=device,
+                                     dtype=dtype,
+                                     requires_grad=False)
+    input_score_states = torch.randn(1,
+                                     device=device,
+                                     dtype=dtype,
+                                     requires_grad=False)
+    sink_keys = torch.randn(1,
+                            head,
+                            sink,
+                            dim,
+                            device=device,
+                            dtype=dtype,
+                            requires_grad=False)
+    sink_values = torch.randn(1,
+                              head,
+                              sink,
+                              dim,
+                              device=device,
+                              dtype=dtype,
+                              requires_grad=False)
+    sink_pos = torch.arange(sink,
+                            device=device,
+                            dtype=torch.long,
+                            requires_grad=False).view(1, -1)
+    sink_mask = torch.zeros(1,
+                            1,
+                            1,
+                            sink,
+                            device=device,
+                            dtype=dtype,
+                            requires_grad=False)
+    keys = torch.randn(1,
+                       head,
+                       max_seq,
+                       dim,
+                       device=device,
+                       dtype=dtype,
+                       requires_grad=False)
+    values = torch.randn(1,
+                         head,
+                         max_seq,
+                         dim,
+                         device=device,
+                         dtype=dtype,
+                         requires_grad=False)
+    pos = torch.zeros(max_seq,
+                      device=device,
+                      dtype=torch.long,
+                      requires_grad=False).view(1, -1)
+
+    pos_ub = torch.tensor(max_seq,
+                          device=device,
+                          dtype=torch.long,
+                          requires_grad=False)
+
+    mask = torch.zeros(1,
+                       1,
+                       1,
+                       max_seq,
+                       device=device,
+                       dtype=dtype,
+                       requires_grad=False)
+    scores = torch.rand(max_seq,
+                        device=device,
+                        dtype=dtype,
+                        requires_grad=False)
+    stored_sinks = torch.zeros(1,
+                               device=device,
+                               dtype=torch.long,
+                               requires_grad=False)
+    start_indices = torch.zeros(max_seq // window,
+                                device=device,
+                                dtype=torch.long,
+                                requires_grad=False)
+
+    stored_tokens = torch.zeros(max_seq // window,
+                                device=device,
+                                dtype=torch.long,
+                                requires_grad=False)
+
+    cache_idx = torch.ones(1, head, 1, dim, device=device, dtype=torch.long)
+    mask_idx = torch.ones(1, 1, 1, 1, device=device, dtype=torch.long)
+    pos_idx = torch.ones(1, 1, device=device, dtype=torch.long)
+    score_idx = torch.ones(1, device=device, dtype=torch.long)
+    l = torch.ones(1, device=device, dtype=torch.long)
+    u = torch.ones(1, device=device, dtype=torch.long) * window
+    segment_len = torch.tensor([window], device=device, dtype=torch.long)
+    tmp_arange = torch.arange(window, device=device, dtype=torch.long)
+
+    _append_to_cache = make_graphed_callables(
+        append_to_cache,
+        (cascade_idx, input_key_states, input_value_states, input_score_states,
+         sink_keys, sink_values, sink_pos, sink_mask, keys, values, pos, mask,
+         scores, stored_sinks, start_indices, stored_tokens, cache_idx,
+         score_idx, pos_idx, mask_idx, l, u, segment_len),
+        allow_unused_input=True)
+
+    _evict_from_cache = make_graphed_callables(
+        evict_from_cache,
+        (cascade_idx, input_key_states, input_value_states, input_score_states,
+         sink_keys, sink_values, sink_pos, sink_mask, keys, values, pos, mask,
+         scores, stored_sinks, start_indices, stored_tokens, cache_idx,
+         score_idx, pos_idx, mask_idx, l, u, segment_len),
+        allow_unused_input=True)
+
+    _overwrite_cache = make_graphed_callables(
+        overwrite_cache,
+        (cascade_idx, input_key_states, input_value_states, input_score_states,
+         sink_keys, sink_values, sink_pos, sink_mask, keys, values, pos, mask,
+         scores, stored_sinks, start_indices, stored_tokens, cache_idx,
+         score_idx, pos_idx, mask_idx, l, u, segment_len),
+        allow_unused_input=True)
+
+    _add_sinks = make_graphed_callables(
+        add_sinks,
+        (input_key_states, input_value_states, input_score_states, sink_keys,
+         sink_values, sink_pos, sink_mask, keys, values, pos, mask, scores,
+         stored_sinks, start_indices, stored_tokens, cache_idx, score_idx,
+         pos_idx, mask_idx, l, u, segment_len),
+        allow_unused_input=True)
+
+    _update_segment_pos = make_graphed_callables(
+        update_segment_pos, (cascade_idx, pos, pos_ub, start_indices,
+                             stored_tokens, l, u, segment_len, tmp_arange),
+        allow_unused_input=True)
+
+    return _append_to_cache, _evict_from_cache, _overwrite_cache, _add_sinks, _update_segment_pos
+
+
+def test_nsys():
+    window, sink = 2048, 4
+    dim, head, layers = 2048 // 16, 16, 1
+    max_seq = 8192
+    device = "cuda:0"
+    dtype = torch.float16
+
+    (
+        append_to_cache,
+        evict_from_cache,
+        overwrite_cache,
+        add_sinks,
+        update_segment_pos,
+    ) = compile_cache(
+        window,
+        sink,
+        dim,
+        head,
+        max_seq,
+        device,
+        dtype,
+    )
+
+    cache = CascadingSinkCacheCompile(
+        window_length=window,
+        num_sink_tokens=sink,
+        max_batch_size=1,
+        heads=head,
+        dim=dim,
+        n_layers=layers,
+        device=device,
+        dtype=dtype,
+        max_seq_len=max_seq,
+    )
+
+    cache.append_to_cache = append_to_cache
+    cache.evict_from_cache = evict_from_cache
+    cache.overwrite_cache = overwrite_cache
+    cache.add_sinks = add_sinks
+    cache.update_segment_pos = update_segment_pos
+
+    # cache = torch.compile(cache, mode="reduce-overhead", fullgraph=True)
+
+    with torch.no_grad():
+        for i in range(100):
+            for layer_idx in range(layers):
+                # print(f"{'='*50}")
+                k, v = torch.ones(
+                    1, head, 1, dim, device=device,
+                    dtype=dtype) * (i + 1), torch.ones(
+                        1, head, 1, dim, device=device, dtype=dtype) * (i + 1)
+
+                # print(f"\n\n\n\ninput for {layer_idx=} kv {k.size()=} {v.size()=}")
+
+                k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache.update(
+                    k.clone(), v.clone(), layer_idx=layer_idx)
+
+
+def test_compiled_non_compiled():
+    window, sink = 2048, 4
+    dim, head, layers = 2048 // 16, 16, 1
+    max_seq = 8192
+    device = "cuda:0"
+    dtype = torch.float16
+
+    (
+        append_to_cache,
+        evict_from_cache,
+        overwrite_cache,
+        add_sinks,
+        update_segment_pos,
+    ) = compile_cache(
+        window,
+        sink,
+        dim,
+        head,
+        max_seq,
+        device,
+        dtype,
+    )
+
+    cache = CascadingSinkCacheCompile(
+        window_length=window,
+        num_sink_tokens=sink,
+        max_batch_size=1,
+        heads=head,
+        dim=dim,
+        n_layers=layers,
+        device=device,
+        dtype=dtype,
+        max_seq_len=max_seq,
+    )
+
+    cache.append_to_cache = append_to_cache
+    cache.evict_from_cache = evict_from_cache
+    cache.overwrite_cache = overwrite_cache
+    cache.add_sinks = add_sinks
+    cache.update_segment_pos = update_segment_pos
+
+    # cache = torch.compile(cache, mode="reduce-overhead", fullgraph=True)
+
+    slow_cache = CascadingSinkCache(
+        window_length=window,
+        num_sink_tokens=sink,
+        max_batch_size=1,
+        heads=head,
+        dim=dim,
+        n_layers=layers,
+        device=device,
+        dtype=dtype,
+        max_seq_len=max_seq,
+    )
+
+    with torch.no_grad():
+        slow_times, fast_times = [], []
+        for i in range(6000):
+            for layer_idx in range(layers):
+                # print(f"{'='*50}")
+                k, v = torch.ones(
+                    1, head, 1, dim, device=device,
+                    dtype=dtype) * (i + 1), torch.ones(
+                        1, head, 1, dim, device=device, dtype=dtype) * (i + 1)
+
+                # print(f"\n\n\n\ninput for {layer_idx=} kv {k.size()=} {v.size()=}")
+
+                tic = time.perf_counter()
+                k_nocomp, v_nocomp, pos_nocomp, sink_mask_nocomp, k_nosink_nocomp, v_nosink_nocomp, pos_nosink_nocomp, mask_nocomp = slow_cache.update(
+                    k.clone(), v.clone(), layer_idx=layer_idx)
+                slow_times.append(time.perf_counter() - tic)
+                n = pos_nocomp.squeeze(0).size(0)
+
+                if k_nosink_nocomp is not None:
+                    # print(f"\n\n{k.size()=} {k_nosink.size()=}")
+                    k_nocomp, v_nocomp = torch.cat(
+                        (k_nocomp, k_nosink_nocomp), dim=-2), torch.cat(
+                            (v_nocomp, v_nosink_nocomp), dim=-2)
+                    pos_nocomp = torch.cat((pos_nocomp, pos_nosink_nocomp),
+                                           dim=-1).squeeze(0)
+                    n = pos_nocomp.size(0)
+                    k_nocomp, v_nocomp = k_nocomp[:, :, :n], v_nocomp[:, :, :n]
+
+                argsort = torch.argsort(pos_nocomp.squeeze(0)[:n])
+
+                k_nocomp, v_nocomp = k_nocomp[:, :, argsort], v_nocomp[:, :,
+                                                                       argsort]
+
+                # ============================================================================================
+                tic = time.perf_counter()
+                k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache.update(
+                    k.clone(), v.clone(), layer_idx=layer_idx)
+                fast_times.append(time.perf_counter() - tic)
+
+                # print(f"\n\n{k.size()=} {k_nosink.size()=}")
+                k, v = torch.cat((k, k_nosink), dim=-2), torch.cat(
+                    (v, v_nosink), dim=-2)
+                pos = torch.cat((pos, pos_nosink), dim=-1).squeeze(0)
+                mask = torch.cat((sink_mask, mask), dim=-1)
+
+                n = (mask == 0).sum()
+                k, v = k[:, :, :n], v[:, :, :n]
+                argsort = torch.argsort(pos[:n])
+                # print(f"{mask=} {k=} {v=}")
+
+                # print(
+                #     f"before sort: \n{slow_k.view(-1)=}\n{k.reshape(-1)=}\n{pos.reshape(-1)=}"
+                # )
+
+                k, v = k[:, :, argsort], v[:, :, argsort]
+
+                # print(f"after sort: {k.view(-1)}")
+                if not k_nocomp.size() == k.size():
+                    print(f"{k_nocomp.size()=} {k.size()=}")
+                    print(f"sizes not equal...\n{k_nocomp=} {k=}")
+                    exit()
+
+                diff = (k_nocomp - k).abs().amax()
+                print(f"k diff: {diff=} {i=} {layer_idx=}")
+                if diff > 1e-6:
+                    print(
+                        f"{k_nocomp.view(-1)=}\n{k.view(-1)=}\n{pos.view(-1)=}\n{(k - k_nocomp).abs().view(-1)=}"
+                    )
+                    exit("too big")
+
+        # print(
+        #     f"output for {layer_idx=} {sk.size()=} {sv.size()=} {spos.size()=}"
+        # )
+    slow_times = sum(slow_times) / len(slow_times)
+    fast_times = sum(fast_times) / len(fast_times)
+    print(f"{slow_times=} {fast_times=}")
+
+
 def test_compiled():
-    window, sink = 4, 2
-    dim, head, layers = 2, 2, 1
-    device = "cuda:7"
+    window, sink = 10, 4
+    dim, head, layers = 128, 32, 1
+    max_seq = 250
+    device = "cuda:0"
     dtype = torch.float16
     cache = CascadingSinkCacheCompile(
         window_length=window,
@@ -2025,73 +2175,89 @@ def test_compiled():
         heads=head,
         dim=dim,
         n_layers=layers,
-        device="cuda:7",
+        device=device,
         dtype=dtype,
-        max_seq_len=12,
+        max_seq_len=max_seq,
     )
 
+    cache = compile_cache(cache)
     slow_cache = CascadingSinkCacheSlow(window_length=window,
                                         num_sink_tokens=sink)
 
-    for i in range(6000):
-        for layer_idx in range(layers):
-            if i < sink:
-                k, v = torch.ones(
-                    1, head, 1, dim, device=device,
-                    dtype=dtype) * (i + 1), torch.ones(
-                        1, head, 1, dim, device=device, dtype=dtype) * (i + 1)
-            else:
-                k, v = torch.ones(
-                    1, head, 1, dim, device=device,
-                    dtype=dtype) * (i + 1), torch.ones(
-                        1, head, 1, dim, device=device, dtype=dtype) * (i + 1)
+    with torch.no_grad():
+        slow_times, fast_times = [], []
+        for i in range(6000):
+            for layer_idx in range(layers):
+                # print(f"{'='*50}")
+                if i < sink:
+                    k, v = torch.ones(
+                        1, head, 1, dim, device=device,
+                        dtype=dtype) * (i + 1), torch.ones(
+                            1, head, 1, dim, device=device,
+                            dtype=dtype) * (i + 1)
+                else:
+                    k, v = torch.ones(
+                        1, head, 1, dim, device=device,
+                        dtype=dtype) * (i + 1), torch.ones(
+                            1, head, 1, dim, device=device,
+                            dtype=dtype) * (i + 1)
 
-            # print(f"\n\n\n\ninput for {layer_idx=} kv {k.size()=} {v.size()=}")
-            slow_k, slow_v = slow_cache.update(k.clone(),
-                                               v.clone(),
-                                               layer_idx=layer_idx)
+                # print(f"\n\n\n\ninput for {layer_idx=} kv {k.size()=} {v.size()=}")
 
-            k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache.update(
-                k.clone(), v.clone(), layer_idx=layer_idx)
+                tic = time.perf_counter()
+                slow_k, slow_v = slow_cache.update(k.clone(),
+                                                   v.clone(),
+                                                   layer_idx=layer_idx)
+                slow_times.append(time.perf_counter() - tic)
 
-            print(f"{k.size()=} {k_nosink.size()=}")
-            k, v = torch.cat((k, k_nosink), dim=-2), torch.cat((v, v_nosink),
-                                                               dim=-2)
-            pos = torch.cat((pos, pos_nosink), dim=-1).squeeze(0)
-            mask = torch.cat((sink_mask, mask), dim=-1)
+                tic = time.perf_counter()
+                k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache.update(
+                    k.clone(), v.clone(), layer_idx=layer_idx)
+                fast_times.append(time.perf_counter() - tic)
 
-            n = (mask == 0).sum()
-            k, v = k[:, :, :n], v[:, :, :n]
-            argsort = torch.argsort(pos[:n])
-            print(f"{mask=} {k=} {v=}")
+                # print(f"\n\n{k.size()=} {k_nosink.size()=}")
+                k, v = torch.cat((k, k_nosink), dim=-2), torch.cat(
+                    (v, v_nosink), dim=-2)
+                pos = torch.cat((pos, pos_nosink), dim=-1).squeeze(0)
+                mask = torch.cat((sink_mask, mask), dim=-1)
+
+                n = (mask == 0).sum()
+                k, v = k[:, :, :n], v[:, :, :n]
+                argsort = torch.argsort(pos[:n])
+                # print(f"{mask=} {k=} {v=}")
+
+                # print(
+                #     f"before sort: \n{slow_k.view(-1)=}\n{k.reshape(-1)=}\n{pos.reshape(-1)=}"
+                # )
+                print(f"comp {pos=}")
+
+                k, v = k[:, :, argsort], v[:, :, argsort]
+
+                # print(f"after sort: {k.view(-1)}")
+                if not slow_k.size() == k.size():
+                    print(f"{slow_k.size()=} {k.size()=}")
+                    print(f"sizes not equal...\n{slow_k=} {k=}")
+                    exit()
+
+                diff = (slow_k - k).abs().amax()
+                print(f"k diff: {diff=} {i=} {layer_idx=}")
+                if diff > 1e-6:
+                    print(
+                        f"{slow_k.view(-1)=}\n{k.view(-1)=}\n{pos.view(-1)=}\n{(k - slow_k).abs().view(-1)=}"
+                    )
+                    exit("too big")
 
             print(
-                f"before sort: \n{slow_k.view(-1)=}\n{k.reshape(-1)=}\n{pos.reshape(-1)=}"
+                f"output for {layer_idx=} {sk.size()=} {sv.size()=} {spos.size()=}"
             )
-            print(f"{pos=}")
-
-            k, v = k[:, :, argsort], v[:, :, argsort]
-
-            # print(f"after sort: {k.view(-1)}")
-            if not slow_k.size() == k.size():
-                print(f"{slow_k.size()=} {k.size()=}")
-                print(f"sizes not equal...\n{slow_k=} {k=}")
-                exit()
-
-            diff = (slow_k - k).abs().amax()
-            print(f"k diff: {diff=} {i=} {layer_idx=}")
-            if diff > 1e-6:
-                print(
-                    f"{slow_k.view(-1)=}\n{k.view(-1)=}\n{pos.view(-1)=}\n{(k - slow_k).abs().view(-1)}"
-                )
-                exit("too big")
-
-            # print(
-            #     f"output for {layer_idx=} {sk.size()=} {sv.size()=} {spos.size()=}"
-            # )
+    slow_times = sum(slow_times) / len(slow_times)
+    fast_times = sum(fast_times) / len(fast_times)
+    print(f"{slow_times=} {fast_times=}")
 
 
 if __name__ == "__main__":
     # test_gs_slice()
-    test_non_compiled()
+    # test_non_compiled()
     # test_compiled()
+    test_compiled_non_compiled()
+    # test_nsys()
