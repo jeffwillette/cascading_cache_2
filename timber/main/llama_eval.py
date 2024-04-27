@@ -93,32 +93,40 @@ def load_model(args):
     config = LlamaConfig.from_pretrained(model_id)
     config._attn_implementation = config.attn_implementation = 'sdpa'
     config._umbc = args.method == "umbc"
+    config._batch_size = 25
     config._sinks = args.sinks
     config._cascades = args.cascades
     config._umbc_slots = args.slots
     config._umbc_chunk = args.chunk
     config._window = args.window
-    infer_dtype = torch.float32
+    infer_dtype = torch.float16
+
+    print(f"{config=}")
+
+    # TODO:
+    #  - how to seped this up more?
+    #  - delete old runs and run again with 16 bit due to better performance
 
     from_pretrained_kwargs = dict(
         config=config,
-        device_map={"": device},
-        quantization_config=transformers.BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=infer_dtype,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            llm_int8_skip_modules=[
-                "sse_q",
-                "sse_k",
-                "sse_v",
-                "slots",
-                "norm_slots",
-                "norm_after",
-                # "input_layernorm",
-                # "post_attention_layernorm",
-                # "norm",
-            ]),
+        # device_map={"": device},
+        device_map=None,
+        # quantization_config=transformers.BitsAndBytesConfig(
+        #     load_in_4bit=True,
+        #     bnb_4bit_compute_dtype=infer_dtype,
+        #     bnb_4bit_use_double_quant=True,
+        #     bnb_4bit_quant_type="nf4",
+        #     llm_int8_skip_modules=[
+        #         "sse_q",
+        #         "sse_k",
+        #         "sse_v",
+        #         "slots",
+        #         "norm_slots",
+        #         "norm_after",
+        #         # "input_layernorm",
+        #         # "post_attention_layernorm",
+        #         # "norm",
+        #     ]),
         torch_dtype=infer_dtype,
         trust_remote_code=True,
     )
@@ -183,7 +191,7 @@ def load_model(args):
             print(f"loading umbc checkpoint: {args.checkpoint=}")
             model.load_state_dict(ckpt, strict=True)
 
-    model = model.eval()
+    model = model.eval().cuda()
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 
     return model, tokenizer, device

@@ -31,6 +31,14 @@ class MockRun:
 
 
 def job_ppl(args, model, tokenizer, device):
+    model.model.setup_caches()
+    model = torch.compile(
+        model,
+        mode="default",
+        # mode="default",
+        fullgraph=False,
+        # options={"trace.enabled": True},
+    )
     run = Run(experiment=args.method,
               read_only=args.dev_run) if not args.dev_run else MockRun()
     dataset = "wikitext"

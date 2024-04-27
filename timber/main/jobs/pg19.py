@@ -16,8 +16,25 @@ from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
 from timber.utils import seed, get_bench
 
 
+class MockRun:
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def track(self, *args, **kwargs):
+        pass
+
+    def __setitem__(self, key, value):
+        pass
+
+    def __getitem__(self, key):
+        pass
+
+
 def job_ppl_pg19(args, model, tokenizer, device):
-    run = Run(experiment=f"{args.method}-pg19")
+    model.model.setup_caches()
+    run = Run(
+        experiment=f"{args.method}-pg19") if not args.dev_run else MockRun()
     dataset = "wikitext"
     run["hparams"] = {
         "job": "ppl",
@@ -29,47 +46,42 @@ def job_ppl_pg19(args, model, tokenizer, device):
         "slots": args.slots,
     }
 
-    encodings, targets = PG19Streaming(tokenizer)[0]
-
     nll = 0
     count = 0
-    past_key_values = None
-    input_ids = encodings.to(device)
-    target_ids = targets.to(device)
-    with tqdm(range(encodings.size(1) - 1)) as pbar:
-        for i in pbar:
-            with torch.no_grad():
-                # model.model.model.sse.post_forward_mbc_cleanup()
-                mdl = model.model if args.lora_r == 0 else model.model.model
+    batch_size = 25
+    dataset = PG19Streaming(tokenizer, batch_size=batch_size)
 
-                if args.method == "umbc":
-                    for lyr in mdl.layers:
-                        lyr.self_attn.sse.post_forward_mbc_cleanup()
+    for x, y in dataset:
+        input_ids = x.to(device)
+        target_ids = y.to(device)
+        print(
+            f"starting batch of books: {input_ids.size()=} {target_ids.size()=}"
+        )
+        with tqdm(range(x.size(1) - 1)) as pbar:
+            for i in pbar:
+                with torch.no_grad():
+                    inp = input_ids[:, i:i + 1]
+                    # use cache false means to use static cascading cache inside the model
+                    output = model(inp, use_cache=False)
 
-                inp = input_ids[:, i:i + 1]
-                output = model(
-                    inp,
-                    use_cache=True,
-                    past_key_values=past_key_values,
-                )
-                past_key_values = output.past_key_values
+                    logits = output.logits[:, -1:]
+                    targets = target_ids[:, i + 1:i + 2]
+                    _nll = torch.nn.functional.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        targets.reshape(-1),
+                        ignore_index=-100,
+                        reduction="sum",
+                    )
+                    nll += _nll
+                    count += (targets >= 0).sum().item()
 
-                logits = output.logits[:, -1:]
-                targets = target_ids[:, i + 1:i + 2]
-                _nll = torch.nn.functional.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    targets.reshape(-1),
-                )
-                nll += _nll
-                count += 1
-
-                if i % 10 == 0:
-                    ppl = torch.exp(nll / count).item()
-                    run.track(ppl,
-                              name="ppl-pg19",
-                              step=i,
-                              context={"subset": "test"})
-                    pbar.set_description(f"{ppl=:.6f}")
+                    if i % 1 == 0:
+                        ppl = torch.exp(nll / count).item()
+                        run.track(ppl,
+                                  name="ppl-pg19",
+                                  step=i,
+                                  context={"subset": "test"})
+                        pbar.set_description(f"{ppl=:.6f}")
 
     ppl = torch.exp(nll / count).item()
 

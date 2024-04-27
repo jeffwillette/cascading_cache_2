@@ -8,6 +8,7 @@ def cache_tokenized(dataset, tokenizer):
     os.makedirs('./cache/pg19', exist_ok=True)
     cache_path = './cache/pg19/tokenized.pth'
     if os.path.exists(cache_path):
+        print(f"loading cached tokenized books from: {cache_path}")
         return torch.load(cache_path)
     else:
         text = []
@@ -16,32 +17,64 @@ def cache_tokenized(dataset, tokenizer):
             entry = dataset[i]
             text.append(entry['text'])
 
-        print("tokenizing")
-        ids = tokenizer(
-            "\n\n".join(text),
-            return_tensors='pt',
-            truncation=False,
-        ).input_ids
+        print("tokenizing books")
+        tokenized = [
+            tokenizer(t, return_tensors="pt", truncation=False).input_ids
+            for t in text
+        ]
 
-        print(f"{ids.size()=}")
+        for v in tokenized:
+            print(v.size())
+
+        # concats all the tokenized books
+        # ids = tokenizer(
+        #     "\n\n".join(text),
+        #     return_tensors='pt',
+        #     truncation=False,
+        # ).input_ids
+
+        print(f"{len(tokenized)=}")
         print("saving")
-        torch.save(ids, cache_path)
+        torch.save(tokenized, cache_path)
         return cache_tokenized(dataset, tokenizer)
 
 
 class PG19Streaming(Dataset):
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, batch_size=10):
         self.tokenizer = tokenizer
         self.dataset = datasets.load_dataset('emozilla/pg19-test')['test']
+        self.batch_size = batch_size
 
         self.inputs = cache_tokenized(self.dataset, self.tokenizer)
+        self.inputs = sorted(self.inputs, key=lambda x: x.size(1))
 
     def __len__(self):
-        return 1
+        return len(self.inputs) // self.batch_size
 
     def __getitem__(self, idx):
-        return self.inputs, self.inputs
+        inputs = self.inputs[idx:(idx + 1) * self.batch_size]
+        max_size = max([v.size(1) for v in inputs])
+
+        out_inputs, out_labels = [], []
+        for v in inputs:
+            out_inputs.append(
+                torch.cat((v,
+                           torch.zeros(1,
+                                       max_size - v.size(1),
+                                       device=v.device,
+                                       dtype=v.dtype)),
+                          dim=-1))
+
+            out_labels.append(
+                torch.cat((v,
+                           torch.full((1, max_size - v.size(1)),
+                                      fill_value=-100,
+                                      device=v.device,
+                                      dtype=v.dtype)),
+                          dim=-1))
+
+        return torch.cat(out_inputs, dim=0), torch.cat(out_labels, dim=0)
 
 
 if __name__ == '__main__':
