@@ -5,8 +5,12 @@ from torch.utils.data import Dataset
 
 
 def cache_tokenized(dataset, tokenizer):
+    print(tokenizer, vars(tokenizer))
     os.makedirs('./cache/pg19', exist_ok=True)
-    cache_path = './cache/pg19/tokenized.pth'
+
+    name = tokenizer.name_or_path.replace("/", "-")
+    cache_path = f'./cache/pg19/{name}-tokenized.pth'
+
     if os.path.exists(cache_path):
         print(f"loading cached tokenized books from: {cache_path}")
         return torch.load(cache_path)
@@ -39,7 +43,7 @@ def cache_tokenized(dataset, tokenizer):
         return cache_tokenized(dataset, tokenizer)
 
 
-class PG19Streaming(Dataset):
+class PG19Streaming(object):
 
     def __init__(self, tokenizer, batch_size=10):
         self.tokenizer = tokenizer
@@ -50,10 +54,13 @@ class PG19Streaming(Dataset):
         self.inputs = sorted(self.inputs, key=lambda x: x.size(1))
 
     def __len__(self):
-        return len(self.inputs) // self.batch_size
+        return (len(self.inputs) // self.batch_size)
 
-    def __getitem__(self, idx):
-        inputs = self.inputs[idx:(idx + 1) * self.batch_size]
+    def __getitem__(self, idx) -> int:
+        if idx >= len(self):
+            raise IndexError("Index out of range")
+
+        inputs = self.inputs[idx * self.batch_size:(idx + 1) * self.batch_size]
         max_size = max([v.size(1) for v in inputs])
 
         out_inputs, out_labels = [], []
@@ -84,4 +91,5 @@ if __name__ == '__main__':
     ds = PG19Streaming(tokenizer)
 
     print(f"{len(ds)=}")
-    print(f"{ds[0][0].size()=}")
+    for i, (x, y) in enumerate(ds):
+        print(f"{i} {x.size()=} {y.size()=}")

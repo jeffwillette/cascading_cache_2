@@ -40,6 +40,8 @@ def eval_args(
     parser.add_argument('--chunk', default=32, type=int)
     parser.add_argument('--sinks', default=0, type=int)
     parser.add_argument('--cascades', default=1, type=int)
+    parser.add_argument('--cascade_func', type=str, default="pow2")
+    parser.add_argument('--comment', type=str, default="")
     parser.add_argument('--dev_run', action='store_true')
 
     args = parser.parse_args()

@@ -16,91 +16,92 @@ from torch.autograd import Function
 from typing import List, Optional, Tuple, Dict, Any
 import warnings
 
+IDTYPE = tl.int64
+
 
 @triton.jit
 def _update_sink_cache(
-        # input tensors
-        KEY,
-        VAL,
-        stride_k_n,
-        stride_k_h,
-        stride_k_t,
-        stride_k_hid,
-        SINK_K,
-        SINK_V,
-        stride_sk_n,
-        stride_sk_h,
-        stride_sk_t,
-        stride_sk_hid,
-        SINK_MASK,
-        stride_m_n,
-        stride_m_h,
-        stride_m_t,
-        SINK_POS,
-        stride_p_n,
-        stride_p_h,
-        stride_p_t,
-        STORED_SINKS,
-        stride_ss_n,
-        stride_ss_h,
+    # input tensors
+    KEY,
+    VAL,
+    stride_k_n,
+    stride_k_h,
+    stride_k_t,
+    stride_k_hid,
+    SINK_K,
+    SINK_V,
+    stride_sk_n,
+    stride_sk_h,
+    stride_sk_t,
+    stride_sk_hid,
+    SINK_MASK,
+    stride_m_n,
+    stride_m_h,
+    stride_m_t,
+    SINK_POS,
+    stride_p_n,
+    stride_p_h,
+    stride_p_t,
+    STORED_SINKS,
+    stride_ss_n,
+    stride_ss_h,
 
-        # input variables
-        N,
-        K,
-        HID,
-        NUM_SINK,
-        WINDOW_SIZE,
+    # input variables
+    N,
+    K,
+    HID,
+    NUM_SINK,
+    WINDOW_SIZE,
 
-        # kernel constants
-        BLOCK_HID: tl.constexpr):
+    # kernel constants
+    BLOCK_HID: tl.constexpr,
+):
 
-    dtype = tl.float16
-    idtype = tl.int64
-
-    idx_hid = tl.arange(0, BLOCK_HID).to(idtype)
+    idx_hid = tl.arange(0, BLOCK_HID).to(IDTYPE)
     mask_hid = idx_hid < HID
 
-    idx_n = tl.program_id(0).to(idtype)
-    idx_h = tl.program_id(1).to(idtype)
-    idx_t = tl.program_id(2).to(idtype)
+    idx_n = tl.program_id(0).to(IDTYPE)
+    idx_h = tl.program_id(1).to(IDTYPE)
+    idx_t = tl.program_id(2).to(IDTYPE)
 
-    kv_shift = idx_n.to(idtype) * stride_k_n + \
-        idx_h.to(idtype) * stride_k_h + \
-        idx_t.to(idtype) * stride_k_t + \
-        idx_hid.to(idtype) * stride_k_hid
+    kv_shift = idx_n.to(IDTYPE) * stride_k_n + \
+        idx_h.to(IDTYPE) * stride_k_h + \
+        idx_t.to(IDTYPE) * stride_k_t + \
+        idx_hid.to(IDTYPE) * stride_k_hid
 
     # # load key
     key = tl.load(KEY + kv_shift, mask=mask_hid, other=0)
     val = tl.load(VAL + kv_shift, mask=mask_hid, other=0)
+    dtype = key.dtype
 
     stored_shift = idx_n * stride_ss_n + idx_h * stride_ss_h
     stored = tl.load(STORED_SINKS + stored_shift)
 
-    kv_cshift = idx_n.to(idtype) * stride_sk_n + \
-        idx_h.to(idtype) * stride_sk_h + \
-        stored.to(idtype) * stride_sk_t + \
-        idx_hid.to(idtype) * stride_sk_hid
+    kv_cshift = idx_n.to(IDTYPE) * stride_sk_n + \
+        idx_h.to(IDTYPE) * stride_sk_h + \
+        stored.to(IDTYPE) * stride_sk_t + \
+        idx_hid.to(IDTYPE) * stride_sk_hid
 
     tl.store(SINK_K + kv_cshift, value=key.to(dtype), mask=mask_hid)
     tl.store(SINK_V + kv_cshift, value=val.to(dtype), mask=mask_hid)
 
     tl.store(
         SINK_POS + \
-            idx_n.to(idtype) * stride_p_n + \
-            idx_h.to(idtype) * stride_p_h + \
-            stored.to(idtype) * stride_p_t,
-        value=stored.to(idtype),
+            idx_n.to(IDTYPE) * stride_p_n + \
+            idx_h.to(IDTYPE) * stride_p_h + \
+            stored.to(IDTYPE) * stride_p_t,
+        value=stored.to(IDTYPE),
     )
 
     tl.store(
         SINK_MASK + \
-            idx_n.to(idtype) * stride_m_n + \
-            idx_h.to(idtype) * stride_m_h + \
-            stored.to(idtype) * stride_m_t,
+            idx_n.to(IDTYPE) * stride_m_n + \
+            idx_h.to(IDTYPE) * stride_m_h + \
+            stored.to(IDTYPE) * stride_m_t,
         value=0,
     )
 
-    tl.store(STORED_SINKS + stored_shift, value=(stored + 1).to(idtype))
+    tl.store(STORED_SINKS + stored_shift, value=(stored + 1).to(IDTYPE))
 
 
 @triton.jit
@@ -126,7 +127,7 @@ def _update_positional_idx(
     pos = (tl.arange(0, WINDOW_SIZE_CONST) + (segment_len - start_idx_i)) % segment_len + \
         pos_ub - segment_len
 
-    pos_idx = tl.arange(0, WINDOW_SIZE_CONST).to(tl.int64)
+    pos_idx = tl.arange(0, WINDOW_SIZE_CONST).to(IDTYPE)
     tl.store(
         POS + \
             idx_n * stride_p_n + \
@@ -188,17 +189,15 @@ def _update_kv_cache(
     CASCADES: tl.constexpr,
     BLOCK_HID: tl.constexpr,
 ):
-    dtype = tl.float16
-    idtype = tl.int64
 
-    idx_hid = tl.arange(0, BLOCK_HID).to(idtype)
+    idx_hid = tl.arange(0, BLOCK_HID).to(IDTYPE)
     mask_hid = idx_hid < HID
 
-    cascades_idx = tl.arange(0, CASCADES).to(idtype)
+    cascades_idx = tl.arange(0, CASCADES).to(IDTYPE)
 
-    idx_n = tl.program_id(0).to(idtype)
-    idx_h = tl.program_id(1).to(idtype)
-    idx_t = tl.program_id(2).to(idtype)
+    idx_n = tl.program_id(0).to(IDTYPE)
+    idx_h = tl.program_id(1).to(IDTYPE)
+    idx_t = tl.program_id(2).to(IDTYPE)
 
     stored = tl.load(STORED_TOKENS + idx_n * CASCADES + cascades_idx)
 
@@ -211,30 +210,31 @@ def _update_kv_cache(
         pos_ub = pos_ub + 1
 
     # LOAD KEY VALUE AND SCORE STATES
-    kv_shift = idx_n.to(idtype) * stride_k_n + \
-        idx_h.to(idtype) * stride_k_h + \
-        idx_t.to(idtype) * stride_k_t + \
-        idx_hid.to(idtype) * stride_k_hid
+    kv_shift = idx_n.to(IDTYPE) * stride_k_n + \
+        idx_h.to(IDTYPE) * stride_k_h + \
+        idx_t.to(IDTYPE) * stride_k_t + \
+        idx_hid.to(IDTYPE) * stride_k_hid
 
     key = tl.load(KEY + kv_shift, mask=mask_hid, other=0)
     value = tl.load(VAL + kv_shift, mask=mask_hid, other=0)
+    dtype = key.dtype
 
     score = tl.load(
         SCR + \
-            idx_n.to(idtype) * stride_s_n + \
-            idx_h.to(idtype) * stride_s_h + \
-            idx_t.to(idtype) * stride_s_t,
+            idx_n.to(IDTYPE) * stride_s_n + \
+            idx_h.to(IDTYPE) * stride_s_h + \
+            idx_t.to(IDTYPE) * stride_s_t,
     )
 
     do_break = False
     i = 0
     while i < CASCADES and not do_break:
-        l = (i * WINDOW_SIZE).to(idtype)
-        u = ((i + 1) * WINDOW_SIZE).to(idtype)
-        segment_len = WINDOW_SIZE.to(idtype)
+        l = (i * WINDOW_SIZE).to(IDTYPE)
+        u = ((i + 1) * WINDOW_SIZE).to(IDTYPE)
+        segment_len = WINDOW_SIZE.to(IDTYPE)
 
         # all N will be the same here, so there is no n dimension included
-        do_cache_i = tl.load(DO_CACHE + i.to(idtype))
+        do_cache_i = tl.load(DO_CACHE + i.to(IDTYPE))
 
         stored_shift = idx_n.to(tl.int64) * stride_st_n + \
             idx_h.to(tl.int64) * stride_st_h + \
@@ -246,13 +246,13 @@ def _update_kv_cache(
         if do_cache_i:
             # print("append first")
             if stored_tokens_i < segment_len:
-                t = start_idx_i.to(idtype) + stored_tokens_i.to(idtype) + l.to(
-                    idtype)
+                t = start_idx_i.to(IDTYPE) + stored_tokens_i.to(IDTYPE) + l.to(
+                    IDTYPE)
 
-                kv_adds = idx_n.to(idtype) * stride_ck_n + \
-                    idx_h.to(idtype) * stride_ck_h + \
-                    t.to(idtype) * stride_ck_t + \
-                    idx_hid.to(idtype) * stride_ck_hid
+                kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
+                    idx_h.to(IDTYPE) * stride_ck_h + \
+                    t.to(IDTYPE) * stride_ck_t + \
+                    idx_hid.to(IDTYPE) * stride_ck_hid
 
                 # add in new values at the proper location, set mask
                 tl.store(CACHE_K + kv_adds, value=key.to(dtype), mask=mask_hid)
@@ -262,23 +262,23 @@ def _update_kv_cache(
 
                 tl.store(
                     CACHE_S + \
-                         idx_n.to(idtype) * stride_s_n + \
-                         idx_h.to(idtype) * stride_s_h + \
-                         t.to(idtype) * stride_s_t,
+                         idx_n.to(IDTYPE) * stride_s_n + \
+                         idx_h.to(IDTYPE) * stride_s_h + \
+                         t.to(IDTYPE) * stride_s_t,
                          value=score.to(dtype)
                 )
 
                 tl.store(
                     MASK + \
-                         idx_n.to(idtype) * stride_m_n + \
-                         idx_h.to(idtype) * stride_m_h + \
-                         t.to(idtype) * stride_m_t,
+                         idx_n.to(IDTYPE) * stride_m_n + \
+                         idx_h.to(IDTYPE) * stride_m_h + \
+                         t.to(IDTYPE) * stride_m_t,
                          value=0
                 )
 
                 # increment the stored tokens for this cascade
                 tl.store(STORED_TOKENS + stored_shift,
-                         value=(stored_tokens_i + 1).to(idtype))
+                         value=(stored_tokens_i + 1).to(IDTYPE))
 
                 _update_positional_idx(
                     POS,
@@ -300,13 +300,13 @@ def _update_kv_cache(
 
             else:
                 # print("evict")
-                t = start_idx_i.to(idtype) + l.to(idtype)
+                t = start_idx_i.to(IDTYPE) + l.to(IDTYPE)
 
                 # load the key value and score states which are going do be evicted
-                kv_adds = idx_n.to(idtype) * stride_ck_n + \
-                    idx_h.to(idtype) * stride_ck_h + \
-                    t.to(idtype) * stride_ck_t + \
-                    idx_hid.to(idtype) * stride_ck_hid
+                kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
+                    idx_h.to(IDTYPE) * stride_ck_h + \
+                    t.to(IDTYPE) * stride_ck_t + \
+                    idx_hid.to(IDTYPE) * stride_ck_hid
 
                 # we need to evict
                 # 1. find the oldest token (start point), remove it and
@@ -314,9 +314,9 @@ def _update_kv_cache(
                 next_key = tl.load(CACHE_K + kv_adds, mask=mask_hid, other=0)
                 next_value = tl.load(CACHE_V + kv_adds, mask=mask_hid, other=0)
 
-                sc_shift = idx_n.to(idtype) * stride_cs_n + \
-                    idx_h.to(idtype) * stride_cs_h + \
-                    t.to(idtype) * stride_cs_t
+                sc_shift = idx_n.to(IDTYPE) * stride_cs_n + \
+                    idx_h.to(IDTYPE) * stride_cs_h + \
+                    t.to(IDTYPE) * stride_cs_t
 
                 next_score = tl.load(CACHE_S + sc_shift)
 
@@ -336,10 +336,10 @@ def _update_kv_cache(
                 # 2. rotate the start index.
                 tl.store(
                     START_INDICES + \
-                        idx_n.to(idtype) * stride_st_n + \
-                        idx_h.to(idtype) * stride_st_h + \
-                        i.to(idtype) * stride_st_c,
-                     value=((start_idx_i + 1) % segment_len).to(idtype)
+                        idx_n.to(IDTYPE) * stride_st_n + \
+                        idx_h.to(IDTYPE) * stride_st_h + \
+                        i.to(IDTYPE) * stride_st_c,
+                     value=((start_idx_i + 1) % segment_len).to(IDTYPE)
                 )
 
                 _update_positional_idx(
@@ -369,13 +369,13 @@ def _update_kv_cache(
                 #    this may happen due to the do_cache input_values not lining up perfectly with powers of 2.
                 #    In this case, we should add an element to the cache so it doesn't just get automatically evicted.
 
-                t = start_idx_i.to(idtype) + stored_tokens_i.to(idtype) + l.to(
-                    idtype)
+                t = start_idx_i.to(IDTYPE) + stored_tokens_i.to(IDTYPE) + l.to(
+                    IDTYPE)
 
-                kv_adds = idx_n.to(idtype) * stride_ck_n + \
-                    idx_h.to(idtype) * stride_ck_h + \
-                    t.to(idtype) * stride_ck_t + \
-                    idx_hid.to(idtype) * stride_ck_hid
+                kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
+                    idx_h.to(IDTYPE) * stride_ck_h + \
+                    t.to(IDTYPE) * stride_ck_t + \
+                    idx_hid.to(IDTYPE) * stride_ck_hid
 
                 # add in new values at the proper location, set mask
                 tl.store(CACHE_K + kv_adds, value=key.to(dtype), mask=mask_hid)
@@ -385,27 +385,27 @@ def _update_kv_cache(
 
                 tl.store(
                     CACHE_S + \
-                        idx_n.to(idtype) * stride_cs_n + \
-                        idx_h.to(idtype) * stride_cs_h + \
-                        t.to(idtype) * stride_cs_t,
+                        idx_n.to(IDTYPE) * stride_cs_n + \
+                        idx_h.to(IDTYPE) * stride_cs_h + \
+                        t.to(IDTYPE) * stride_cs_t,
                     value=score.to(dtype)
                 )
 
                 tl.store(
                     MASK + \
-                        idx_n.to(idtype) * stride_m_n + \
-                        idx_h.to(idtype) * stride_m_n + \
-                        t.to(idtype) * stride_m_t,
+                        idx_n.to(IDTYPE) * stride_m_n + \
+                        idx_h.to(IDTYPE) * stride_m_n + \
+                        t.to(IDTYPE) * stride_m_t,
                     value=0
                 )
 
                 # increment the stored tokens for this cascade
                 tl.store(
                     STORED_TOKENS + \
-                        idx_n.to(idtype) * stride_st_n + \
-                        idx_h.to(idtype) * stride_st_h + \
-                        i.to(idtype) * stride_st_c,
-                    value=(stored_tokens_i + 1).to(idtype)
+                        idx_n.to(IDTYPE) * stride_st_n + \
+                        idx_h.to(IDTYPE) * stride_st_h + \
+                        i.to(IDTYPE) * stride_st_c,
+                    value=(stored_tokens_i + 1).to(IDTYPE)
                 )
 
                 _update_positional_idx(
@@ -437,11 +437,11 @@ def _update_kv_cache(
                 # t = ((start_idx_i - 1) % stored_tokens_i) + l
 
                 t = (((start_idx_i.to(tl.float32) - 1) %
-                      stored_tokens_i).to(idtype) + l.to(idtype)).to(idtype)
+                      stored_tokens_i).to(IDTYPE) + l.to(IDTYPE)).to(IDTYPE)
 
-                cs_shift = idx_n.to(idtype) * stride_cs_n + \
-                    idx_h.to(idtype) * stride_cs_h + \
-                    t.to(idtype) * stride_cs_t
+                cs_shift = idx_n.to(IDTYPE) * stride_cs_n + \
+                    idx_h.to(IDTYPE) * stride_cs_h + \
+                    t.to(IDTYPE) * stride_cs_t
 
                 old_score = tl.load(CACHE_S + cs_shift)
 
@@ -454,10 +454,10 @@ def _update_kv_cache(
                 else:
                     # print("overwrite do")
 
-                    kv_adds = idx_n.to(idtype) * stride_ck_n + \
-                        idx_h.to(idtype) * stride_ck_h + \
-                        t.to(idtype) * stride_ck_t + \
-                        idx_hid.to(idtype) * stride_ck_hid
+                    kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
+                        idx_h.to(IDTYPE) * stride_ck_h + \
+                        t.to(IDTYPE) * stride_ck_t + \
+                        idx_hid.to(IDTYPE) * stride_ck_hid
 
                     tl.store(CACHE_K + kv_adds,
                              value=key.to(dtype),
@@ -521,7 +521,7 @@ class SinkCacheFunc(Function):
         assert stored_tokens.stride() == start_indices.stride()
 
         device = k.device
-        dtype = k.dtype
+        # dtype = k.dtype
 
         BLOCK_HID = triton.next_power_of_2(HID)
         CASCADES = stored_tokens.size(-1)
@@ -554,56 +554,60 @@ class SinkCacheFunc(Function):
         try:
             if stored_sinks[0, 0] < num_sink:
 
-                _update_sink_cache[grid](k,
-                                         v,
-                                         *k.stride(),
-                                         sink_k,
-                                         sink_v,
-                                         *sink_k.stride(),
-                                         sink_mask,
-                                         *sink_mask.stride(),
-                                         sink_pos,
-                                         *sink_pos.stride(),
-                                         stored_sinks,
-                                         *stored_sinks.stride(),
-                                         N,
-                                         K,
-                                         HID,
-                                         num_sink,
-                                         window_size,
-                                         BLOCK_HID,
-                                         num_warps=1,
-                                         num_stages=1)
+                _update_sink_cache[grid](
+                    k,
+                    v,
+                    *k.stride(),
+                    sink_k,
+                    sink_v,
+                    *sink_k.stride(),
+                    sink_mask,
+                    *sink_mask.stride(),
+                    sink_pos,
+                    *sink_pos.stride(),
+                    stored_sinks,
+                    *stored_sinks.stride(),
+                    N,
+                    K,
+                    HID,
+                    num_sink,
+                    window_size,
+                    BLOCK_HID,
+                    num_warps=1,
+                    num_stages=1,
+                )
 
             else:
-                _update_kv_cache[grid](k,
-                                       v,
-                                       *k.stride(),
-                                       s,
-                                       *s.stride(),
-                                       cache_k,
-                                       cache_v,
-                                       *cache_k.stride(),
-                                       cache_s,
-                                       *cache_s.stride(),
-                                       mask,
-                                       *mask.stride(),
-                                       pos,
-                                       *pos.stride(),
-                                       stored_tokens,
-                                       start_indices,
-                                       *stored_tokens.stride(),
-                                       do_cache,
-                                       N,
-                                       K,
-                                       HID,
-                                       num_sink,
-                                       window_size,
-                                       window_size,
-                                       CASCADES,
-                                       BLOCK_HID,
-                                       num_warps=1,
-                                       num_stages=1)
+                _update_kv_cache[grid](
+                    k,
+                    v,
+                    *k.stride(),
+                    s,
+                    *s.stride(),
+                    cache_k,
+                    cache_v,
+                    *cache_k.stride(),
+                    cache_s,
+                    *cache_s.stride(),
+                    mask,
+                    *mask.stride(),
+                    pos,
+                    *pos.stride(),
+                    stored_tokens,
+                    start_indices,
+                    *stored_tokens.stride(),
+                    do_cache,
+                    N,
+                    K,
+                    HID,
+                    num_sink,
+                    window_size,
+                    window_size,
+                    CASCADES,
+                    BLOCK_HID,
+                    num_warps=1,
+                    num_stages=1,
+                )
 
         except RuntimeError as ex:
             print(N, K, HID, BLOCK_HID,
@@ -690,24 +694,26 @@ def sink_cache(
         event_cache_end = torch.cuda.Event(enable_timing=True)
         event_cache_start.record()
 
-    _sink_cache(k,
-                v,
-                s,
-                sink_k,
-                sink_v,
-                sink_mask,
-                sink_pos,
-                cache_k,
-                cache_v,
-                cache_s,
-                mask,
-                pos,
-                do_cache,
-                stored_tokens,
-                start_indices,
-                stored_sinks,
-                num_sink=num_sink,
-                window_size=window_size)
+    _sink_cache(
+        k,
+        v,
+        s,
+        sink_k,
+        sink_v,
+        sink_mask,
+        sink_pos,
+        cache_k,
+        cache_v,
+        cache_s,
+        mask,
+        pos,
+        do_cache,
+        stored_tokens,
+        start_indices,
+        stored_sinks,
+        num_sink=num_sink,
+        window_size=window_size,
+    )
 
     if BENCHMARK:
         event_cache_end.record()
@@ -737,6 +743,7 @@ class CascadingSinkCacheTriton(SinkCache):
         max_seq_len: int = 32,
         device: torch.device = "cpu",
         dtype: torch.dtype = torch.float16,
+        cascade_func: str = "pow2",
     ) -> None:
         super().__init__()
         self.max_seq_len = max_seq_len
@@ -745,6 +752,10 @@ class CascadingSinkCacheTriton(SinkCache):
         self.dim = dim
         self.device = device
         self.dtype = dtype
+        self.window_length = window_length
+        self.num_sink_tokens = num_sink_tokens
+        self.cascade_func = cascade_func
+        self.head_reduction = "mean"
 
         self.key_cache: torch.Tensor
         self.value_cache: torch.Tensor
@@ -757,31 +768,47 @@ class CascadingSinkCacheTriton(SinkCache):
         self.bh = self.max_batch_size * self.heads
 
         self.cascades = max_seq_len // window_length
+
+        self.init_static_cache()
+
+    def init_static_cache(self):
+        B, H, S, D = self.max_batch_size, self.heads, self.max_seq_len, self.dim
+        nsink, dev, dtp = self.num_sink_tokens, self.device, self.dtype
+        print(f"INIT CLEAN TRITON CACHE {self.cascade_func=}")
+
         self.do_cache = torch.tensor([True for _ in range(self.cascades)],
-                                     device=device,
+                                     device=dev,
                                      dtype=torch.bool)
-        self.do_cache_every_n = torch.tensor(
-            [2**i for i in range(self.cascades)],
-            device=device,
-            dtype=torch.long)
-        # self.do_cache_every_n = [i + 1 for i in range(self.cascades)]
 
-        self.beta = np.exp(-np.log(100) / window_length)
-        self.num_sink_tokens = num_sink_tokens
+        if self.cascade_func == "pow2":
+            self.do_cache_every_n = torch.tensor(
+                [2**i for i in range(self.cascades)],
+                device=dev,
+                dtype=torch.long)
+        elif self.cascade_func == "iplus1":
+            self.do_cache_every_n = torch.tensor(
+                [i + 1 for i in range(self.cascades)],
+                device=dev,
+                dtype=torch.long)
+        else:
+            raise ValueError(f"unknown cascade func: {self.cascade_func}")
 
-        self.window_length = window_length
+        self.beta = np.exp(-np.log(100) / self.window_length)
+        self.num_sink_tokens = self.num_sink_tokens
+
+        self.window_length = self.window_length
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
 
         # per layer, not per cascade
         self.stored_tokens = torch.zeros(self.max_batch_size,
                                          self.heads,
                                          self.cascades,
-                                         device=device,
+                                         device=dev,
                                          dtype=torch.long)
 
         self.stored_sinks = torch.zeros(self.max_batch_size,
                                         self.heads,
-                                        device=device,
+                                        device=dev,
                                         dtype=torch.long)
 
         # each cascade will have start indices which are considered the beginning of
@@ -789,26 +816,19 @@ class CascadingSinkCacheTriton(SinkCache):
         self.start_indices = torch.zeros(self.max_batch_size,
                                          self.heads,
                                          self.cascades,
-                                         device=device,
+                                         device=dev,
                                          dtype=torch.long)
 
         # index for positional encodings, this will be modified on
         # each return in order to grab the correct positional encoding indices.
-        self.pos = torch.zeros(max_seq_len, device=device,
+        self.pos = torch.zeros(self.max_seq_len, device=dev,
                                dtype=torch.long).reshape(1, -1).repeat(
                                    self.max_batch_size, self.heads, 1)
 
         self.sink_pos = torch.zeros(self.num_sink_tokens,
-                                    device=device,
+                                    device=dev,
                                     dtype=torch.long).reshape(1, -1).repeat(
                                         self.max_batch_size, self.heads, 1)
-
-        print("INIT NLOGN TRITON VERSION")
-        self.init_static_cache()
-
-    def init_static_cache(self):
-        B, H, S, D = self.max_batch_size, self.heads, self.max_seq_len, self.dim
-        nsink, dev, dtp = self.num_sink_tokens, self.device, self.dtype
 
         blank = torch.zeros(B, H, S, D, device=dev, dtype=dtp)
         blank_scores = torch.zeros(B,
@@ -850,10 +870,18 @@ class CascadingSinkCacheTriton(SinkCache):
         attention_scores: torch.Tensor,
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self.score_cache = self.beta * self.score_cache + (
-            1 - self.beta) * attention_scores.mean(dim=1,
-                                                   keepdim=True).squeeze(2)
+        if self.head_reduction == "mean":
+            self.score_cache = self.beta * self.score_cache + (
+                1 - self.beta) * attention_scores.mean(dim=1,
+                                                       keepdim=True).squeeze(2)
+        elif self.head_reduction == "none":
+            self.score_cache = self.beta * self.score_cache + (
+                1 - self.beta) * attention_scores.squeeze(2)
+        else:
+            raise ValueError(
+                f"unknown head reduction method: {self.head_reduction}")
 
+    @torch._dynamo.disable(recursive=True)
     def update(
         self,
         key_states: torch.Tensor,
@@ -1563,6 +1591,7 @@ def test_against_reference():
             # print(f"{k[idx:idx+1].view(-1)=}\n{pos=}\n{sink_mask=}")
             k, v = torch.cat((k, k_nosink), dim=-2), torch.cat((v, v_nosink),
                                                                dim=-2)
+            print(f"fast {pos.size()=} {pos_nosink.size()=}")
             pos = torch.cat((pos, pos_nosink), dim=-1)
 
             # print(f"{k[0, 0, :,  0]=}")

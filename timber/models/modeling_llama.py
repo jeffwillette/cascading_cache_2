@@ -35,7 +35,6 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from timber.models.umbc import SlotSetEncoder
 # from timber.models.cascade import CascadingSinkCache, SinkCache
 # from timber.models.cascade import CascadingSinkCacheCompile as CascadingSinkCache, SinkCache, compile_cache
 from timber.models.sink_cache_head_parallel import CascadingSinkCacheTriton as CascadingSinkCache, SinkCache
@@ -395,14 +394,6 @@ class LlamaAttention(nn.Module):
                                 bias=config.attention_bias)
         self._init_rope()
 
-        if self.config._umbc:
-            self.sse = SlotSetEncoder(
-                K=config._umbc_slots,
-                dim=config.hidden_size,
-                slot_type="deterministic",
-                heads=config.num_attention_heads,
-            )
-
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
@@ -431,6 +422,176 @@ class LlamaAttention(nn.Module):
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+
+        static_cascade = hasattr(self, "past_key_value") and isinstance(
+            getattr(self, "past_key_value"), CascadingSinkCache)
+        cascade = isinstance(past_key_value, CascadingSinkCache)
+        if static_cascade or cascade:
+            return self.forward_cascade(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        return self.forward_original(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+    @torch.compile
+    def qkv(self, x, size):
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(*size).transpose(1, 2)
+        k = k.view(*size).transpose(1, 2)
+        v = v.view(*size).transpose(1, 2)
+        return q, k, v
+
+    @torch.compile
+    def o(self, x):
+        return self.o_proj(x)
+
+    @torch.compile
+    def qkto(self, q, sink_k, sink_m, sink_v, k, m, v, cache, size):
+        scale = 1 / np.sqrt(q.size(-1))
+        sink_out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
+                                sink_k * np.sqrt(scale))
+
+        sink_out += sink_m.unsqueeze(2)
+
+        out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
+                           k * np.sqrt(scale))
+
+        out += m.unsqueeze(2)
+
+        total_out = torch.cat((sink_out, out), dim=-1)
+        scores = total_out.softmax(dim=-1)
+
+        out = scores[:, :, :, :sink_k.size(-2)] @ sink_v
+        out += scores[:, :, :, sink_k.size(-2):] @ v
+
+        cache.update_attention_scores(scores[:, :, :, sink_k.size(-2):], 0)
+
+        # print(f"{attn_output.size()=}")
+        out = out.transpose(1, 2).contiguous()
+        out = out.view(*size)
+
+        return self.o(out)
+
+    @torch.compile
+    def rope(self, x, pos):
+        cos, sin = self.rotary_emb(x, pos)
+        out = apply_rotary_pos_emb_one(x, cos, sin)
+        return out
+
+    def forward_cascade(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        # query_states = self.q_proj(hidden_states)
+        # key_states = self.k_proj(hidden_states)
+        # value_states = self.v_proj(hidden_states)
+
+        # query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states, key_states, value_states = self.qkv(
+            hidden_states, (bsz, q_len, self.num_heads, self.head_dim))
+
+        # In case static cache is used, it is an instance attribute.
+        past_key_value = getattr(self, "past_key_value", past_key_value)
+        layer_idx = self.layer_idx if not hasattr(self,
+                                                  "past_key_value") else 0
+
+        # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        cache_kwargs = {"cache_position": cache_position}
+        sink_key_states, sink_value_states, sink_pos, sink_mask, key_states, value_states, key_pos, mask =\
+            past_key_value.update(key_states, value_states)
+
+        sink_key_states = self.rope(sink_key_states, sink_pos)
+
+        sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
+        sink_value_states = repeat_kv(sink_value_states,
+                                      self.num_key_value_groups)
+
+        query_pos = torch.amax(torch.cat((sink_pos, key_pos), dim=-1),
+                               dim=-1,
+                               keepdim=True)
+        key_states = self.rope(key_states, key_pos)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        query_states = self.rope(query_states, query_pos)
+
+        # print(
+        #     f"{query_states.size()=} {sink_key_states.size()=} {sink_value_states.size()=}"
+        # )
+
+        out = self.qkto(
+            query_states,
+            sink_key_states,
+            sink_mask,
+            sink_value_states,
+            key_states,
+            mask,
+            value_states,
+            past_key_value,
+            (bsz, q_len, self.hidden_size),
+        )
+
+        return out, None, past_key_value
+
+    def forward_original(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -490,13 +651,10 @@ class LlamaAttention(nn.Module):
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "cache_position": cache_position
-            }
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
             key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs)
+                key_states, value_states)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -767,7 +925,6 @@ class LlamaFlashAttention2(LlamaAttention):
         )
 
 
-# @torch.compile
 def apply_rotary_pos_emb_one(x, cos, sin, position_ids=None, unsqueeze_dim=1):
     # print(f"in apply one: {x.size()=} {cos.size()=} {sin.size()=}")
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -792,57 +949,6 @@ class LlamaSdpaAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-               Optional[Tuple[torch.Tensor]]]:
-
-        if self.method == "umbc" and self.training:
-            return self.forward_umbc(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
-            )
-
-        static_cascade = hasattr(self, "past_key_value") and isinstance(
-            getattr(self, "past_key_value"), CascadingSinkCache)
-        cascade = isinstance(past_key_value, CascadingSinkCache)
-        if static_cascade or cascade:
-            return self.forward_cascade(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
-            )
-
-        return self.forward_original(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-    def forward_umbc(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
                Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
@@ -866,295 +972,6 @@ class LlamaSdpaAttention(LlamaAttention):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-
-        if hasattr(self, "sse"):
-            sse_out = self.sse.forward_cumulative(
-                hidden_states)  # out: (B, S, K, D)
-
-            sse_q, sse_k, sse_v = torch.chunk(sse_out, 3, dim=-2)
-            sse_q, sse_k, sse_v = map(lambda x: x.amax(dim=-2),
-                                      (sse_q, sse_k, sse_v))
-
-            query_states = query_states + sse_q
-            key_states = key_states + sse_k
-            value_states = value_states + sse_v
-
-        query_states = query_states.view(bsz, q_len, self.num_heads,
-                                         self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
-                                     self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
-                                         self.head_dim).transpose(1, 2)
-
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin)
-
-        # if hasattr(self, "sse"):
-        #     sse_out = self.sse.forward_cumulative(
-        #         hidden_states)  # out: (B, S, K, D)
-
-        #     sse_q, sse_k, sse_v = torch.chunk(sse_out, 3, dim=-2)
-        #     sse_q, sse_k, sse_v = map(lambda x: x.amax(dim=-2),
-        #                               (sse_q, sse_k, sse_v))
-
-        #     sse_q = sse_q.reshape(bsz, q_len, self.num_key_value_heads,
-        #                           self.head_dim).transpose(1, 2)
-        #     sse_k = sse_k.reshape(bsz, q_len, self.num_key_value_heads,
-        #                           self.head_dim).transpose(1, 2)
-        #     sse_v = sse_v.reshape(bsz, q_len, self.num_key_value_heads,
-        #                           self.head_dim).transpose(1, 2)
-
-        #     query_states += sse_q
-        #     key_states += sse_k
-        #     value_states += sse_v
-
-        # In case static cache is used, it is an instance attribute.
-        past_key_value = getattr(self, "past_key_value", past_key_value)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "cache_position": cache_position
-            }
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        causal_mask = attention_mask
-        # if attention_mask is not None and cache_position is not None:
-        if attention_mask is not None:
-            causal_mask = causal_mask[:, :, :, :key_states.shape[-2]]
-
-        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-        # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        B, H, S, D = query_states.size()
-        query_states = query_states.reshape(B * H, S, D).contiguous()
-        key_states = key_states.reshape(B * H, S, D).contiguous()
-        value_states = value_states.reshape(B * H, S, D).contiguous()
-
-        with torch.autocast("cuda", dtype=torch.float32):
-            attn_output = sink_attention(query_states,
-                                         key_states,
-                                         value_states,
-                                         cos.squeeze(0),
-                                         sin.squeeze(0),
-                                         num_sink=self.config._sink,
-                                         window_size=self.config._window)
-
-        attn_output = attn_output.view(B, H, S, D)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o_proj(attn_output)
-
-        # if hasattr(self, "sse"):
-        #     attn_output = attn_output + self.sse.forward_cumulative(
-        #         hidden_states + attn_output).amax(dim=-2)
-
-        return attn_output, None, past_key_value
-
-    # @torch.compile
-    def qkv(self, x, size):
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        q = q.view(*size).transpose(1, 2)
-        k = k.view(*size).transpose(1, 2)
-        v = v.view(*size).transpose(1, 2)
-        return q, k, v
-
-    # @torch.compile
-    def qkt(self, q, k, scale):
-        return torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
-                            k * np.sqrt(scale))
-
-    # @torch.compile
-    def o(self, x):
-        return self.o_proj(x)
-
-    # @torch.compile
-    def rope(self, x, pos):
-        return self.rotary_emb(x, pos)
-
-    # @torch.compile
-    def kv(self, k, v):
-        return k @ v
-
-    def forward_cascade(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-               Optional[Tuple[torch.Tensor]]]:
-        if output_attentions:
-            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
-            logger.warning_once(
-                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-            )
-            return super().forward(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-            )
-
-        bsz, q_len, _ = hidden_states.size()
-
-        # query_states = self.q_proj(hidden_states)
-        # key_states = self.k_proj(hidden_states)
-        # value_states = self.v_proj(hidden_states)
-
-        # query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        query_states, key_states, value_states = self.qkv(
-            hidden_states, (bsz, q_len, self.num_heads, self.head_dim))
-
-        # In case static cache is used, it is an instance attribute.
-        past_key_value = getattr(self, "past_key_value", past_key_value)
-        layer_idx = self.layer_idx if not hasattr(self,
-                                                  "past_key_value") else 0
-
-        # sin and cos are specific to RoPE models; cache_position needed for the static cache
-        cache_kwargs = {"cache_position": cache_position}
-        sink_key_states, sink_value_states, sink_pos, sink_mask, key_states, value_states, key_pos, mask =\
-            past_key_value.update(key_states, value_states)
-
-        # print(f"{self.layer_idx=}")
-        # print(
-        #     f"{sink_key_states[0, 0, :, :10]=}\n{sink_value_states[0, 0, :, :10]=}\n{key_states[0, 0, :, :10]=}\n{value_states[0, 0, :, :10]=}"
-        # )
-        # print(f"{sink_pos.size()=}")
-        sink_cos, sink_sin = self.rotary_emb(sink_key_states, sink_pos)
-        sink_key_states = apply_rotary_pos_emb_one(sink_key_states, sink_cos,
-                                                   sink_sin)
-
-        # print(
-        #     f"{sink_key_states.size()=} {sink_value_states.size()=} {sink_pos.size()=} {sink_mask.size()=} {key_states.size()=} {value_states.size()=} {key_pos.size()=} {mask.size()=}"
-        # )
-        # print(f"{sink_pos=}")
-        # print(f"{sink_mask=}")
-        # print(f"pos: {key_pos[0, :50]=}")
-        # print(f"mask: {mask[0, :50]=}")
-        sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
-        sink_value_states = repeat_kv(sink_value_states,
-                                      self.num_key_value_groups)
-
-        # print(f"{sink_pos=}\n{key_pos=}")
-        query_pos = torch.amax(torch.cat((sink_pos, key_pos), dim=-1),
-                               dim=-1,
-                               keepdim=True)
-        cos, sin = self.rope(key_states, key_pos)
-        key_states = apply_rotary_pos_emb_one(key_states, cos, sin)
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # print(f"{key_states.size()=} {value_states.size()=}")
-        # print(f"{query_pos=}")
-        # print(f"{query_pos=}")
-
-        cos, sin = self.rope(query_states, query_pos)
-        query_states = apply_rotary_pos_emb_one(query_states, cos, sin)
-
-        # print(
-        #     f"{query_states.size()=} {sink_key_states.size()=} {sink_value_states.size()=}"
-        # )
-
-        scale = 1 / np.sqrt(query_states.size(-1))
-        attn_sink_output = self.qkt(query_states, sink_key_states, scale)
-        # print(f"{attn_sink_output[0,0,0]=} {sink_mask[0,0,0]=}")
-        # print(f"{attn_sink_output.size()=} {sink_mask.size()=}")
-        attn_sink_output += sink_mask.unsqueeze(2)
-
-        attn_output = self.qkt(query_states, key_states, scale)
-        # print(f"{attn_output[0,0,0]=} {mask[0,0,0]=}")
-        # print(attn_output.size(), mask.size())
-        attn_output += mask.unsqueeze(2)
-        attn_sink_output = torch.cat((attn_sink_output, attn_output), dim=-1)
-
-        attn_scores = attn_sink_output.softmax(dim=-1)
-        # print(f"{self.layer_idx=} {attn_scores=}")
-
-        attn_output = self.kv(
-            attn_scores[:, :, :, :sink_key_states.size(-2)],
-            sink_value_states,
-        )
-
-        attn_output += self.kv(
-            attn_scores[:, :, :, sink_key_states.size(-2):],
-            value_states,
-        )
-
-        if isinstance(past_key_value,
-                      CascadingSinkCache) and key_states is not None:
-            past_key_value.update_attention_scores(
-                attn_scores[:, :, :, sink_key_states.size(-2):], layer_idx)
-
-        # print(f"{attn_output.size()=}")
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o(attn_output)
-
-        return attn_output, None, past_key_value
-
-    def forward_original(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-               Optional[Tuple[torch.Tensor]]]:
-        if output_attentions:
-            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
-            logger.warning_once(
-                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-            )
-            return super().forward(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-            )
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        if hasattr(self, "sse"):
-            sse_out = self.sse.forward_mbc(hidden_states)  # out: (B, S, K, D)
-
-            sse_q, sse_k, sse_v = torch.chunk(sse_out, 3, dim=-2)
-            sse_q, sse_k, sse_v = map(lambda x: x.amax(dim=-2),
-                                      (sse_q, sse_k, sse_v))
-
-            query_states = query_states + sse_q
-            key_states = key_states + sse_k
-            value_states = value_states + sse_v
 
         query_states = query_states.view(bsz, q_len, self.num_heads,
                                          self.head_dim).transpose(1, 2)
@@ -1248,17 +1065,6 @@ class LlamaSdpaAttention(LlamaAttention):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-
-        if hasattr(self, "sse"):
-            sse_out = self.sse.forward_mbc(hidden_states)  # out: (B, S, K, D)
-
-            sse_q, sse_k, sse_v = torch.chunk(sse_out, 3, dim=-2)
-            sse_q, sse_k, sse_v = map(lambda x: x.amax(dim=-2),
-                                      (sse_q, sse_k, sse_v))
-
-            query_states = query_states + sse_q
-            key_states = key_states + sse_k
-            value_states = value_states + sse_v
 
         query_states = query_states.view(bsz, q_len, self.num_heads,
                                          self.head_dim).transpose(1, 2)
@@ -1420,10 +1226,6 @@ class LlamaDecoderLayer(nn.Module):
 
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
             config=config, layer_idx=layer_idx)
-
-        self.self_attn.method = "none"
-        if config._umbc:
-            self.self_attn.method = "umbc"
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size,
@@ -1681,6 +1483,10 @@ class LlamaModel(LlamaPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def clear_caches(self):
+        for i, decoder_layer in enumerate(self.layers):
+            decoder_layer.self_attn.past_key_value.init_static_cache()
+
     def setup_caches(self):
         window = self.config._window // self.config._cascades
         max_seq_len = self.config._window
@@ -1696,6 +1502,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 max_seq_len=max_seq_len,
                 dtype=torch.float16,
                 device=self.embed_tokens.weight.device,
+                cascade_func=self.config._cascade_func,
             )
 
             decoder_layer.self_attn.past_key_value = cache
@@ -1740,8 +1547,7 @@ class LlamaModel(LlamaPreTrainedModel):
             if isinstance(past_key_values, SinkCache):
                 return past_key_values
 
-            if (self.config._umbc
-                    or self.config._sinks > 0) and past_key_values is None:
+            if self.config._sinks > 0 and past_key_values is None:
                 # init a new cache
                 window = self.config._window // self.config._cascades
                 max_seq_len = self.config._window
@@ -1995,8 +1801,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                                 if output_hidden_states is not None else
                                 self.config.output_hidden_states)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # print(f"{input_ids.size()=} {token_start=} {sse_end=}")
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(

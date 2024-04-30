@@ -11,6 +11,7 @@ from transformers import TextStreamer
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
 from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
+from timber.models.qwen.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config
 from timber.utils import seed, get_bench
 
 from timber.main.jobs.bench_single_layer import job_bench_single_layer
@@ -20,6 +21,27 @@ from timber.main.jobs.pg19 import job_ppl_pg19
 # from timber.main.jobs.stream import job_stream
 from timber.main.jobs.mmlu import job_mmlu
 from timber.main.eval_args import eval_args, ArgsType
+
+
+def get_model(model_id, **from_pretrained_kwargs):
+    if "llama" in model_id.lower():
+        return LlamaForCausalLM.from_pretrained(model_id,
+                                                **from_pretrained_kwargs)
+    elif "qwen" in model_id.lower():
+        return Qwen2ForCausalLM.from_pretrained(model_id,
+                                                **from_pretrained_kwargs)
+
+    else:
+        raise ValueError(f"{model_id} not supported")
+
+
+def get_config(model_id):
+    if "llama" in model_id.lower():
+        return LlamaConfig.from_pretrained(model_id)
+    elif "qwen" in model_id.lower():
+        return Qwen2Config.from_pretrained(model_id)
+    else:
+        raise ValueError(f"{model_id} not supported")
 
 
 def load_vllm_model(args: ArgsType):
@@ -70,6 +92,15 @@ def load_vllm_model(args: ArgsType):
     return model, tokenizer, device
 
 
+def get_dtype(model_name):
+    if "llama" in model_name.lower():
+        return torch.float16
+    elif "qwen" in model_name.lower():
+        return torch.bfloat16
+    else:
+        raise ValueError(f"unknown dtype for model: {model_name}")
+
+
 def load_model(args):
     if args.model.startswith('vllm'):
         return load_vllm_model(args)
@@ -79,33 +110,33 @@ def load_model(args):
         'llama32k': 'togethercomputer/LLaMA-2-7B-32K',
         'llama13b': 'meta-llama/Llama-2-13b-hf',
         'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
-        'qwen14b': 'Qwen/Qwen1.5-14B-Chat',
-        'qwen7b': 'Qwen/Qwen1.5-7B-Chat',
-        'qwen0.5b': 'Qwen/Qwen1.5-0.5B-Chat',
-        # 'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B-ShareGPT',
+        # 'qwen14b': 'Qwen/Qwen1.5-14B-Chat',
+        # 'qwen7b': 'Qwen/Qwen1.5-7B-Chat',
+        # 'qwen0.5b': 'Qwen/Qwen1.5-0.5B-Chat',
+        'qwen14b': 'Qwen/Qwen1.5-14B',
+        'qwen7b': 'Qwen/Qwen1.5-7B',
+        'qwen0.5b': 'Qwen/Qwen1.5-0.5B',
         'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B',
     }
+
     assert args.model in MODELS, MODELS.keys()
     model_id = MODELS[args.model]
 
     # config = LlamaConfig.from_pretrained(model_id,
     #                                      max_position_embeddings=4096 * 2)
-    config = LlamaConfig.from_pretrained(model_id)
-    config._attn_implementation = config.attn_implementation = 'sdpa'
-    config._umbc = args.method == "umbc"
-    config._batch_size = 25
+    config = get_config(model_id)
+
+    config._attn_implementation = config.attn_implementation = 'eager'
+    config._batch_size = args.batch_size
     config._sinks = args.sinks
     config._cascades = args.cascades
     config._umbc_slots = args.slots
     config._umbc_chunk = args.chunk
     config._window = args.window
-    infer_dtype = torch.float16
+    config._cascade_func = args.cascade_func
+    infer_dtype = get_dtype(model_id)
 
     print(f"{config=}")
-
-    # TODO:
-    #  - how to seped this up more?
-    #  - delete old runs and run again with 16 bit due to better performance
 
     from_pretrained_kwargs = dict(
         config=config,
@@ -131,8 +162,7 @@ def load_model(args):
         trust_remote_code=True,
     )
 
-    model = LlamaForCausalLM.from_pretrained(model_id,
-                                             **from_pretrained_kwargs)
+    model = get_model(model_id, **from_pretrained_kwargs)
 
     for m in model.modules():
         if hasattr(m, 'attention_method'):

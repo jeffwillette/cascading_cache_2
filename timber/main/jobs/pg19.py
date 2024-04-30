@@ -33,6 +33,7 @@ class MockRun:
 
 def job_ppl_pg19(args, model, tokenizer, device):
     model.model.setup_caches()
+    model = torch.compile(model, mode="max-autotune", fullgraph=False)
     run = Run(
         experiment=f"{args.method}-pg19") if not args.dev_run else MockRun()
     dataset = "wikitext"
@@ -44,20 +45,28 @@ def job_ppl_pg19(args, model, tokenizer, device):
         "cascades": args.cascades,
         "window": args.window,
         "slots": args.slots,
+        "model": args.model,
+        "cascade-func": args.cascade_func,
+        "comment": args.comment,
     }
 
-    nll = 0
-    count = 0
-    batch_size = 25
-    dataset = PG19Streaming(tokenizer, batch_size=batch_size)
+    nll_total = 0
+    count_total = 0
 
-    for x, y in dataset:
+    nll_individual = torch.zeros(100)
+    count_individual = torch.zeros(100)
+    step = 0
+
+    dataset = PG19Streaming(tokenizer, batch_size=args.batch_size)
+
+    for j, (x, y) in enumerate(dataset):
+        model.model.clear_caches()
         input_ids = x.to(device)
         target_ids = y.to(device)
         print(
             f"starting batch of books: {input_ids.size()=} {target_ids.size()=}"
         )
-        with tqdm(range(x.size(1) - 1)) as pbar:
+        with tqdm(range(x.size(1) - 1), ncols=150) as pbar:
             for i in pbar:
                 with torch.no_grad():
                     inp = input_ids[:, i:i + 1]
@@ -70,34 +79,49 @@ def job_ppl_pg19(args, model, tokenizer, device):
                         logits.reshape(-1, logits.size(-1)),
                         targets.reshape(-1),
                         ignore_index=-100,
-                        reduction="sum",
+                        reduction="none",
                     )
-                    nll += _nll
-                    count += (targets >= 0).sum().item()
 
-                    if i % 1 == 0:
-                        ppl = torch.exp(nll / count).item()
+                    nll_total += _nll.sum()
+                    count_total += (targets >= 0).sum().item()
+
+                    l, u = j * args.batch_size, (j + 1) * args.batch_size
+                    nll_individual[l:u] += _nll.cpu()
+                    count_individual[l:u] += (targets >= 0).sum(dim=-1).cpu()
+                    step += 1
+
+                    if step % 100 == 0:
+                        ppl = torch.exp(nll_total / count_total).item()
                         run.track(ppl,
                                   name="ppl-pg19",
-                                  step=i,
+                                  step=step,
                                   context={"subset": "test"})
                         pbar.set_description(f"{ppl=:.6f}")
 
-    ppl = torch.exp(nll / count).item()
+                        book_idx = l + torch.arange(args.batch_size)
+                        book_ppl = torch.exp(nll_individual[book_idx] /
+                                             count_individual[book_idx])
+
+                        stats = {}
+                        for k in range(args.batch_size):
+                            key = f"ppl-pg19-book-{l + k}"
+                            val = book_ppl[k].item()
+                            # only track items which have not reached EOS
+                            if targets.view(-1)[k] >= 0:
+                                stats[key] = val
+
+                        run.track(stats, step=i, context={"subset": "test"})
+
+    ppl = torch.exp(nll_total / count_total).item()
 
     os.makedirs('./cache/llama_eval/', exist_ok=True)
-    if args.method == "umbc":
-        with open(
-                f'./cache/llama_eval/pg19-{args.method}-sinks-{args.sinks}-window-{args.window}-slots-{args.slots}.json',
-                'w') as f:
-            json.dump({'ppl': ppl}, f)
-    elif args.method == "sink":
+    if args.method == "sink":
         with open(
                 f'./cache/llama_eval/pg19-{args.method}-sinks-{args.sinks}-window-{args.window}.json',
                 'w') as f:
             json.dump({'ppl': ppl}, f)
     else:
-        with open(f'./cache/llama_eval/pg19-{args.method}.json', 'w') as f:
-            json.dump({'ppl': ppl}, f)
+        raise ValueError(
+            f"methods other than sink are not supported: {args.method=}")
 
     print(f'PPL: {ppl:.4f}')
