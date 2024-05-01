@@ -9,6 +9,21 @@ import random
 
 # from .profiler import Profiler
 
+class MockRun:
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def track(self, *args, **kwargs):
+        pass
+
+    def __setitem__(self, key, value):
+        pass
+
+    def __getitem__(self, key):
+        pass
+
+
 def indent_string(s):
     return ("  " + s).replace('\n', '\n  ')
 

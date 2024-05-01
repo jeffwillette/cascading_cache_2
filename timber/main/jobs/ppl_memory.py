@@ -12,11 +12,14 @@ from aim import Run
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
 from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
-from timber.utils import seed, get_bench
+from timber.utils import seed, get_bench, MockRun
 
 
 def job_ppl_memory(args, model, tokenizer, device):
-    run = Run(experiment=args.method)
+    model.model.setup_caches(args.world_size)
+    model = model.to(args.infer_dtype).cuda()
+
+    run = Run(experiment=args.method) if not args.dev_run else MockRun()
     dataset = "wikitext"
     run["hparams"] = {
         "job": "ppl-memory",
@@ -56,37 +59,19 @@ def job_ppl_memory(args, model, tokenizer, device):
             target_ids = input_ids.clone()
             target_ids[:, :-trg_len] = -100
 
-            if args.method in ["umbc", "sink"]:
+            if args.method in ["sink"]:
                 with torch.no_grad():
-                    # model.model.model.sse.post_forward_mbc_cleanup()
-                    mdl = model.model if args.lora_r == 0 else model.model.model
-
-                    if args.method == "umbc":
-                        for lyr in mdl.layers:
-                            lyr.self_attn.sse.post_forward_mbc_cleanup()
-
                     # rng = input_ids.size(1) - 1
-                    past_key_values = None
                     rng = 3840 + 1024
                     with tqdm(range(rng)) as pbar2:
                         for i in pbar2:
                             inp = input_ids[:, i:i + 1]
-                            output = model(
-                                inp,
-                                use_cache=True,
-                                past_key_values=past_key_values,
-                            )
-                            past_key_values = output.past_key_values
+                            output = model(inp, use_cache=False)
 
                     with tqdm(range(rng - 2048, rng - 1024)) as pbar2:
                         for i in pbar2:
                             inp = input_ids[:, i:i + 1]
-                            output = model(
-                                inp,
-                                use_cache=True,
-                                past_key_values=past_key_values,
-                            )
-                            past_key_values = output.past_key_values
+                            output = model(inp, use_cache=False)
 
                             logits = output.logits[:, -1:]
                             targets = target_ids[:, i + 1:i + 2]
@@ -122,12 +107,7 @@ def job_ppl_memory(args, model, tokenizer, device):
     ppl = torch.exp(torch.stack(nlls).mean()).item()
 
     os.makedirs('./cache/llama_eval/', exist_ok=True)
-    if args.method == "umbc":
-        with open(
-                f'./cache/llama_eval/ppl-memory-{args.method}-sinks-{args.sinks}-window-{args.window}-slots-{args.slots}.json',
-                'w') as f:
-            json.dump({'ppl': ppl}, f)
-    elif args.method == "sink":
+    if args.method == "sink":
         with open(
                 f'./cache/llama_eval/ppl-memory-{args.method}-sinks-{args.sinks}-window-{args.window}.json',
                 'w') as f:

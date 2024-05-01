@@ -34,9 +34,3 @@ HIP_K=256 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PROMPT_ATTENTION_BACK
 # for vllm dev
 HIP_DENSE_LAYERS=3 HIP_K=256 CUDA_VISIBLE_DEVICES=0 python timber/main/llama_eval.py --model vllm_llama1b --job stream --batch_size 4 --input sample4k.md --stride 4096
 ```
-
-# UMBC
-
-PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python timber/trainer/timber_trainer.py --model llama1.3b --disable_kd --batch_size 1 --max_steps 10000 --dataset openwebtext --slots 32 --window 256 --method umbc --chunk 32 --seq_len 32768 --accumulation_steps 16
-
-PYTHONPATH=. CUDA_VISIBLE_DEVICES=7 python timber/main/llama_eval.py --job ppl --method umbc --slots 32 --window 256 --model llama1.3b --lora_r 8 --checkpoint ./checkpoint/llama1.3b-openwebtext-131072-epoch-00-step-2.pth

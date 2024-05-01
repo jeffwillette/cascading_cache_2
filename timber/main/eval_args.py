@@ -1,6 +1,7 @@
 import argparse
 from dataclasses import dataclass
 from typing import Literal, Optional
+import deepspeed
 
 
 @dataclass
@@ -40,10 +41,12 @@ def eval_args(
     parser.add_argument('--chunk', default=32, type=int)
     parser.add_argument('--sinks', default=0, type=int)
     parser.add_argument('--cascades', default=1, type=int)
+    parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--cascade_func', type=str, default="pow2")
     parser.add_argument('--comment', type=str, default="")
     parser.add_argument('--dev_run', action='store_true')
 
+    # parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     print(args)
     return args

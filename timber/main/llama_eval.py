@@ -8,6 +8,7 @@ from tqdm import tqdm
 import argparse
 from transformers import TextStreamer
 
+import deepspeed
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
 from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
@@ -96,7 +97,7 @@ def get_dtype(model_name):
     if "llama" in model_name.lower():
         return torch.float16
     elif "qwen" in model_name.lower():
-        return torch.bfloat16
+        return torch.float16
     else:
         raise ValueError(f"unknown dtype for model: {model_name}")
 
@@ -107,7 +108,7 @@ def load_model(args):
 
     device = 'cuda:0'
     MODELS = {
-        'llama32k': 'togethercomputer/LLaMA-2-7B-32K',
+        'llama7b': 'togethercomputer/LLaMA-2-7B-32K',
         'llama13b': 'meta-llama/Llama-2-13b-hf',
         'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
         # 'qwen14b': 'Qwen/Qwen1.5-14B-Chat',
@@ -130,11 +131,9 @@ def load_model(args):
     config._batch_size = args.batch_size
     config._sinks = args.sinks
     config._cascades = args.cascades
-    config._umbc_slots = args.slots
-    config._umbc_chunk = args.chunk
     config._window = args.window
     config._cascade_func = args.cascade_func
-    infer_dtype = get_dtype(model_id)
+    args.infer_dtype = get_dtype(model_id)
 
     print(f"{config=}")
 
@@ -158,15 +157,20 @@ def load_model(args):
         #         # "post_attention_layernorm",
         #         # "norm",
         #     ]),
-        torch_dtype=infer_dtype,
+        torch_dtype=args.infer_dtype,
         trust_remote_code=True,
     )
 
     model = get_model(model_id, **from_pretrained_kwargs)
-
     for m in model.modules():
         if hasattr(m, 'attention_method'):
             m.attention_method = args.method
+
+    # pipe = pipeline("text2text-generation", model=model_id, device=local_rank)
+    # Initialize the DeepSpeed-Inference engine
+
+    args.local_rank = int(os.getenv('LOCAL_RANK', '0'))
+    args.world_size = int(os.getenv('WORLD_SIZE', '1'))
 
     if args.lora_r > 0 and args.checkpoint is not None:
         print("LoRA init")
@@ -189,12 +193,6 @@ def load_model(args):
             modules_to_save=[
                 'input_layernorm',
                 'post_attention_layernorm',
-                'sse_q',
-                "sse_k",
-                "sse_v",
-                "slots",
-                "norm_slots",
-                'norm_after',
             ])
 
         model = prepare_model_for_kbit_training(model)
@@ -213,17 +211,8 @@ def load_model(args):
         print('load result', result)
         model = model.to(infer_dtype)
         print('lora checkpoint loaded from', args.checkpoint)
-    elif args.method == "umbc":
-        if args.checkpoint is not None:
-            ckpt = torch.load(args.checkpoint, map_location="cpu")
 
-            ckpt = {k[6:]: v for k, v in ckpt["state_dict"].items()}
-            print(f"loading umbc checkpoint: {args.checkpoint=}")
-            model.load_state_dict(ckpt, strict=True)
-
-    model = model.eval().cuda()
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
-
     return model, tokenizer, device
 
 

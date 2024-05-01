@@ -21,7 +21,6 @@ from aim.pytorch_lightning import AimLogger
 from pytorch_lightning.profilers import PyTorchProfiler
 from torch.utils.data import Subset
 from sklearn.model_selection import train_test_split
-from timber.models.umbc import SlotSetEncoder
 import torch.utils.checkpoint
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 import deepspeed.checkpoint
@@ -194,9 +193,6 @@ def load_model(
 
     config = LlamaConfig.from_pretrained(model_id)
     config._attn_implementation = config.attn_implementation = 'sdpa'
-    config._umbc = train_config.method == "umbc"
-    config._umbc_slots = train_config.slots
-    config._umbc_chunk = train_config.chunks
     config._window = train_config.window
     config._sink = 4
 
@@ -233,27 +229,6 @@ def load_model(
         torch_dtype=torch.float32,
         low_cpu_mem_usage=True,
     )
-
-    if train_config.method == "umbc":
-        # bitsandbytes somehow did not ignore this module and I could never figure out why.
-        # just reinit the parameters to get rid of large values and NaN's
-
-        for lyr in model.model.layers:
-            attn = lyr.self_attn
-            attn.sse.reset_parameters()
-
-        if train_config.init_from_checkpoint is not None:
-            print('loading from', train_config.init_from_checkpoint)
-            state_dict = torch.load(train_config.init_from_checkpoint,
-                                    map_location='cpu')['state_dict']
-            keys = list(state_dict.keys())
-            for key in keys:
-                x = state_dict[key]
-                state_dict[key[6:]] = x
-                del state_dict[key]
-            model.load_state_dict(state_dict)
-            print('UMBC checkpoint loaded from',
-                  train_config.init_from_checkpoint)
 
     for m in model.modules():
         if hasattr(m, 'attention_method'):
@@ -344,52 +319,7 @@ class LabModule(pl.LightningModule):
             past_key_values=past_key_values,
         )
 
-    def step_umbc(
-        self,
-        inputs,
-        target,
-        output_teacher,
-        subset="train",
-        batch_idx=0,
-    ):
-
-        model = self.model.model if self.config.lora_r == 0 else self.model.model.model
-        ln_affines = {}
-        for i, lyr in enumerate(model.layers):
-            weight = lyr.self_attn.sse.norm_after.weight
-            mu, sigma = weight.mean(), weight.std()
-            ln_affines[f"lnaffine_layer_{i}_mu"] = mu.item()
-            ln_affines[f"lnaffine_layer_{i}_std"] = sigma.item()
-        self.log_dict(ln_affines, on_step=True, rank_zero_only=True)
-
-        output = self(
-            inputs,
-            output_hidden_states=False,
-        )
-
-        logits = output.logits[:, :-1]
-        tgt = target[:, 1:]
-        loss = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, output.logits.size(-1)),
-            tgt.reshape(-1),
-        )
-
-        gc.collect()
-        self.log_losses(loss.exp().detach(), 0, 0, 0, subset="train")
-        return loss
-
-    def log_losses(self,
-                   total,
-                   ce,
-                   kd_hidden=None,
-                   kd_logits=None,
-                   subset="train"):
-        self.log(f"{subset}_loss_model",
-                 total.item(),
-                 sync_dist=True,
-                 on_step=True)
-
-    def step_plain(self, inputs, target, output_teacher=None, subset="train"):
+    def step(self, inputs, target, output_teacher=None, subset="train"):
         output = self(inputs, target, output_hidden_states=self.config.kd)
 
         loss_kd_hidden, loss_kd_logits = 0, 0
@@ -431,16 +361,6 @@ class LabModule(pl.LightningModule):
                 output_teacher = self.teacher(
                     inputs, output_hidden_states=self.config.kd)
 
-        if self.config.method == "umbc":
-            loss = self.step_umbc(
-                inputs,
-                target,
-                output_teacher,
-                subset="train",
-                batch_idx=batch_idx,
-            )
-            return loss
-
         loss = self.step_plain(inputs, target, subset="train")
         return loss
 
@@ -448,11 +368,6 @@ class LabModule(pl.LightningModule):
         self.model.eval()
 
         inputs, target = batch
-
-        if self.config.method == "umbc":
-            model = self.model.model if self.config.lora_r == 0 else self.model.model.model
-            # for lyr in model.layers:
-            #     lyr.self_attn.sse.post_forward_mbc_cleanup()
 
         with torch.no_grad():
             output = self(inputs, target)
@@ -488,9 +403,6 @@ class LabModule(pl.LightningModule):
             tconfig.method = "none"
 
             sconfig = copy.deepcopy(self.config)
-            if self.config.method == "umbc":
-                sconfig.seq_len = self.config.slots + self.config.window
-
             self.model = load_model(train_config=sconfig,
                                     method=sconfig.method,
                                     device=self.local_rank)
@@ -583,8 +495,6 @@ def main(config: TrainConfig):
         filename += f'llama32k-{config.dataset}-{config.seq_len}-bq{config.block_size_q}-bk{config.block_size_k}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'none':
         filename += f'llama32k-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
-    elif config.method == 'umbc':
-        filename += f'llama1.3b-{config.dataset}-{config.seq_len}-slots-{config.slots}-lora-r-{config.lora_r}-window-{config.window}-{{epoch:02d}}-{{step}}'
     elif config.method == 'reformer':
         filename += f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-k{config.k}-{{epoch:02d}}-{{step}}'
     elif config.method == 'performer':
@@ -680,7 +590,7 @@ if __name__ == "__main__":
     parser.add_argument('--slots', default=32, type=int)
     parser.add_argument('--block_size_q', default=16, type=int)
     parser.add_argument('--block_size_k', default=2, type=int)
-    parser.add_argument('--method', default='umbc', type=str)
+    parser.add_argument('--method', default='', type=str)
     parser.add_argument('--comment', default='', type=str)
     parser.add_argument('--window', default=256, type=int)
     parser.add_argument('--chunk', default=32, type=int)

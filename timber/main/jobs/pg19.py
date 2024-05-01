@@ -13,42 +13,45 @@ from aim import Run
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
 from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
-from timber.utils import seed, get_bench
-
-
-class MockRun:
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def track(self, *args, **kwargs):
-        pass
-
-    def __setitem__(self, key, value):
-        pass
-
-    def __getitem__(self, key):
-        pass
+from timber.utils import seed, get_bench, MockRun
+import deepspeed
+from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig, LlamaDecoderLayer
 
 
 def job_ppl_pg19(args, model, tokenizer, device):
-    model.model.setup_caches()
-    model = torch.compile(model, mode="max-autotune", fullgraph=False)
-    run = Run(
-        experiment=f"{args.method}-pg19") if not args.dev_run else MockRun()
-    dataset = "wikitext"
-    run["hparams"] = {
-        "job": "ppl",
-        "method": args.method,
-        "dataset": dataset,
-        "sinks": args.sinks,
-        "cascades": args.cascades,
-        "window": args.window,
-        "slots": args.slots,
-        "model": args.model,
-        "cascade-func": args.cascade_func,
-        "comment": args.comment,
-    }
+    # model.model.setup_caches()
+    # model = torch.compile(model, mode="max-autotune", fullgraph=False)
+    model.model.setup_caches(args.world_size)
+    model = model.to(args.infer_dtype)
+    model = deepspeed.init_inference(model,
+                                     tensor_parallel={"tp_size": 4},
+                                     replace_with_kernel_inject=False,
+                                     dtype=args.infer_dtype,
+                                     injection_policy={
+                                         LlamaDecoderLayer: (
+                                             'mlp.down_proj',
+                                             'self_attn.o_proj',
+                                         )
+                                     })
+    # model = torch.compile(model, mode="max-autotune", fullgraph=False)
+
+    run = MockRun()
+    if args.local_rank == 0:
+        run = Run(experiment=f"{args.method}-pg19"
+                  ) if not args.dev_run else MockRun()
+        dataset = "pg19"
+        run["hparams"] = {
+            "job": "ppl",
+            "method": args.method,
+            "dataset": dataset,
+            "sinks": args.sinks,
+            "cascades": args.cascades,
+            "window": args.window,
+            "slots": args.slots,
+            "model": args.model,
+            "cascade-func": args.cascade_func,
+            "comment": args.comment,
+        }
 
     nll_total = 0
     count_total = 0
@@ -60,9 +63,8 @@ def job_ppl_pg19(args, model, tokenizer, device):
     dataset = PG19Streaming(tokenizer, batch_size=args.batch_size)
 
     for j, (x, y) in enumerate(dataset):
-        model.model.clear_caches()
-        input_ids = x.to(device)
-        target_ids = y.to(device)
+        input_ids = x.cuda()
+        target_ids = y.cuda()
         print(
             f"starting batch of books: {input_ids.size()=} {target_ids.size()=}"
         )
@@ -71,7 +73,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
                 with torch.no_grad():
                     inp = input_ids[:, i:i + 1]
                     # use cache false means to use static cascading cache inside the model
-                    output = model(inp, use_cache=False)
+                    output = model(inp, use_cache=False, reset=i == 0)
 
                     logits = output.logits[:, -1:]
                     targets = target_ids[:, i + 1:i + 2]

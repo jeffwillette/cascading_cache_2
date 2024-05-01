@@ -35,9 +35,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-# from timber.models.cascade import CascadingSinkCache, SinkCache
-# from timber.models.cascade import CascadingSinkCacheCompile as CascadingSinkCache, SinkCache, compile_cache
-from timber.models.sink_cache_head_parallel import CascadingSinkCacheTriton as CascadingSinkCache, SinkCache
+from timber.models.sink_cache_cascade import CascadingSinkCacheTriton as CascadingSinkCache, SinkCache
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -460,7 +458,7 @@ class LlamaAttention(nn.Module):
             **kwargs,
         )
 
-    @torch.compile
+    # @torch.compile
     def qkv(self, x, size):
         q = self.q_proj(x)
         k = self.k_proj(x)
@@ -471,11 +469,11 @@ class LlamaAttention(nn.Module):
         v = v.view(*size).transpose(1, 2)
         return q, k, v
 
-    @torch.compile
+    # @torch.compile
     def o(self, x):
         return self.o_proj(x)
 
-    @torch.compile
+    # @torch.compile
     def qkto(self, q, sink_k, sink_m, sink_v, k, m, v, cache, size):
         scale = 1 / np.sqrt(q.size(-1))
         sink_out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
@@ -496,13 +494,13 @@ class LlamaAttention(nn.Module):
 
         cache.update_attention_scores(scores[:, :, :, sink_k.size(-2):], 0)
 
-        # print(f"{attn_output.size()=}")
         out = out.transpose(1, 2).contiguous()
         out = out.view(*size)
 
-        return self.o(out)
+        out = self.o(out)
+        return out
 
-    @torch.compile
+    # @torch.compile
     def rope(self, x, pos):
         cos, sin = self.rotary_emb(x, pos)
         out = apply_rotary_pos_emb_one(x, cos, sin)
@@ -517,6 +515,7 @@ class LlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
                Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
@@ -549,6 +548,9 @@ class LlamaAttention(nn.Module):
 
         # In case static cache is used, it is an instance attribute.
         past_key_value = getattr(self, "past_key_value", past_key_value)
+        if kwargs["reset"]:
+            past_key_value.reset()
+
         layer_idx = self.layer_idx if not hasattr(self,
                                                   "past_key_value") else 0
 
@@ -586,7 +588,8 @@ class LlamaAttention(nn.Module):
             mask,
             value_states,
             past_key_value,
-            (bsz, q_len, self.hidden_size),
+            (bsz, q_len,
+             -1),  # needs to be -1 instead of hidden size for deepspeed
         )
 
         return out, None, past_key_value
@@ -1485,9 +1488,9 @@ class LlamaModel(LlamaPreTrainedModel):
 
     def clear_caches(self):
         for i, decoder_layer in enumerate(self.layers):
-            decoder_layer.self_attn.past_key_value.init_static_cache()
+            decoder_layer.self_attn.past_key_value.reset()
 
-    def setup_caches(self):
+    def setup_caches(self, world_size=1):
         window = self.config._window // self.config._cascades
         max_seq_len = self.config._window
 
@@ -1497,7 +1500,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 window,
                 num_sink_tokens=self.config._sinks,
                 max_batch_size=self.config._batch_size,
-                heads=self.config.num_attention_heads,
+                heads=self.config.num_attention_heads // world_size,
                 dim=self.config.hidden_size // self.config.num_attention_heads,
                 max_seq_len=max_seq_len,
                 dtype=torch.float16,

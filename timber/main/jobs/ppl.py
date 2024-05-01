@@ -80,15 +80,8 @@ def job_ppl(args, model, tokenizer, device):
             target_ids = input_ids.clone()
             target_ids[:, :-trg_len] = -100
 
-            if args.method in ["umbc", "sink"]:
+            if args.method in ["sink"]:
                 with torch.no_grad():
-                    # model.model.model.sse.post_forward_mbc_cleanup()
-                    mdl = model.model if args.lora_r == 0 else model.model.model
-
-                    if args.method == "umbc":
-                        for lyr in mdl.layers:
-                            lyr.self_attn.sse.post_forward_mbc_cleanup()
-
                     rng = input_ids.size(1) - 1
                     past_key_values = None
                     with tqdm(range(rng)) as pbar2:
@@ -136,12 +129,7 @@ def job_ppl(args, model, tokenizer, device):
     ppl = torch.exp(nll / count).item()
 
     os.makedirs('./cache/llama_eval/', exist_ok=True)
-    if args.method == "umbc":
-        with open(
-                f'./cache/llama_eval/ppl-{args.method}-sinks-{args.sinks}-window-{args.window}-slots-{args.slots}.json',
-                'w') as f:
-            json.dump({'ppl': ppl}, f)
-    elif args.method == "sink":
+    if args.method == "sink":
         with open(
                 f'./cache/llama_eval/ppl-{args.method}-sinks-{args.sinks}-window-{args.window}.json',
                 'w') as f:
