@@ -12,27 +12,40 @@ from aim import Run
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
-from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
 from timber.utils import seed, get_bench, MockRun
 import deepspeed
-from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig, LlamaDecoderLayer
+from timber.models.modeling_llama import LlamaDecoderLayer
+from timber.models.qwen.modeling_qwen2 import Qwen2DecoderLayer
+
+
+def get_injection_policy(model_id):
+    if "llama" in model_id.lower():
+        return {
+            LlamaDecoderLayer: (
+                'mlp.down_proj',
+                'self_attn.o_proj',
+            )
+        }
+    elif "qwen" in model_id.lower():
+        return {
+            Qwen2DecoderLayer: (
+                'mlp.down_proj',
+                'self_attn.o_proj',
+            )
+        }
+    else:
+        raise ValueError()
 
 
 def job_ppl_pg19(args, model, tokenizer, device):
-    # model.model.setup_caches()
-    # model = torch.compile(model, mode="max-autotune", fullgraph=False)
     model.model.setup_caches(args.world_size)
-    model = model.to(args.infer_dtype)
-    model = deepspeed.init_inference(model,
-                                     tensor_parallel={"tp_size": 4},
-                                     replace_with_kernel_inject=False,
-                                     dtype=args.infer_dtype,
-                                     injection_policy={
-                                         LlamaDecoderLayer: (
-                                             'mlp.down_proj',
-                                             'self_attn.o_proj',
-                                         )
-                                     })
+    model = deepspeed.init_inference(
+        model,
+        tensor_parallel={"tp_size": args.world_size},
+        replace_with_kernel_inject=False,
+        dtype=args.infer_dtype,
+        injection_policy=get_injection_policy(args.model),
+    )
     # model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
     run = MockRun()
@@ -49,6 +62,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
             "window": args.window,
             "slots": args.slots,
             "model": args.model,
+            "head-reduction": args.head_reduction,
             "cascade-func": args.cascade_func,
             "comment": args.comment,
         }

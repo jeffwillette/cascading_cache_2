@@ -2,6 +2,7 @@ import os
 import torch
 import datasets
 from torch.utils.data import Dataset
+import numpy as np
 
 
 def cache_tokenized(dataset, tokenizer):
@@ -30,28 +31,32 @@ def cache_tokenized(dataset, tokenizer):
         for v in tokenized:
             print(v.size())
 
-        # concats all the tokenized books
-        # ids = tokenizer(
-        #     "\n\n".join(text),
-        #     return_tensors='pt',
-        #     truncation=False,
-        # ).input_ids
-
         print(f"{len(tokenized)=}")
         print("saving")
         torch.save(tokenized, cache_path)
         return cache_tokenized(dataset, tokenizer)
 
 
-class PG19Streaming(object):
+class PG19Streaming(Dataset):
 
-    def __init__(self, tokenizer, batch_size=10):
+    def __init__(self, tokenizer, batch_size=24):
         self.tokenizer = tokenizer
         self.dataset = datasets.load_dataset('emozilla/pg19-test')['test']
         self.batch_size = batch_size
 
         self.inputs = cache_tokenized(self.dataset, self.tokenizer)
+
+        lens = [v.size(1) for v in self.inputs]
+        selected = np.argsort(lens)[20:20 + 24]
+        print(f"selected book indices: {selected=}")
+
+        # sort the books to pick a chunk of similarly sized books for a batch
         self.inputs = sorted(self.inputs, key=lambda x: x.size(1))
+        sub = self.inputs[20:20 + 24]
+
+        print([v.size(1) for v in sub])
+        print(torch.tensor([v.size(1) for v in sub]).cumsum(0))
+        self.inputs = sub
 
     def __len__(self):
         return (len(self.inputs) // self.batch_size)

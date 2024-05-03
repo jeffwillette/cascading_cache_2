@@ -44,6 +44,7 @@ def eval_args(
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--cascade_func', type=str, default="pow2")
     parser.add_argument('--comment', type=str, default="")
+    parser.add_argument('--head_reduction', type=str, default="mean")
     parser.add_argument('--dev_run', action='store_true')
 
     # parser = deepspeed.add_config_arguments(parser)

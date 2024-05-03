@@ -17,6 +17,7 @@ from timber.utils import seed, get_bench
 
 from timber.main.jobs.bench_single_layer import job_bench_single_layer
 from timber.main.jobs.ppl import job_ppl
+from timber.main.jobs.passkey import job_passkey
 from timber.main.jobs.ppl_memory import job_ppl_memory
 from timber.main.jobs.pg19 import job_ppl_pg19
 # from timber.main.jobs.stream import job_stream
@@ -111,11 +112,13 @@ def load_model(args):
         'llama7b': 'togethercomputer/LLaMA-2-7B-32K',
         'llama13b': 'meta-llama/Llama-2-13b-hf',
         'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
+        'llama7b-chat': '/d1/dataset/llama/models/llama_v2/llama-2-7b-chat-hf',
         # 'qwen14b': 'Qwen/Qwen1.5-14B-Chat',
         # 'qwen7b': 'Qwen/Qwen1.5-7B-Chat',
         # 'qwen0.5b': 'Qwen/Qwen1.5-0.5B-Chat',
         'qwen14b': 'Qwen/Qwen1.5-14B',
         'qwen7b': 'Qwen/Qwen1.5-7B',
+        'qwen7b-chat': 'Qwen/Qwen1.5-7B-Chat',
         'qwen0.5b': 'Qwen/Qwen1.5-0.5B',
         'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B',
     }
@@ -133,6 +136,7 @@ def load_model(args):
     config._cascades = args.cascades
     config._window = args.window
     config._cascade_func = args.cascade_func
+    config._head_reduction = args.head_reduction
     args.infer_dtype = get_dtype(model_id)
 
     print(f"{config=}")
@@ -209,7 +213,6 @@ def load_model(args):
 
         result = model.load_state_dict(state_dict, strict=True)
         print('load result', result)
-        model = model.to(infer_dtype)
         print('lora checkpoint loaded from', args.checkpoint)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
@@ -222,24 +225,34 @@ def main():
     args = eval_args()
 
     assert args.job in [
-        'ppl', 'ppl-pg19', 'ppl-memory', 'stream', 'mmlu', 'bench_single_layer'
+        'ppl', 'ppl-pg19', 'ppl-memory', 'stream', 'mmlu',
+        'bench_single_layer', 'passkey'
     ]
 
     model, tokenizer, device = load_model(args)
 
     if args.job == 'ppl':
-        job_ppl(args, model, tokenizer, device)
+        raise NotImplementedError(
+            "implementation needs to be updated to current")
+        # job_ppl(args, model, tokenizer, device)
     elif args.job == 'ppl-memory':
         job_ppl_memory(args, model, tokenizer, device)
+    elif args.job == 'passkey':
+        job_passkey(args, model, tokenizer, device)
     elif args.job == 'ppl-pg19':
         job_ppl_pg19(args, model, tokenizer, device)
     elif args.job == 'stream':
-        pass
+        raise NotImplementedError(
+            "implementation needs to be updated to current")
         # job_stream(args, model, tokenizer, device)
     elif args.job == 'mmlu':
-        job_mmlu(args, model, tokenizer, device)
+        raise NotImplementedError(
+            "implementation needs to be updated to current")
+        # job_mmlu(args, model, tokenizer, device)
     elif args.job == 'bench_single_layer':
-        job_bench_single_layer(args, model, tokenizer, device)
+        raise NotImplementedError(
+            "implementation needs to be updated to current")
+        # job_bench_single_layer(args, model, tokenizer, device)
     else:
         raise Exception()
 

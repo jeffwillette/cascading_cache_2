@@ -9,6 +9,7 @@ import random
 
 # from .profiler import Profiler
 
+
 class MockRun:
 
     def __init__(self, *args, **kwargs):
@@ -27,6 +28,7 @@ class MockRun:
 def indent_string(s):
     return ("  " + s).replace('\n', '\n  ')
 
+
 def strify(d):
     newline = '\n'
     if isinstance(d, torch.Tensor):
@@ -44,6 +46,7 @@ def strify(d):
     else:
         return f'{type(d)}'
 
+
 def seed(seed=42):
     torch.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
@@ -51,22 +54,27 @@ def seed(seed=42):
     np.random.seed(seed)
     random.seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed) # if use multi-GPU
+    torch.cuda.manual_seed_all(seed)  # if use multi-GPU
     os.environ["PYTHONHASHSEED"] = str(seed)
 
-cuda_copy_lock = None # type: threading.RLock
+
+cuda_copy_lock = None  # type: threading.RLock
+
+
 def register_copy_lock(lock):
     global cuda_copy_lock
     assert cuda_copy_lock is None
-    
+
     cuda_copy_lock = lock
+
 
 def tensor_buffer_to(v, device):
     if isinstance(v, torch.Tensor):
-        if not isinstance(device, torch.device) and not isinstance(device, torch.dtype):
+        if not isinstance(device, torch.device) and not isinstance(
+                device, torch.dtype):
             device = torch.device(device)
         op_type = 'device' if isinstance(device, torch.device) else 'dtype'
-        
+
         if op_type == 'device':
             if v.device == device:
                 return v
@@ -75,12 +83,12 @@ def tensor_buffer_to(v, device):
             if cuda_copy_lock is not None:
                 cuda_copy_lock.acquire()
                 acquired = True
-            
+
             new_v = v.to(device, non_blocking=True)
-            
+
             if acquired:
                 cuda_copy_lock.release()
-            
+
             return new_v
         elif op_type == 'dtype':
             if v.dtype == device:
@@ -91,13 +99,14 @@ def tensor_buffer_to(v, device):
     elif isinstance(v, list):
         return list([tensor_buffer_to(i, device) for i in v])
     elif isinstance(v, dict):
-        return dict({k:tensor_buffer_to(vv, device) for k,vv in v.items()})
+        return dict({k: tensor_buffer_to(vv, device) for k, vv in v.items()})
     elif isinstance(v, (float, int, str)):
         return v
     elif v is None:
         return v
     else:
         raise Exception(type(v))
+
 
 def batch_to(batch, device):
     if isinstance(batch, dict):
@@ -117,6 +126,7 @@ def batch_to(batch, device):
     else:
         raise Exception(type(batch))
 
+
 def get_device_name(device):
     name = torch.cuda.get_device_name(device=device)
     name = name.lower()
@@ -125,35 +135,44 @@ def get_device_name(device):
     name = name.replace(' ', '_')
     return name
 
+
 def model_hash(model):
     import hashlib
     flt = hashlib.shake_256()
     for name, param in sorted(model.named_parameters(), key=lambda x: x[0]):
         flt.update(name.encode())
-        flt.update(param.data.view(-1)[:min(16, param.data.numel())].cpu().numpy().tobytes())
+        flt.update(
+            param.data.view(-1)
+            [:min(16, param.data.numel())].cpu().numpy().tobytes())
     return flt.hexdigest(16)
 
+
 class NanException(Exception):
+
     def __init__(self, *args: object) -> None:
         super().__init__("NaN occure")
 
         self.args = args
 
+
 nan_check = True
+
+
 def set_global_nan_check(v):
     global nan_check
     nan_check = v
+
 
 def raise_if_nan(tensor):
     global nan_check
     if not nan_check:
         return tensor
-    
+
     if torch.isinf(tensor).any():
         torch.save(tensor, 'utils_inf.pth')
         print('Has INF in here raise_if_nan. check utils_inf.pth')
         raise NanException()
-    
+
     if torch.isnan(tensor).any():
         # print('Has NAN in here', tensor)
         torch.save(tensor, 'utils_nan.pth')
@@ -161,28 +180,35 @@ def raise_if_nan(tensor):
         raise NanException()
     return tensor
 
+
 import pickle
 import io
+
 
 def module_clone(module: torch.nn.Module, device=None):
     is_training = copy.deepcopy(module.training)
     if device is None:
         device = copy.deepcopy(get_module_device(module))
-    
+
     # cloned_module = pickle.loads(pickle.dumps(module)) # type: torch.nn.Module
     buffer = io.BytesIO()
     try:
-        torch.save(module, buffer, _use_new_zipfile_serialization=False, pickle_protocol=5)
+        torch.save(module,
+                   buffer,
+                   _use_new_zipfile_serialization=False,
+                   pickle_protocol=5)
         buffer.seek(0)
-        cloned_module = torch.load(buffer, map_location='cpu') # type: torch.nn.Module
+        cloned_module = torch.load(buffer,
+                                   map_location='cpu')  # type: torch.nn.Module
     finally:
         buffer.close()
     # cloned_module = copy.deepcopy(module)
-    
+
     cloned_module = cloned_module.train(is_training)
     if device is not None:
         cloned_module = cloned_module.to(device)
     return cloned_module
+
 
 def human_readable(value, unit='B', unit_size=1024):
     if value < 0:
@@ -200,10 +226,15 @@ def human_readable(value, unit='B', unit_size=1024):
     else:
         return f'{value:.1f} {unit}'
 
+
 def compute_internal_fragmentation():
     # https://github.com/pytorch/pytorch/issues/29554
     snapshot = torch.cuda.memory_snapshot()
-    return 1 - (sum(b['allocated_size'] for b in snapshot if b['allocated_size'] > 0) / sum(b['total_size'] for b in snapshot if b['allocated_size'] > 0))
+    return 1 - (sum(b['allocated_size']
+                    for b in snapshot if b['allocated_size'] > 0) /
+                sum(b['total_size']
+                    for b in snapshot if b['allocated_size'] > 0))
+
 
 def compact_cuda_memory():
     """
@@ -214,29 +245,31 @@ def compact_cuda_memory():
     if cuda_copy_lock is not None:
         cuda_copy_lock.acquire()
         acquired = True
-    
+
     try:
         # wait for all computation is finished
         torch.cuda.synchronize()
-        
+
         # Run a full garbage collect first so any dangling tensors are released
         gc.collect()
 
         # Then move all tensors to the CPU
-        locations = {} # type: Dict[torch.Tensor, str]
+        locations = {}  # type: Dict[torch.Tensor, str]
         cpu_device = torch.device('cpu')
         for obj in gc.get_objects():
             if not isinstance(obj, torch.Tensor):
                 continue
-            
+
             obj_device = obj.device
             if obj_device != cpu_device:
                 locations[obj] = obj_device
                 # obj.device = cpu_device
                 obj.data = obj.data.to(cpu_device, non_blocking=True)
                 assert obj.device != obj_device
-                if (isinstance(obj, torch.nn.Parameter)) and obj.grad is not None:
-                    obj.grad.data = obj.grad.data.to(cpu_device, non_blocking=True)
+                if (isinstance(obj,
+                               torch.nn.Parameter)) and obj.grad is not None:
+                    obj.grad.data = obj.grad.data.to(cpu_device,
+                                                     non_blocking=True)
 
         torch.cuda.synchronize()
         gc.collect()
@@ -248,14 +281,17 @@ def compact_cuda_memory():
             # tensor.device = device
             tensor.data = tensor.data.to(device, non_blocking=True)
             assert tensor.data.device == tensor.device
-            if (isinstance(tensor, torch.nn.Parameter)) and tensor.grad is not None:
-                tensor.grad.data = tensor.grad.data.to(device, non_blocking=True)
+            if (isinstance(tensor,
+                           torch.nn.Parameter)) and tensor.grad is not None:
+                tensor.grad.data = tensor.grad.data.to(device,
+                                                       non_blocking=True)
                 assert tensor.grad.device == tensor.data.device
-        
+
         torch.cuda.synchronize()
     finally:
         if acquired:
             cuda_copy_lock.release()
+
 
 def get_module_device(m: torch.nn.Module):
     dev = None
@@ -267,7 +303,10 @@ def get_module_device(m: torch.nn.Module):
             dev = new_dev
     return dev
 
+
 warmup_finished = False
+
+
 def warmup_torch_stream(job, warmup_steps=3, force_rewarmup=False):
     global warmup_finished
     if (not force_rewarmup) and warmup_finished:
@@ -279,10 +318,12 @@ def warmup_torch_stream(job, warmup_steps=3, force_rewarmup=False):
             job()
     torch.cuda.current_stream().wait_stream(s)
     warmup_finished = True
-    
+
+
 # default_profiler = Profiler()
 # def get_profiler():
 #     return default_profiler
+
 
 def copy_batch(from_batch, to_batch):
     if isinstance(from_batch, torch.Tensor):
@@ -298,15 +339,19 @@ def copy_batch(from_batch, to_batch):
     else:
         raise Exception(type(from_batch))
 
+
 def unzip(lst, dim=0):
     return [i[dim] for i in lst]
+
 
 import contextlib
 import sys
 import tqdm
 
+
 class TqdmWriteDummyFile(object):
     file = None
+
     def __init__(self, file: TextIO):
         self.file = file
 
@@ -315,12 +360,13 @@ class TqdmWriteDummyFile(object):
         # if len(x.rstrip()) > 0:
         #     tqdm.tqdm.write(x, file=self.file)
         tqdm.tqdm.write(x, file=self.file, end='')
-    
+
     def flush(self):
         self.file.flush()
-    
+
     def close(self):
         self.file.close()
+
 
 @contextlib.contextmanager
 def using_tqdm_write():
@@ -328,8 +374,10 @@ def using_tqdm_write():
     sys.stdout = TqdmWriteDummyFile(sys.stdout)
     yield
     sys.stdout = save_stdout
-    
+
+
 import multiprocessing as mp
+
 
 def __query_available_devices(q):
     import torch
@@ -341,32 +389,38 @@ def __query_available_devices(q):
         available = (free_mem / (total_mem + 1e-8)) > 0.5
         if available:
             available_devices.append(i)
-        avail_mem.append(f'[{i}({available})]={free_mem / (total_mem + 1e-8) * 100:.1f}%')
+        avail_mem.append(
+            f'[{i}({available})]={free_mem / (total_mem + 1e-8) * 100:.1f}%')
     print('QueryDevice: Available Memories,', *avail_mem)
     q.put(available_devices)
 
+
 def query_available_devices() -> list[int]:
     q = mp.Queue()
-    cuda_process = mp.Process(target=__query_available_devices, args=(q,), daemon=True)
+    cuda_process = mp.Process(target=__query_available_devices,
+                              args=(q, ),
+                              daemon=True)
     cuda_process.start()
     cuda_process.join()
     available_devices = q.get()
     q.close()
     return available_devices
 
+
 class Metric:
+
     def __init__(self, method='moving_average', window_size=50):
         self.method = method
         self.window_size = window_size
-        
+
         self.sum = {}
         self.count = {}
         self.buf = {}
-        
+
     def update(self, x, name='', weight=1):
         if isinstance(x, torch.Tensor):
             x = x.item()
-        
+
         if self.method == 'mean':
             if not name in self.sum:
                 self.sum[name] = 0
@@ -394,23 +448,26 @@ class Metric:
             r[key] = self.get(key)
         return r
 
+
 import time
 
+
 class BenchmarkRegion:
+
     def __init__(self, benchmark: "Benchmark", name: str) -> None:
         self.benchmark = benchmark
         self.name = name
-        
+
         self.parent = None
         self.children = []
-    
+
     def __enter__(self):
         if self.benchmark.disabled: return
         # if self.benchmark.synchronize: torch.cuda.synchronize()
         self.t = time.time()
         self.start = torch.cuda.Event(enable_timing=True)
         self.start.record()
-        
+
         if self.benchmark.tracking_callstack:
             if self.benchmark.current_region_context is None:
                 self.benchmark.current_region_context = self
@@ -421,18 +478,20 @@ class BenchmarkRegion:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.benchmark.disabled: return
-        
+
         self.end = torch.cuda.Event(enable_timing=True)
         if self.benchmark.synchronize:
             self.end.record()
+
             def measure():
                 torch.cuda.synchronize()
                 return self.start.elapsed_time(self.end) / 1000
+
             self.elapsed = measure
         else:
             self.elapsed = time.time() - self.t
         self.benchmark.add_data(self.name, self.elapsed)
-        
+
         if self.benchmark.tracking_callstack:
             if self.parent is None:
                 self.benchmark.tracking_callstack = False
@@ -440,68 +499,71 @@ class BenchmarkRegion:
                 self.benchmark.traced_callstack = self
             else:
                 self.benchmark.current_region_context = self.parent
-    
+
     def format_tree(self, indent=0):
         spaces = "  " * indent
-        messages =  [f"{spaces}> {self.name}"]
+        messages = [f"{spaces}> {self.name}"]
         for child in self.children:
-            messages.append(child.format_tree(indent+1))
+            messages.append(child.format_tree(indent + 1))
         return "\n".join(messages)
 
+
 class BenchmarkMemRegion:
+
     def __init__(self, benchmark: "Benchmark", name: str) -> None:
         self.benchmark = benchmark
         self.name = name
-    
+
     def __enter__(self):
         if self.benchmark.disabled: return
-        
+
         # if self.benchmark.synchronize: torch.cuda.synchronize()
         self.t = torch.cuda.memory_allocated()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.benchmark.disabled: return
-        
+
         # if self.benchmark.synchronize: torch.cuda.synchronize()
         self.t = torch.cuda.memory_allocated() - self.t
         # print(self.name, self.t // 1024)
         # self.benchmark.add_data(self.name, self.t)
 
+
 class Benchmark:
     current_region_context: BenchmarkRegion
     traced_callstack: BenchmarkRegion
-    
+
     def __init__(self):
         self.synchronize = True
         self.disabled = True
         self.activate_temp_buffers = False
         self.buffers = {}
         self.data = {}
-        
+
         self.tracking_callstack = True
         self.current_region_context = None
         self.traced_callstack = None
-    
+
     def add_data(self, name, t):
         count, sum = self.data.get(name, (0, 0))
         if isinstance(t, (int, float, torch.Tensor)):
-            self.data[name] = (count+1, sum+t)
+            self.data[name] = (count + 1, sum + t)
         else:
             if sum == 0:
                 sum = []
-            self.data[name] = (count+1, sum + [t])
-    
+            self.data[name] = (count + 1, sum + [t])
+
     def reset_trace(self):
         self.tracking_callstack = True
         self.current_region_context = None
         self.traced_callstack = None
-    
+
     def reset_measures(self):
         self.data = {}
-    
+
     def region(self, name):
         return BenchmarkRegion(benchmark=self, name=name)
-    
+
     def mem_region(self, name):
         return BenchmarkMemRegion(benchmark=self, name=name)
 
@@ -511,7 +573,7 @@ class Benchmark:
             if isinstance(s, list):
                 s = [i() for i in s]
                 s = sum(s)
-            data[key] = s / (c+1e-10)
+            data[key] = s / (c + 1e-10)
         return data
 
     def register_temp_buffer(self, name, v, lazy=None):
@@ -520,36 +582,43 @@ class Benchmark:
         if (v is None) and (lazy is not None): v = lazy()
         buffer.append(v)
         self.buffers[name] = buffer
-    
+
     def get_temp_buffer(self, name, index=-1):
         return self.buffers[name][index]
-    
+
     def reset_temp_buffers(self):
         self.buffers = {}
-    
+
     def format_tracetree(self):
         data = self.todict()
         root = self.traced_callstack
         if root is None: return ""
-        
+
         total_time = data[root.name]
+
         def format_tree_percent(item, indent=0):
             spaces = ""
             if indent == 1:
                 spaces = "╰─"
             elif indent > 1:
                 spaces = "  " * (indent - 1) + "╰─"
-            messages =  [f"{spaces}> {item.name} ({data[item.name]*1000:.2f} ms, {data[item.name] / total_time * 100:.2f}%)"]
+            messages = [
+                f"{spaces}> {item.name} ({data[item.name]*1000:.2f} ms, {data[item.name] / total_time * 100:.2f}%)"
+            ]
             for child in item.children:
-                messages.append(format_tree_percent(child, indent+1))
+                messages.append(format_tree_percent(child, indent + 1))
             return "\n".join(messages)
+
         return format_tree_percent(root)
 
+
 BENCHMARK = Benchmark()
+
 
 def get_bench() -> Benchmark:
     global BENCHMARK
     return BENCHMARK
+
 
 def trace_referrers(obj, live_count=2):
     if live_count <= 0:
@@ -557,13 +626,17 @@ def trace_referrers(obj, live_count=2):
     parent = gc.get_referrers(obj)
     return f"[{[trace_referrers(p, live_count=live_count-1) for p in parent]}]({type(obj)})"
 
+
 def get_all_allocated_tensors() -> List[Tuple[torch.Tensor, list]]:
     tensors = []
     for obj in gc.get_objects():
         try:
-            if isinstance(obj, torch.Tensor) and (not isinstance(obj, torch.nn.Parameter)) and (torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data))):
+            if isinstance(obj, torch.Tensor) and (not isinstance(
+                    obj, torch.nn.Parameter)) and (
+                        torch.is_tensor(obj) or
+                        (hasattr(obj, 'data') and torch.is_tensor(obj.data))):
                 if obj.device != torch.device('cpu'):
-                    obj = obj #type: torch.Tensor
+                    obj = obj  #type: torch.Tensor
                     # referrers = gc.get_referrers(obj)
                     referrers = trace_referrers(obj)
                     tensors.append((obj, referrers))
