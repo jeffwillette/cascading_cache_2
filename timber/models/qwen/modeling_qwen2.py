@@ -429,7 +429,7 @@ class Qwen2Attention(nn.Module):
 
         # sin and cos are specific to RoPE models; cache_position needed for the static cache
 
-        c = torch.zeros_like(hidden_states)
+        c = torch.zeros_like(query_states.transpose(1, 2).view(bsz, q_len, -1))
         # print(f"{query_states.size()=} {c.size()=}")
         for i in tqdm(
                 range(q_len),
@@ -481,7 +481,7 @@ class Qwen2Attention(nn.Module):
             )
             # print(f"{i} {out.size()=}")
 
-            c[:, i] = out
+            c[:, i:i + 1] = out
 
         out = self.o(c)
 
@@ -1435,6 +1435,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 past_key_values_length,
                 sliding_window=self.config.sliding_window,
             )
+        elif self.config._sinks > 0:
+            pass
         else:
             # 4d mask is passed through the layers
             attention_mask = _prepare_4d_causal_attention_mask(
@@ -1681,7 +1683,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
                 attention_mask = attention_mask[:, -max_cache_length:]
 
         position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
+        if attention_mask is not None and position_ids is None and not isinstance(
+                past_key_values, SinkCache):
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)

@@ -113,6 +113,7 @@ def load_model(args):
         'llama13b': 'meta-llama/Llama-2-13b-hf',
         'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
         'llama7b-chat': '/d1/dataset/llama/models/llama_v2/llama-2-7b-chat-hf',
+        "llama2-7b-chat-32k": "togethercomputer/Llama-2-7B-32K-Instruct",
         # 'qwen14b': 'Qwen/Qwen1.5-14B-Chat',
         # 'qwen7b': 'Qwen/Qwen1.5-7B-Chat',
         # 'qwen0.5b': 'Qwen/Qwen1.5-0.5B-Chat',
@@ -246,9 +247,7 @@ def main():
             "implementation needs to be updated to current")
         # job_stream(args, model, tokenizer, device)
     elif args.job == 'mmlu':
-        raise NotImplementedError(
-            "implementation needs to be updated to current")
-        # job_mmlu(args, model, tokenizer, device)
+        job_mmlu(args, model, tokenizer, device)
     elif args.job == 'bench_single_layer':
         raise NotImplementedError(
             "implementation needs to be updated to current")

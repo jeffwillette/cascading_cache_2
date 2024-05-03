@@ -600,7 +600,7 @@ class LlamaAttention(nn.Module):
 
         # sin and cos are specific to RoPE models; cache_position needed for the static cache
 
-        c = torch.zeros_like(hidden_states)
+        c = torch.zeros_like(query_states.transpose(1, 2).view(bsz, q_len, -1))
         # print(f"{query_states.size()=} {c.size()=}")
         for i in tqdm(
                 range(q_len),
@@ -652,7 +652,7 @@ class LlamaAttention(nn.Module):
             )
             # print(f"{i} {out.size()=}")
 
-            c[:, i] = out
+            c[:, i:i + 1] = out
 
         out = self.o(c)
 
