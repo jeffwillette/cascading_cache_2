@@ -1968,7 +1968,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        # logits = logits.float()
 
         loss = None
         if labels is not None:
@@ -2022,6 +2022,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                     past_key_values.get_max_length(), device=input_ids.device)
                                     if past_key_values.get_max_length()
                                     is not None else None)
+
+                print(
+                    f"{max_cache_length=} {past_length=} {past_key_values.get_seq_length()=} {cache_position=}"
+                )
 
                 cache_length = past_length if max_cache_length is None else torch.min(
                     max_cache_length, past_length)

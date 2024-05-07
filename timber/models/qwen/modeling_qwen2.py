@@ -289,6 +289,8 @@ class Qwen2Attention(nn.Module):
         cascade = isinstance(past_key_value, CascadingSinkCache)
         if static_cascade or cascade:
             if hidden_states.size(1) == 1:
+                # print(
+                #     f"calling forward cascade single: {hidden_states.size()=}")
                 return self.forward_cascade(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -305,6 +307,7 @@ class Qwen2Attention(nn.Module):
             warnings.warn(
                 "CALLING RESET INSIDE MODEL, IF THIS IS NOT THE START OF A GENERATION LOOP, THEN THIS MIGHT BE AN ERROR"
             )
+            # print(f"calling forward cascade batch: {hidden_states.size()=}")
             self.past_key_value.reset(verbose=False)
             return self.forward_cascade_batch(
                 hidden_states=hidden_states,
@@ -567,6 +570,8 @@ class Qwen2Attention(nn.Module):
             past_key_value,
             (bsz, q_len, self.hidden_size),
         )
+
+        # print(f"returning single: {out.size()=}")
 
         return out, None, past_key_value
 
@@ -1610,7 +1615,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        # logits = logits.float()
 
         loss = None
         if labels is not None:
@@ -1654,7 +1659,14 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache) or isinstance(
                     past_key_values, SinkCache):
-                past_length = past_key_values.get_seq_length()
+
+                # cache position contains the value of the seen tokens and not the actual tokens stored
+                # in the cache, so that is what we should go off of since the tokens stored might be less than cache_position for cascading cache
+                cache_position = kwargs.get("cache_position", None)
+                past_length = cache_position[
+                    0] if cache_position is not None else past_key_values.get_seq_length(
+                    )
+
                 max_cache_length = past_key_values.get_max_length()
 
                 cache_length = past_length if max_cache_length is None else min(
@@ -1671,6 +1683,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
                     1] > input_ids.shape[1]:
                 input_ids = input_ids[:, -(attention_mask.shape[1] -
                                            past_length):]
+
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
             elif past_length < input_ids.shape[1]:
@@ -1699,6 +1712,10 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
         if has_static_cache:
             past_key_values = None
+
+        # print(
+        #     f"returning from prepare inputs for generation {model_inputs['input_ids'].size()=}"
+        # )
 
         model_inputs.update({
             "position_ids": position_ids,

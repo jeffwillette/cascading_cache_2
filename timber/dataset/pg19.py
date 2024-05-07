@@ -1,6 +1,7 @@
 import os
 import torch
 import datasets
+import warnings
 from torch.utils.data import Dataset
 import numpy as np
 
@@ -47,12 +48,18 @@ class PG19Streaming(Dataset):
         self.inputs = cache_tokenized(self.dataset, self.tokenizer)
 
         lens = [v.size(1) for v in self.inputs]
-        selected = np.argsort(lens)[20:20 + 24]
+        selected = np.argsort(lens)
+
+        selected = selected[20:20 + 24].tolist() + selected[19:20].tolist()
+        warnings.warn(
+            f"there was a subset mismatch for qwen and llama tokenizers. Adding book 19:20 fixed it. If you are using a different tokenizer, you need to make sure you select the proper subset based on these indices. {selected} {len(selected)=}"
+        )
+        print(f"total books {np.argsort(lens)=}")
         print(f"selected book indices: {selected=}")
 
         # sort the books to pick a chunk of similarly sized books for a batch
         self.inputs = sorted(self.inputs, key=lambda x: x.size(1))
-        sub = self.inputs[20:20 + 24]
+        sub = self.inputs[20:20 + 24] + self.inputs[19:20]
 
         print([v.size(1) for v in sub])
         print(torch.tensor([v.size(1) for v in sub]).cumsum(0))
@@ -91,10 +98,19 @@ class PG19Streaming(Dataset):
 
 if __name__ == '__main__':
     import transformers
+    print("Llama")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         'togethercomputer/LLaMA-2-7B-32K')
     ds = PG19Streaming(tokenizer)
 
-    print(f"{len(ds)=}")
-    for i, (x, y) in enumerate(ds):
-        print(f"{i} {x.size()=} {y.size()=}")
+    # print(f"{len(ds)=}")
+    # for i, (x, y) in enumerate(ds):
+    #     print(f"{i} {x.size()=} {y.size()=}")
+
+    print("Qwen")
+    tokenizer = transformers.AutoTokenizer.from_pretrained('Qwen/Qwen1.5-7B')
+    ds = PG19Streaming(tokenizer)
+
+    # print(f"{len(ds)=}")
+    # for i, (x, y) in enumerate(ds):
+    #     print(f"{i} {x.size()=} {y.size()=}")

@@ -15,7 +15,7 @@ from peft import get_peft_model, prepare_model_for_kbit_training
 from timber.utils import seed, get_bench, MockRun
 import deepspeed
 from timber.models.modeling_llama import LlamaDecoderLayer
-from timber.models.qwen.modeling_qwen2 import Qwen2DecoderLayer
+from timber.models.qwen.modeling_qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 
 
 def get_injection_policy(model_id):
@@ -31,7 +31,8 @@ def get_injection_policy(model_id):
             Qwen2DecoderLayer: (
                 'mlp.down_proj',
                 'self_attn.o_proj',
-            )
+            ),
+            # Qwen2ForCausalLM: ("lm_head", ),
         }
     else:
         raise ValueError()
@@ -39,13 +40,14 @@ def get_injection_policy(model_id):
 
 def job_ppl_pg19(args, model, tokenizer, device):
     model.model.setup_caches(args.world_size)
-    model = deepspeed.init_inference(
-        model,
-        tensor_parallel={"tp_size": args.world_size},
-        replace_with_kernel_inject=False,
-        dtype=args.infer_dtype,
-        injection_policy=get_injection_policy(args.model),
-    )
+    model = model.cuda()
+    # model = deepspeed.init_inference(
+    #     model,
+    #     tensor_parallel={"tp_size": args.world_size},
+    #     replace_with_kernel_inject=False,
+    #     dtype=args.infer_dtype,
+    #     injection_policy=get_injection_policy(args.model),
+    # )
     # model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
     run = MockRun()
@@ -79,6 +81,12 @@ def job_ppl_pg19(args, model, tokenizer, device):
     for j, (x, y) in enumerate(dataset):
         input_ids = x.cuda()
         target_ids = y.cuda()
+
+        ############################ TEMPORARY HACK TO MATCH THE SUBSETS OF QWEN AND LLAMA
+        # if j < 24:
+        #     print(f"skipping book {j}")
+        #     continue
+        ############################ END HACK, COMMENT OUT WHEN DONE
         print(
             f"starting batch of books: {input_ids.size()=} {target_ids.size()=}"
         )
@@ -107,12 +115,12 @@ def job_ppl_pg19(args, model, tokenizer, device):
                     step += 1
 
                     if step % 100 == 0:
-                        ppl = torch.exp(nll_total / count_total).item()
-                        run.track(ppl,
-                                  name="ppl-pg19",
-                                  step=step,
-                                  context={"subset": "test"})
-                        pbar.set_description(f"{ppl=:.6f}")
+                        # ppl = torch.exp(nll_total / count_total).item()
+                        # run.track(ppl,
+                        #           name="ppl-pg19",
+                        #           step=step,
+                        #           context={"subset": "test"})
+                        # pbar.set_description(f"{ppl=:.6f}")
 
                         book_idx = l + torch.arange(args.batch_size)
                         book_ppl = torch.exp(nll_individual[book_idx] /

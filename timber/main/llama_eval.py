@@ -166,7 +166,14 @@ def load_model(args):
         trust_remote_code=True,
     )
 
-    model = get_model(model_id, **from_pretrained_kwargs)
+    if args.method == "vanilla":
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_id, **from_pretrained_kwargs)
+    elif args.method == "sink":
+        model = get_model(model_id, **from_pretrained_kwargs)
+    else:
+        raise ValueError("unsupported method")
+
     for m in model.modules():
         if hasattr(m, 'attention_method'):
             m.attention_method = args.method
