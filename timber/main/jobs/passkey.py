@@ -7,12 +7,26 @@ from aim import Run
 import numpy as np
 from timber.utils import MockRun
 from timber.dataset.passkey import Passkey
+import deepspeed
+from timber.main.jobs.pg19 import get_injection_policy
 
 
 def job_passkey(args, model, tokenizer, device):
     model.model.setup_caches(args.world_size)
-    model = model.to(args.infer_dtype).cuda()
-    model = torch.compile(model, mode="max-autotune", fullgraph=False)
+
+    if args.world_size > 1:
+        model = deepspeed.init_inference(
+            model,
+            tensor_parallel={"tp_size": args.world_size},
+            replace_with_kernel_inject=False,
+            dtype=args.infer_dtype,
+            injection_policy=get_injection_policy(args.model),
+        )
+        m = model.module.model
+    else:
+        model = model.to(args.infer_dtype).cuda()
+        model = torch.compile(model, mode="max-autotune", fullgraph=False)
+        m = model.model
 
     dataset = Passkey(tokenizer, batch_size=args.batch_size)
 
@@ -21,7 +35,7 @@ def job_passkey(args, model, tokenizer, device):
         input_ids = input_ids.cuda()
         target_ids = target_ids.cuda()
 
-        model.model.clear_caches()
+        m.clear_caches()
         correct, count = 0, 0
         correct_per_token, count_per_token = 0, 0
 

@@ -40,15 +40,17 @@ def get_injection_policy(model_id):
 
 def job_ppl_pg19(args, model, tokenizer, device):
     model.model.setup_caches(args.world_size)
-    model = model.cuda()
-    # model = deepspeed.init_inference(
-    #     model,
-    #     tensor_parallel={"tp_size": args.world_size},
-    #     replace_with_kernel_inject=False,
-    #     dtype=args.infer_dtype,
-    #     injection_policy=get_injection_policy(args.model),
-    # )
-    # model = torch.compile(model, mode="max-autotune", fullgraph=False)
+    if args.world_size == 1:
+        model = model.to(args.infer_dtype).cuda()
+        model = torch.compile(model, mode="max-autotune", fullgraph=False)
+    else:
+        model = deepspeed.init_inference(
+            model,
+            tensor_parallel={"tp_size": args.world_size},
+            replace_with_kernel_inject=False,
+            dtype=args.infer_dtype,
+            injection_policy=get_injection_policy(args.model),
+        )
 
     run = MockRun()
     if args.local_rank == 0:
@@ -64,8 +66,8 @@ def job_ppl_pg19(args, model, tokenizer, device):
             "window": args.window,
             "slots": args.slots,
             "model": args.model,
-            "head-reduction": args.head_reduction,
-            "cascade-func": args.cascade_func,
+            "head_reduction": args.head_reduction,
+            "cascade_func": args.cascade_func,
             "comment": args.comment,
         }
 

@@ -23,7 +23,7 @@ D. {choice_d}
 
 Answer:"""
 
-MMLU_FORMAT_TARGET_QUESTION = """> I want you to answer the following are multiple choice question about {subject_name}.
+MMLU_FORMAT_TARGET_QUESTION = """> I want you to answer the following multiple choice question about {subject_name}.
 
 {number}. {question}
 
@@ -50,18 +50,18 @@ MMLU_STEM = [
     # 'astronomy',
     # 'college_biology',
     # 'college_chemistry',
-    'college_computer_science',
-    'college_mathematics',
-    'college_physics',
-    'computer_security',
-    'conceptual_physics',
-    'electrical_engineering',
-    'elementary_mathematics',
-    'high_school_biology',
-    'high_school_chemistry',
-    'high_school_computer_science',
-    'high_school_mathematics',
-    'high_school_physics',
+    # 'college_computer_science',
+    # 'college_mathematics',
+    # 'college_physics',
+    # 'computer_security',
+    # 'conceptual_physics',
+    # 'electrical_engineering',
+    # 'elementary_mathematics',
+    # 'high_school_biology',
+    # 'high_school_chemistry',
+    # 'high_school_computer_science',
+    # 'high_school_mathematics',
+    # 'high_school_physics',
     'high_school_statistics',
     'machine_learning',
 ]
@@ -411,7 +411,9 @@ def evaluate_mmlu(args, model, tokenizer, subject_name, reverse=False):
     os.makedirs('./saves/llama_eval/mmlu/', exist_ok=True)
     json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}_reverse_{reverse}.json'
     if args.method == 'sink':
-        json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}_window_{args.window}_cascade_{args.cascades}_sinks_{args.sinks}_comment_{args.comment}_reverse_{reverse}.json'
+        json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}_window_{args.window}_' + \
+            f'head_reduction_{args.head_reduction}_cascade_{args.cascades}_sinks_{args.sinks}_' + \
+            f'comment_{args.comment}_reverse_{reverse}.json'
 
     with open(json_path, 'w') as f:
         json.dump(

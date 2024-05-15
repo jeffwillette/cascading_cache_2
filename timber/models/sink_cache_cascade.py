@@ -4,6 +4,7 @@ gmlwns2000, jeffwillette @ github
 """
 
 import math
+import os
 import time
 import numpy as np
 import torch
@@ -130,9 +131,9 @@ def _update_positional_idx(
     pos_idx = tl.arange(0, WINDOW_SIZE_CONST).to(IDTYPE)
     tl.store(
         POS + \
-            idx_n * stride_p_n + \
-            idx_h * stride_p_h + \
-            (l + pos_idx) * stride_p_t,
+            idx_n.to(IDTYPE) * stride_p_n + \
+            idx_h.to(IDTYPE) * stride_p_h + \
+            (l + pos_idx).to(IDTYPE) * stride_p_t,
         value=pos
     )
 
@@ -243,9 +244,10 @@ def _update_kv_cache(
         stored_tokens_i = tl.load(STORED_TOKENS + stored_shift)
         start_idx_i = tl.load(START_INDICES + stored_shift)
 
+        # print("do cache i before loop: ", do_cache_i, i)
         if do_cache_i:
-            # print("append first")
             if stored_tokens_i < segment_len:
+                # print("append first")
                 t = start_idx_i.to(IDTYPE) + stored_tokens_i.to(IDTYPE) + l.to(
                     IDTYPE)
 
@@ -377,7 +379,7 @@ def _update_kv_cache(
                     t.to(IDTYPE) * stride_ck_t + \
                     idx_hid.to(IDTYPE) * stride_ck_hid
 
-                # add in new values at the proper location, set mask
+                # # add in new values at the proper location, set mask
                 tl.store(CACHE_K + kv_adds, value=key.to(dtype), mask=mask_hid)
                 tl.store(CACHE_V + kv_adds,
                          value=value.to(dtype),
@@ -394,12 +396,12 @@ def _update_kv_cache(
                 tl.store(
                     MASK + \
                         idx_n.to(IDTYPE) * stride_m_n + \
-                        idx_h.to(IDTYPE) * stride_m_n + \
+                        idx_h.to(IDTYPE) * stride_m_h + \
                         t.to(IDTYPE) * stride_m_t,
                     value=0
                 )
 
-                # increment the stored tokens for this cascade
+                # # increment the stored tokens for this cascade
                 tl.store(
                     STORED_TOKENS + \
                         idx_n.to(IDTYPE) * stride_st_n + \
@@ -812,6 +814,18 @@ class CascadingSinkCacheTriton(SinkCache):
                 torch.tensor([2**i for i in range(self.cascades)],
                              device=dev,
                              dtype=torch.long))
+        elif self.cascade_func == "pow3":
+            self.register_buffer(
+                "do_cache_every_n",
+                torch.tensor([3**i for i in range(self.cascades)],
+                             device=dev,
+                             dtype=torch.long))
+        elif self.cascade_func == "pow4":
+            self.register_buffer(
+                "do_cache_every_n",
+                torch.tensor([4**i for i in range(self.cascades)],
+                             device=dev,
+                             dtype=torch.long))
         elif self.cascade_func == "iplus1":
             self.register_buffer(
                 "do_cache_every_n",
@@ -911,15 +925,25 @@ class CascadingSinkCacheTriton(SinkCache):
         attention_scores: torch.Tensor,
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
+
         if self.head_reduction == "mean":
-            self.score_cache = self.beta * self.score_cache + (
-                1 - self.beta) * attention_scores.mean(dim=1,
-                                                       keepdim=True).squeeze(2)
+            attention_scores = attention_scores.mean(dim=1,
+                                                     keepdim=True).squeeze(2)
+
+        elif self.head_reduction == "max":
+            attention_scores = attention_scores.amax(dim=1,
+                                                     keepdim=True).squeeze(2)
+        elif self.head_reduction == "median":
+            attention_scores = attention_scores.median(
+                dim=1, keepdim=True).values.squeeze(2)
         elif self.head_reduction == "none":
             pass
         else:
             raise ValueError(
                 f"unknown head reduction method: {self.head_reduction}")
+
+        self.score_cache = self.beta * self.score_cache + (
+            1 - self.beta) * attention_scores
 
     @torch._dynamo.disable(recursive=True)
     def update(
@@ -1468,6 +1492,44 @@ class CascadingSinkCache(SinkCache):
         )
 
 
+class SinkAttentionNaive(nn.Module):
+
+    def __init__(self, sinks, window):
+        super().__init__()
+        self.sinks = sinks
+        self.window = window
+
+        self.register_buffer("sink_k_cache", torch.Tensor())
+        self.register_buffer("sink_v_cache", torch.Tensor())
+        self.register_buffer("k_cache", torch.Tensor())
+        self.register_buffer("v_cache", torch.Tensor())
+        self._seen_tokens = 0
+
+    def forward(self, k, v):
+        if self._seen_tokens < self.sinks:
+            if self.sink_k_cache.numel() > 0:
+                self.sink_k_cache = torch.cat((self.sink_k_cache, k), dim=-2)
+                self.sink_v_cache = torch.cat((self.sink_v_cache, v), dim=-2)
+            else:
+                self.sink_k_cache = k
+                self.sink_v_cache = v
+        else:
+            if self.k_cache.numel() > 0:
+                start = min(
+                    1, max(0,
+                           self._seen_tokens - self.sinks - self.window + 1))
+                self.k_cache = torch.cat((self.k_cache[:, :, start:], k),
+                                         dim=-2)
+                self.v_cache = torch.cat((self.v_cache[:, :, start:], v),
+                                         dim=-2)
+            else:
+                self.k_cache = k
+                self.v_cache = v
+
+        self._seen_tokens += 1
+        return self.sink_k_cache, self.sink_v_cache, self.k_cache, self.v_cache
+
+
 def test_batch():
     cache = CascadingSinkCacheTriton(window_length=WIND,
                                      num_sink_tokens=NSINK,
@@ -1672,14 +1734,152 @@ def test_against_reference():
     print(f"{slow_times=} {fast_times=}")
 
 
+def test_pows():
+    cache = CascadingSinkCacheTriton(window_length=WIND,
+                                     num_sink_tokens=NSINK,
+                                     max_batch_size=N,
+                                     heads=HEAD,
+                                     dim=HID,
+                                     cascade_func="pow3",
+                                     max_seq_len=MAX_SEQ,
+                                     device=DEVICE,
+                                     dtype=DTYPE)
+
+    with torch.no_grad():
+        for i in range(6000):
+            print(f"{'='*50}")
+            k, v = torch.ones(N, HEAD, 1, HID, device=DEVICE, dtype=DTYPE) * (
+                i + 1), torch.ones(N, HEAD, 1, HID, device=DEVICE,
+                                   dtype=DTYPE) * (i + 1)
+
+            # ============================================================================================
+            k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache.update(
+                k, v)
+
+            print(
+                f"fast from mdoel out {pos.size()=} {pos_nosink.size()=} {k.size()=} {k_nosink.size()=}"
+            )
+            idx = 0
+            pos, mask, sink_mask, pos_nosink = pos[idx], mask[
+                idx, 0], sink_mask[idx, 0], pos_nosink[idx]
+
+            # print(f"{k.size()=}")
+            # print(f"{k=}")
+            # print(f"{k[idx:idx+1].view(-1)=}\n{pos=}\n{sink_mask=}")
+            k, v = torch.cat((k, k_nosink), dim=-2), torch.cat((v, v_nosink),
+                                                               dim=-2)
+            print(f"fast {pos.size()=} {pos_nosink.size()=}")
+            pos = torch.cat((pos, pos_nosink), dim=-1)
+
+            # print(f"{k[0, 0, :,  0]=}")
+            mask = torch.cat((sink_mask, mask), dim=-1)
+
+            n = (mask == 0).sum()
+            k, v = k[idx:idx + 1, :, :n], v[idx:idx + 1, :, :n]
+            argsort = torch.argsort(pos[:n])
+            # print(
+            #     f"fast: {mask=}\n{k[:, :].reshape(-1)=}\n{v[:, :].reshape(-1)=}"
+            # )
+
+            # print(f"before sort: \n{k.reshape(-1)=}\n{pos.reshape(-1)=}")
+
+            k, v = k[:, :, argsort], v[:, :, argsort]
+
+            print(f"out: {k=}")
+
+
+def bench_against_naive():
+    naive = SinkAttentionNaive(4, 1024).cuda()
+
+    dev = f"cuda:0"
+    cache = CascadingSinkCacheTriton(window_length=1024 // 1,
+                                     num_sink_tokens=4,
+                                     max_batch_size=8,
+                                     heads=32,
+                                     dim=128,
+                                     max_seq_len=1024,
+                                     device=dev,
+                                     dtype=torch.float32)
+
+    cache_cascade = CascadingSinkCacheTriton(window_length=1024 // 4,
+                                             num_sink_tokens=4,
+                                             max_batch_size=8,
+                                             heads=32,
+                                             dim=128,
+                                             max_seq_len=1024,
+                                             device=dev,
+                                             dtype=torch.float32)
+
+    naive_times, fast_times, cascade_times = [], [], []
+    for i in range(4096 + 100):
+        k = torch.randn(8, 32, 1, 128).cuda()
+        v = torch.randn(8, 32, 1, 128).cuda()
+        attn_score = torch.randn(8, 32, 1024).cuda()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        sink_k, sink_v, k_cache, v_cache = naive(k, v)
+        end.record()
+        torch.cuda.synchronize()
+        elapsed = start.elapsed_time(end)
+        naive_times.append(elapsed)
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache_cascade.update(
+            k, v)
+        cache_cascade.update_attention_scores(attn_score)
+        end.record()
+        torch.cuda.synchronize()
+        elapsed = start.elapsed_time(end)
+        cascade_times.append(elapsed)
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache.update(
+            k, v)
+        end.record()
+        torch.cuda.synchronize()
+        elapsed = start.elapsed_time(end)
+        fast_times.append(elapsed)
+
+    naive_mean = sum(naive_times[100:]) / len(naive_times[100:])
+    fast_mean = sum(fast_times[100:]) / len(fast_times[100:])
+    cascade_mean = sum(cascade_times[100:]) / len(cascade_times[100:])
+    print(f"{naive_mean=} {fast_mean=} {cascade_mean=}")
+
+
 if __name__ == '__main__':
-    N = 128
+    # N = 128
+    # HID = 128
+    # NSINK = 4
+    # WIND = 32
+    # HEAD = 16
+    # MAX_SEQ = 128
+    # DEVICE = "cuda:7"
+    # DTYPE = torch.float32
+
+    # llama7b settings
+    # N = 128
+    # HID = 128
+    # NSINK = 4
+    # WIND = 2048 // 4
+    # HEAD = 32
+    # MAX_SEQ = 2048
+    # DEVICE = "cuda:3"
+    # DTYPE = torch.float16
+
+    # toy settings
+    N = 1
     HID = 128
     NSINK = 4
-    WIND = 32
-    HEAD = 16
-    MAX_SEQ = 128
-    DEVICE = "cuda:0"
+    WIND = 512
+    HEAD = 32
+    MAX_SEQ = 2048
+    DEVICE = "cuda:3"
     DTYPE = torch.float32
 
     # k = torch.arange(27 * 3).reshape(3, 3, 3, 3).contiguous().cuda()
@@ -1687,5 +1887,8 @@ if __name__ == '__main__':
     # loaded = TestFunc.apply(k)
     # print(f"{loaded=}")
 
-    test_against_reference()
+    # test_pows()
+    # test_against_reference()
+
+    bench_against_naive()
     # test_batch()

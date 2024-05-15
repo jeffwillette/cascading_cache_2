@@ -335,6 +335,18 @@ class LlamaMLP(nn.Module):
         return down_proj
 
 
+def repeat_mask(mask: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen = mask.shape
+    if n_rep == 1:
+        return mask
+    mask = mask[:, :, None, :].expand(batch, num_key_value_heads, n_rep, slen)
+    return mask.reshape(batch, num_key_value_heads * n_rep, slen)
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -504,14 +516,14 @@ class LlamaAttention(nn.Module):
         )
 
     # @torch.compile
-    def qkv(self, x, size):
+    def qkv(self, x, size, kv_size):
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
         q = q.view(*size).transpose(1, 2)
-        k = k.view(*size).transpose(1, 2)
-        v = v.view(*size).transpose(1, 2)
+        k = k.view(*kv_size).transpose(1, 2)
+        v = v.view(*kv_size).transpose(1, 2)
         return q, k, v
 
     # @torch.compile
@@ -548,6 +560,24 @@ class LlamaAttention(nn.Module):
 
         out = scores[:, :, :, :sink_k.size(-2)] @ sink_v
         out += scores[:, :, :, sink_k.size(-2):] @ v
+
+        if torch.distributed.is_initialized():
+            lst = [
+                torch.zeros_like(scores) for _ in range(self.config.world_size)
+            ]
+            torch.distributed.all_gather(lst, scores)
+            if self.config._head_reduction == "mean":
+                scores = torch.cat(lst, dim=1).mean(dim=1, keepdim=True)
+            elif self.config._head_reduction == "max":
+                scores = torch.cat(lst, dim=1).amax(dim=1, keepdim=True)
+            elif self.config._head_reduction == "median":
+                scores = torch.cat(lst, dim=1).median(dim=1,
+                                                      keepdim=True).values
+            elif self.config._head_reduction == "none":
+                pass
+            else:
+                raise ValueError(
+                    f"unknown head reduction: {self.config.head_reduction=}")
 
         cache.update_attention_scores(scores[:, :, :, sink_k.size(-2):], 0)
 
@@ -588,7 +618,8 @@ class LlamaAttention(nn.Module):
         # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         query_states, key_states, value_states = self.qkv(
-            hidden_states, (bsz, q_len, self.num_heads, self.head_dim))
+            hidden_states, (bsz, q_len, self.num_heads, self.head_dim),
+            (bsz, q_len, self.num_key_value_heads, self.head_dim))
 
         # In case static cache is used, it is an instance attribute.
         past_key_value = getattr(self, "past_key_value", past_key_value)
@@ -616,6 +647,7 @@ class LlamaAttention(nn.Module):
 
             sink_key_states = self.rope(sink_key_states, sink_pos)
 
+            sink_mask = repeat_mask(sink_mask, self.num_key_value_groups)
             sink_key_states = repeat_kv(sink_key_states,
                                         self.num_key_value_groups)
             sink_value_states = repeat_kv(sink_value_states,
@@ -627,6 +659,7 @@ class LlamaAttention(nn.Module):
             # print(f"{k_states.size()=} {key_pos.size()=} {key_pos=}")
             k_states = self.rope(k_states, key_pos)
 
+            mask = repeat_mask(mask, self.num_key_value_groups)
             k_states = repeat_kv(k_states, self.num_key_value_groups)
             v_states = repeat_kv(v_states, self.num_key_value_groups)
 
@@ -681,7 +714,8 @@ class LlamaAttention(nn.Module):
         # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         query_states, key_states, value_states = self.qkv(
-            hidden_states, (bsz, q_len, self.num_heads, self.head_dim))
+            hidden_states, (bsz, q_len, self.num_heads, self.head_dim),
+            (bsz, q_len, self.num_key_value_heads, self.head_dim))
 
         # In case static cache is used, it is an instance attribute.
         past_key_value = getattr(self, "past_key_value", past_key_value)
@@ -698,6 +732,7 @@ class LlamaAttention(nn.Module):
 
         sink_key_states = self.rope(sink_key_states, sink_pos)
 
+        sink_mask = repeat_mask(sink_mask, self.num_key_value_groups)
         sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
         sink_value_states = repeat_kv(sink_value_states,
                                       self.num_key_value_groups)
@@ -707,6 +742,7 @@ class LlamaAttention(nn.Module):
                                keepdim=True)
         key_states = self.rope(key_states, key_pos)
 
+        mask = repeat_mask(mask, self.num_key_value_groups)
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -1632,12 +1668,14 @@ class LlamaModel(LlamaPreTrainedModel):
         max_seq_len = self.config._window
 
         for i, decoder_layer in enumerate(self.layers):
-            print(f"init cache for layer {i=} {world_size=}")
+            print(
+                f"init cache for layer {i=} {world_size=} {self.config=} {self.config._cascade_func=}"
+            )
             cache = CascadingSinkCache(
                 window,
                 num_sink_tokens=self.config._sinks,
                 max_batch_size=self.config._batch_size,
-                heads=self.config.num_attention_heads // world_size,
+                heads=self.config.num_key_value_heads // world_size,
                 dim=self.config.hidden_size // self.config.num_attention_heads,
                 max_seq_len=max_seq_len,
                 dtype=torch.float16,
@@ -2022,10 +2060,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                     past_key_values.get_max_length(), device=input_ids.device)
                                     if past_key_values.get_max_length()
                                     is not None else None)
-
-                print(
-                    f"{max_cache_length=} {past_length=} {past_key_values.get_seq_length()=} {cache_position=}"
-                )
 
                 cache_length = past_length if max_cache_length is None else torch.min(
                     max_cache_length, past_length)

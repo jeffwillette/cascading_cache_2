@@ -4,8 +4,9 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 
-PREFIX = "There is important info hidden inside a lot of irrelevant text. Find it and memorize them. I will quiz you about the the important information. "
-FILLER_TEXT = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
+# PREFIX = "There is important info hidden inside a lot of irrelevant text. Find the important info and memorize it. I will quiz you about the the important information. "
+PREFIX = "There is a pass key hidden inside a lot of irrelevant text. Find the pass key and memorize it. I will quiz you about the the pass key. "
+FILLER_TEXT = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. Remember the pass key."
 QUERY = "What is the pass key? The pass key is "
 
 
@@ -37,7 +38,10 @@ def gen_text():
         query_len = len(QUERY[:-1].split(" "))
 
         inputs, targets = [], []
-        prompt_lens = [1000, 2000, 4000, 8000, 16000, 32000, 64000]
+        # prompt_lens = [2000, 4000, 8000, 16000, 32000, 64000]
+        prompt_lens = [2000, 4000, 8000, 16000, 32000]
+        # prompt_lens.reverse()
+
         for l in prompt_lens:
             n_fillers = (l - prefix_len - query_len) // filler_len + 1
             for i in range(50):
@@ -49,7 +53,7 @@ def gen_text():
                 key_phrase = interpolate_passkey(k)
                 target = f"{k}"
 
-                insert_loc = np.random.randint(2, len(text) - 1)
+                insert_loc = np.random.randint(2, (len(text) - 1) // 2)
                 text = text[:insert_loc] + \
                     [key_phrase] + text[insert_loc:] + [QUERY]
 
@@ -154,6 +158,10 @@ if __name__ == '__main__':
     import transformers
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         'togethercomputer/LLaMA-2-7B-32K')
+
+    token_prefix = tokenizer(PREFIX, return_tensors="pt",
+                             truncation=False).input_ids
+    print(f"{token_prefix.size()=}")
     ds = Passkey(tokenizer)
 
     print(f"{len(ds)=}")

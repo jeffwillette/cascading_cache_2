@@ -122,6 +122,12 @@ def load_model(args):
         'qwen7b-chat': 'Qwen/Qwen1.5-7B-Chat',
         'qwen0.5b': 'Qwen/Qwen1.5-0.5B',
         'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B',
+        'llama3-8b-instruct':
+        "/d1/dataset/llama/models/llama_v3/Meta-Llama-3-8B-Instruct",
+        'llama3-8b': 'meta-llama/Meta-Llama-3-8B',
+        'llama3-70b-instruct':
+        "/d1/dataset/llama/models/llama_v3/Meta-Llama-3-70B-Instruct",
+        'llama2-70b': "/d1/dataset/llama/models/llama_v2/llama-2-70b",
     }
 
     assert args.model in MODELS, MODELS.keys()
@@ -129,6 +135,10 @@ def load_model(args):
 
     # config = LlamaConfig.from_pretrained(model_id,
     #                                      max_position_embeddings=4096 * 2)
+
+    args.local_rank = int(os.getenv('LOCAL_RANK', '0'))
+    args.world_size = int(os.getenv('WORLD_SIZE', '1'))
+
     config = get_config(model_id)
 
     config._attn_implementation = config.attn_implementation = 'eager'
@@ -136,35 +146,54 @@ def load_model(args):
     config._sinks = args.sinks
     config._cascades = args.cascades
     config._window = args.window
+    config.world_size = args.world_size
     config._cascade_func = args.cascade_func
     config._head_reduction = args.head_reduction
-    args.infer_dtype = get_dtype(model_id)
 
     print(f"{config=}")
 
-    from_pretrained_kwargs = dict(
-        config=config,
-        # device_map={"": device},
-        device_map=None,
-        # quantization_config=transformers.BitsAndBytesConfig(
-        #     load_in_4bit=True,
-        #     bnb_4bit_compute_dtype=infer_dtype,
-        #     bnb_4bit_use_double_quant=True,
-        #     bnb_4bit_quant_type="nf4",
-        #     llm_int8_skip_modules=[
-        #         "sse_q",
-        #         "sse_k",
-        #         "sse_v",
-        #         "slots",
-        #         "norm_slots",
-        #         "norm_after",
-        #         # "input_layernorm",
-        #         # "post_attention_layernorm",
-        #         # "norm",
-        #     ]),
-        torch_dtype=args.infer_dtype,
-        trust_remote_code=True,
-    )
+    if "70B" not in model_id or "70b" not in model_id:
+        args.infer_dtype = get_dtype(model_id)
+        from_pretrained_kwargs = dict(
+            config=config,
+            # device_map={"": device},
+            device_map=None,
+            # quantization_config=transformers.BitsAndBytesConfig(
+            #     load_in_4bit=True,
+            #     bnb_4bit_compute_dtype=infer_dtype,
+            #     bnb_4bit_use_double_quant=True,
+            #     bnb_4bit_quant_type="nf4",
+            #     llm_int8_skip_modules=[
+            #         "sse_q",
+            #         "sse_k",
+            #         "sse_v",
+            #         "slots",
+            #         "norm_slots",
+            #         "norm_after",
+            #         # "input_layernorm",
+            #         # "post_attention_layernorm",
+            #         # "norm",
+            #     ]),
+            torch_dtype=args.infer_dtype,
+            trust_remote_code=True,
+        )
+    else:
+        args.infer_dtype = get_dtype(model_id)
+        from_pretrained_kwargs = dict(
+            config=config,
+            # device_map={"": device},
+            device_map="auto",
+            # load_in_4bit=True,
+            # device_map=None,
+            quantization_config=transformers.BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=args.infer_dtype,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            ),
+            torch_dtype=args.infer_dtype,
+            trust_remote_code=True,
+        )
 
     if args.method == "vanilla":
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -180,9 +209,6 @@ def load_model(args):
 
     # pipe = pipeline("text2text-generation", model=model_id, device=local_rank)
     # Initialize the DeepSpeed-Inference engine
-
-    args.local_rank = int(os.getenv('LOCAL_RANK', '0'))
-    args.world_size = int(os.getenv('WORLD_SIZE', '1'))
 
     if args.lora_r > 0 and args.checkpoint is not None:
         print("LoRA init")

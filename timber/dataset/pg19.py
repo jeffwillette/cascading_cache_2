@@ -38,6 +38,20 @@ def cache_tokenized(dataset, tokenizer):
         return cache_tokenized(dataset, tokenizer)
 
 
+# def cache_tokenized(dataset, tokenizer):
+#     print(tokenizer, vars(tokenizer))
+#     os.makedirs('./cache/pg19', exist_ok=True)
+#
+#     name = tokenizer.name_or_path.replace("/", "-")
+#     cache_path = f'./cache/pg19/{name}-tokenized.pth'
+#
+#     text = []
+#     for i in range(len(dataset)):
+#         entry = dataset[i]
+#         print(f"{i} {entry['short_book_title']}")
+#         # text.append(entry['text'])
+
+
 class PG19Streaming(Dataset):
 
     def __init__(self, tokenizer, batch_size=24):
@@ -103,12 +117,21 @@ if __name__ == '__main__':
         'togethercomputer/LLaMA-2-7B-32K')
     ds = PG19Streaming(tokenizer)
 
-    # print(f"{len(ds)=}")
-    # for i, (x, y) in enumerate(ds):
-    #     print(f"{i} {x.size()=} {y.size()=}")
+    print(f"{len(ds)=}")
+    for i, (x, y) in enumerate(ds):
+        print(f"{i} {x.size()=} {y.size()=}")
 
     print("Qwen")
     tokenizer = transformers.AutoTokenizer.from_pretrained('Qwen/Qwen1.5-7B')
+    ds = PG19Streaming(tokenizer)
+
+    print("Qwen14b")
+    tokenizer = transformers.AutoTokenizer.from_pretrained('Qwen/Qwen1.5-14B')
+    ds = PG19Streaming(tokenizer)
+
+    print("Llama3")
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        'meta-llama/Meta-Llama-3-8B')
     ds = PG19Streaming(tokenizer)
 
     # print(f"{len(ds)=}")

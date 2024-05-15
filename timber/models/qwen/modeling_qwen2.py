@@ -374,6 +374,24 @@ class Qwen2Attention(nn.Module):
         out = scores[:, :, :, :sink_k.size(-2)] @ sink_v
         out += scores[:, :, :, sink_k.size(-2):] @ v
 
+        if torch.distributed.is_initialized():
+            lst = [
+                torch.zeros_like(scores) for _ in range(self.config.world_size)
+            ]
+            torch.distributed.all_gather(lst, scores)
+            if self.config._head_reduction == "mean":
+                scores = torch.cat(lst, dim=1).mean(dim=1, keepdim=True)
+            elif self.config._head_reduction == "max":
+                scores = torch.cat(lst, dim=1).amax(dim=1, keepdim=True)
+            elif self.config._head_reduction == "median":
+                scores = torch.cat(lst, dim=1).median(dim=1,
+                                                      keepdim=True).values
+            elif self.config._head_reduction == "none":
+                pass
+            else:
+                raise ValueError(
+                    f"unknown head reduction: {self.config.head_reduction=}")
+
         cache.update_attention_scores(scores[:, :, :, sink_k.size(-2):], 0)
 
         # print(f"{attn_output.size()=}")
