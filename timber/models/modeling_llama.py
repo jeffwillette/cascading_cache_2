@@ -542,6 +542,7 @@ class LlamaAttention(nn.Module):
         v,
         cache,
         size,
+        output_attentions=False,
         include_o=True,
     ):
         scale = 1 / np.sqrt(q.size(-1))
@@ -557,6 +558,26 @@ class LlamaAttention(nn.Module):
 
         total_out = torch.cat((sink_out, out), dim=-1)
         scores = total_out.softmax(dim=-1)
+
+        out_attn = None
+        if output_attentions:
+            og_pos = torch.cat(
+                (torch.arange(sink_out.size(-1),
+                              device=sink_out.device), cache.og_pos[0, 0]))
+
+            out_attn = torch.zeros(out.size(0),
+                                   out.size(1),
+                                   1,
+                                   max(og_pos.amax() + 1, og_pos.size(0)),
+                                   device=out.device,
+                                   dtype=out.dtype)
+
+            og_pos = og_pos.view(1, 1, 1, -1).repeat(out.size(0), out.size(1),
+                                                     1, 1)
+
+            # print(f"{og_pos.size()=} {scores.size()=} {out_attn.size()=}")
+            out_attn.scatter_(-1, og_pos, scores)
+            # print(f"out_attn: {out_attn[0, 0, 0]=}")
 
         out = scores[:, :, :, :sink_k.size(-2)] @ sink_v
         out += scores[:, :, :, sink_k.size(-2):] @ v
@@ -587,7 +608,7 @@ class LlamaAttention(nn.Module):
         if include_o:
             out = self.o(out)
 
-        return out
+        return out, out_attn
 
     # @torch.compile
     def rope(self, x, pos):
@@ -752,7 +773,7 @@ class LlamaAttention(nn.Module):
         #     f"{query_states.size()=} {sink_key_states.size()=} {sink_value_states.size()=}"
         # )
 
-        out = self.qkto(
+        out, attentions = self.qkto(
             query_states,
             sink_key_states,
             sink_mask,
@@ -763,9 +784,10 @@ class LlamaAttention(nn.Module):
             past_key_value,
             (bsz, q_len,
              -1),  # needs to be -1 instead of hidden size for deepspeed
+            output_attentions,
         )
 
-        return out, None, past_key_value
+        return out, attentions, past_key_value
 
     def forward_original(
         self,

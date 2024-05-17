@@ -169,6 +169,10 @@ def _update_kv_cache(
     stride_p_n,
     stride_p_h,
     stride_p_t,
+    OG_POS,
+    stride_op_n,
+    stride_op_h,
+    stride_op_t,
 
     # tracker variables
     STORED_TOKENS,
@@ -184,6 +188,7 @@ def _update_kv_cache(
     HID,
     NUM_SINK,
     WINDOW_SIZE,
+    real_token_idx,
 
     # kernel constants
     WINDOW_SIZE_CONST: tl.constexpr,
@@ -270,6 +275,15 @@ def _update_kv_cache(
                          value=score.to(dtype)
                 )
 
+                # print("store token: in first add: ", real_token_idx)
+                tl.store(
+                    OG_POS + \
+                     idx_n.to(IDTYPE) * stride_op_n + \
+                     idx_h.to(IDTYPE) * stride_op_h + \
+                     t.to(IDTYPE) * stride_op_t,
+                     value=real_token_idx.to(IDTYPE)
+                )
+
                 tl.store(
                     MASK + \
                          idx_n.to(IDTYPE) * stride_m_n + \
@@ -310,11 +324,16 @@ def _update_kv_cache(
                     t.to(IDTYPE) * stride_ck_t + \
                     idx_hid.to(IDTYPE) * stride_ck_hid
 
+                real_pos_adds = idx_n.to(IDTYPE) * stride_op_n + \
+                        idx_h.to(IDTYPE) * stride_op_h + \
+                        t.to(IDTYPE) * stride_op_t
+
                 # we need to evict
                 # 1. find the oldest token (start point), remove it and
                 #    set input_key_state at that location
                 next_key = tl.load(CACHE_K + kv_adds, mask=mask_hid, other=0)
                 next_value = tl.load(CACHE_V + kv_adds, mask=mask_hid, other=0)
+                next_real_pos_idx = tl.load(OG_POS + real_pos_adds)
 
                 sc_shift = idx_n.to(IDTYPE) * stride_cs_n + \
                     idx_h.to(IDTYPE) * stride_cs_h + \
@@ -328,12 +347,18 @@ def _update_kv_cache(
                          value=value.to(dtype),
                          mask=mask_hid)
 
+                # print("store token: in evict: ", real_token_idx)
+                tl.store(OG_POS + real_pos_adds,
+                         value=real_token_idx.to(IDTYPE))
+
                 tl.store(CACHE_S + sc_shift, value=score.to(dtype))
 
                 # set the evicted token variables for the next iteration
                 key = next_key.to(dtype)
                 value = next_value.to(dtype)
                 score = next_score.to(dtype)
+                # print("reset token idx variable: in evict: ", real_token_idx)
+                real_token_idx = next_real_pos_idx.to(tl.int32)
 
                 # 2. rotate the start index.
                 tl.store(
@@ -384,6 +409,15 @@ def _update_kv_cache(
                 tl.store(CACHE_V + kv_adds,
                          value=value.to(dtype),
                          mask=mask_hid)
+
+                # print("store in eager add: ", real_token_idx)
+                tl.store(
+                    OG_POS + \
+                        idx_n.to(IDTYPE) * stride_ck_n + \
+                        idx_h.to(IDTYPE) * stride_ck_h + \
+                        t.to(IDTYPE) * stride_ck_t,
+                    value=real_token_idx.to(IDTYPE),
+                )
 
                 tl.store(
                     CACHE_S + \
@@ -470,6 +504,15 @@ def _update_kv_cache(
                              value=value.to(dtype),
                              mask=mask_hid)
 
+                    # print("store in token swap: ", real_token_idx)
+                    tl.store(
+                        OG_POS + \
+                            idx_n.to(IDTYPE) * stride_op_n + \
+                            idx_h.to(IDTYPE) * stride_op_h + \
+                            t.to(IDTYPE) * stride_op_t,
+                        value=real_token_idx.to(IDTYPE),
+                    )
+
                     tl.store(CACHE_S + cs_shift, value=score)
 
                     _update_positional_idx(
@@ -508,12 +551,14 @@ class SinkCacheFunc(Function):
         cache_s: Tensor,
         mask: Tensor,
         pos: Tensor,
+        og_pos: Tensor,
         do_cache: Tensor,
         stored_tokens: Tensor,
         start_indices: Tensor,
         stored_sinks: Tensor,
         num_sink: int,
         window_size: int,
+        real_token_idx: int,
     ):
         assert k.ndim == 4
         assert v.ndim == 4
@@ -597,6 +642,8 @@ class SinkCacheFunc(Function):
                     *mask.stride(),
                     pos,
                     *pos.stride(),
+                    og_pos,
+                    *og_pos.stride(),
                     stored_tokens,
                     start_indices,
                     *stored_tokens.stride(),
@@ -606,6 +653,7 @@ class SinkCacheFunc(Function):
                     HID,
                     num_sink,
                     window_size,
+                    real_token_idx,
                     window_size,
                     CASCADES,
                     BLOCK_HID,
@@ -641,12 +689,14 @@ def _sink_cache(
     cache_s: Tensor,
     mask: Tensor,
     pos: Tensor,
+    og_pos: Tensor,
     do_cache: Tensor,
     stored_tokens: Tensor,
     start_indices: Tensor,
     stored_sinks: Tensor,
     num_sink,
     window_size,
+    real_token_idx,
 ):
     N, H, K, HID = k.shape
 
@@ -663,12 +713,14 @@ def _sink_cache(
         cache_s,
         mask,
         pos,
+        og_pos,
         do_cache,
         stored_tokens,
         start_indices,
         stored_sinks,
         num_sink,
         window_size,
+        real_token_idx,
     )
 
 
@@ -685,12 +737,14 @@ def sink_cache(
     cache_s: Tensor,
     mask: Tensor,
     pos: Tensor,
+    og_pos: Tensor,
     do_cache: Tensor,
     stored_tokens: Tensor,
     start_indices: Tensor,
     stored_sinks: Tensor,
     num_sink,
     window_size,
+    real_token_idx,
     BENCHMARK: bool = False,
 ):
     if BENCHMARK:
@@ -711,12 +765,14 @@ def sink_cache(
         cache_s,
         mask,
         pos,
+        og_pos,
         do_cache,
         stored_tokens,
         start_indices,
         stored_sinks,
         num_sink=num_sink,
         window_size=window_size,
+        real_token_idx=real_token_idx,
     )
 
     if BENCHMARK:
@@ -769,6 +825,7 @@ class CascadingSinkCacheTriton(SinkCache):
         self.sink_keys: torch.Tensor
         self.sink_values: torch.Tensor
         self.sink_mask: torch.Tensor
+        self.og_pos: torch.Tensor
 
         self.bh = self.max_batch_size * self.heads
 
@@ -794,6 +851,7 @@ class CascadingSinkCacheTriton(SinkCache):
         self.score_cache.zero_()
         self.sink_keys.zero_()
         self.sink_values.zero_()
+        self.og_pos.zero_()
         self.mask.fill_(torch.finfo(dtp).min)
         self.sink_mask.fill_(torch.finfo(dtp).min)
 
@@ -871,6 +929,12 @@ class CascadingSinkCacheTriton(SinkCache):
         # each return in order to grab the correct positional encoding indices.
         self.register_buffer(
             "pos",
+            torch.zeros(self.max_seq_len, device=dev,
+                        dtype=torch.long).reshape(1, -1).repeat(
+                            self.max_batch_size, self.heads, 1))
+
+        self.register_buffer(
+            "og_pos",
             torch.zeros(self.max_seq_len, device=dev,
                         dtype=torch.long).reshape(1, -1).repeat(
                             self.max_batch_size, self.heads, 1))
@@ -975,12 +1039,14 @@ class CascadingSinkCacheTriton(SinkCache):
             self.score_cache,
             self.mask,
             self.pos,
+            self.og_pos,
             self.do_cache,
             self.stored_tokens,
             self.start_indices,
             self.stored_sinks,
             self.num_sink_tokens,
             self.window_length,
+            self._seen_tokens - 1,
         )
 
         pos_shift = self.num_sink_tokens if self._seen_tokens > self.num_sink_tokens else 0
@@ -1687,6 +1753,7 @@ def test_against_reference():
             print(
                 f"fast from mdoel out {pos.size()=} {pos_nosink.size()=} {k.size()=} {k_nosink.size()=}"
             )
+            print(f"og pos: {cache.og_pos[0, 0]=}")
             idx = 0
             pos, mask, sink_mask, pos_nosink = pos[idx], mask[
                 idx, 0], sink_mask[idx, 0], pos_nosink[idx]
@@ -1874,13 +1941,13 @@ if __name__ == '__main__':
 
     # toy settings
     N = 1
-    HID = 128
+    HID = 1
     NSINK = 4
-    WIND = 512
-    HEAD = 32
-    MAX_SEQ = 2048
+    WIND = 8
+    HEAD = 1
+    MAX_SEQ = 32
     DEVICE = "cuda:3"
-    DTYPE = torch.float32
+    DTYPE = torch.float16
 
     # k = torch.arange(27 * 3).reshape(3, 3, 3, 3).contiguous().cuda()
     # print(f"{k=}")
@@ -1888,7 +1955,7 @@ if __name__ == '__main__':
     # print(f"{loaded=}")
 
     # test_pows()
-    # test_against_reference()
+    test_against_reference()
 
-    bench_against_naive()
+    # bench_against_naive()
     # test_batch()

@@ -32,7 +32,6 @@ def get_injection_policy(model_id):
                 'mlp.down_proj',
                 'self_attn.o_proj',
             ),
-            # Qwen2ForCausalLM: ("lm_head", ),
         }
     else:
         raise ValueError()
@@ -40,7 +39,11 @@ def get_injection_policy(model_id):
 
 def job_ppl_pg19(args, model, tokenizer, device):
     model.model.setup_caches(args.world_size)
-    if args.world_size == 1:
+    output_attentions = False
+    if "attention-matrix-plot" in args.comment:
+        model = model.to(args.infer_dtype).cuda()
+        output_attentions = True
+    elif args.world_size == 1:
         model = model.to(args.infer_dtype).cuda()
         model = torch.compile(model, mode="max-autotune", fullgraph=False)
     else:
@@ -92,12 +95,30 @@ def job_ppl_pg19(args, model, tokenizer, device):
         print(
             f"starting batch of books: {input_ids.size()=} {target_ids.size()=}"
         )
+        ATTN_ROWS_LIMIT = 8192
+        attn_rows = []
         with tqdm(range(x.size(1) - 1), ncols=150) as pbar:
             for i in pbar:
                 with torch.no_grad():
                     inp = input_ids[:, i:i + 1]
                     # use cache false means to use static cascading cache inside the model
-                    output = model(inp, use_cache=False, reset=i == 0)
+                    output = model(inp,
+                                   use_cache=False,
+                                   reset=i == 0,
+                                   output_attentions=output_attentions)
+
+                    if output_attentions:
+                        attn_rows.append([
+                            a.cpu().amax(dim=1).to(torch.float8_e4m3fn)
+                            for a in output.attentions
+                        ])
+                        print(f"{len(attn_rows)=}")
+                        if i == ATTN_ROWS_LIMIT - 1:
+                            torch.save(
+                                attn_rows,
+                                f"./attention_visualization/book-{j}-window-{args.window}-cascades-{args.cascades}.pt"
+                            )
+                            break
 
                     logits = output.logits[:, -1:]
                     targets = target_ids[:, i + 1:i + 2]
