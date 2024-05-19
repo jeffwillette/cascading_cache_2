@@ -1000,6 +1000,8 @@ class CascadingSinkCacheTriton(SinkCache):
         elif self.head_reduction == "median":
             attention_scores = attention_scores.median(
                 dim=1, keepdim=True).values.squeeze(2)
+        elif self.head_reduction == "independent":
+            attention_scores = attention_scores.squeeze(2)
         elif self.head_reduction == "none":
             pass
         else:

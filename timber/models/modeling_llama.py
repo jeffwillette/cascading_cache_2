@@ -607,7 +607,7 @@ class LlamaAttention(nn.Module):
             elif self.config._head_reduction == "median":
                 scores = torch.cat(lst, dim=1).median(dim=1,
                                                       keepdim=True).values
-            elif self.config._head_reduction == "none":
+            elif self.config._head_reduction in ["none", "independent"]:
                 pass
             else:
                 raise ValueError(
