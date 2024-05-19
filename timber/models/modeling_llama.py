@@ -43,6 +43,8 @@ from transformers.modeling_outputs import (
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
 )
+# from third_party.hyper_attn.models.attention.modeling_chatglm_fast_attention import FastCoreAttention
+from third_party.hyper_attn.models.attention.hyper_attn import HyperAttention
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
@@ -504,6 +506,17 @@ class LlamaAttention(nn.Module):
             # print(f"diff {diff}")
             # return out, None, past_key_value
 
+        elif hasattr(self, "hyper_attn"):
+            return self.forward_hyper_attention(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
         return self.forward_original(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -788,6 +801,97 @@ class LlamaAttention(nn.Module):
         )
 
         return out, attentions, past_key_value
+
+    def forward_hyper_attention(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        if self.config.pretraining_tp > 1:
+            key_value_slicing = (self.num_key_value_heads *
+                                 self.head_dim) // self.config.pretraining_tp
+            query_slices = self.q_proj.weight.split(
+                (self.num_heads * self.head_dim) // self.config.pretraining_tp,
+                dim=0)
+            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+            query_states = [
+                F.linear(hidden_states, query_slices[i])
+                for i in range(self.config.pretraining_tp)
+            ]
+            query_states = torch.cat(query_states, dim=-1)
+
+            key_states = [
+                F.linear(hidden_states, key_slices[i])
+                for i in range(self.config.pretraining_tp)
+            ]
+            key_states = torch.cat(key_states, dim=-1)
+
+            value_states = [
+                F.linear(hidden_states, value_slices[i])
+                for i in range(self.config.pretraining_tp)
+            ]
+            value_states = torch.cat(value_states, dim=-1)
+
+        else:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads,
+                                         self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
+                                     self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
+                                         self.head_dim).transpose(1, 2)
+
+        past_key_value = getattr(self, "past_key_value", past_key_value)
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+            key_states, value_states = past_key_value.update(
+                key_states, value_states)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_output = self.hyper_attn(query_states,
+                                      key_states,
+                                      value_states,
+                                      causal=True)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        if self.config.pretraining_tp > 1:
+            attn_output = attn_output.split(self.hidden_size //
+                                            self.config.pretraining_tp,
+                                            dim=2)
+            o_proj_slices = self.o_proj.weight.split(
+                self.hidden_size // self.config.pretraining_tp, dim=1)
+            attn_output = sum([
+                F.linear(attn_output[i], o_proj_slices[i])
+                for i in range(self.config.pretraining_tp)
+            ])
+        else:
+            attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
 
     def forward_original(
         self,
@@ -1708,6 +1812,24 @@ class LlamaModel(LlamaPreTrainedModel):
 
             decoder_layer.self_attn.past_key_value = cache
 
+    def setup_hyper_attention(self):
+        # adjust the window length of each cascade. The input window length is the max
+        for i, decoder_layer in enumerate(self.layers):
+            # print(f"init hyper attention for layer {i=} {self.config=}")
+
+            min_seq_len = 4096
+            if i < 100:
+                min_seq_len = 32768
+
+            decoder_layer.self_attn.hyper_attn = HyperAttention(
+                input_dim=128,
+                lsh_num_projs=7,
+                block_size=64,
+                sample_size=1024,
+                min_seq_len=min_seq_len,
+                cuda=True,
+            )
+
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
         self,
@@ -1780,8 +1902,8 @@ class LlamaModel(LlamaPreTrainedModel):
             position_ids = cache_position.unsqueeze(0)
 
         causal_mask = None
-        # causal_mask = self._update_causal_mask(attention_mask, inputs_embeds,
-        #                                        cache_position)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds,
+                                               cache_position)
 
         # embed positions
         hidden_states = inputs_embeds

@@ -21,9 +21,7 @@ cd third_party/LongBench-timber/
 
 ## TODO
 
-- specify all training details
-- specify compute requirements
-- describe EMA
+- footnotesize redo to small?
 
 
 ## Note

@@ -149,6 +149,10 @@ def load_model(args):
     config.world_size = args.world_size
     config._cascade_func = args.cascade_func
     config._head_reduction = args.head_reduction
+    config._hyper = args.method == "hyper"
+
+    if args.model == "llama13b_32k":
+        config.max_position_embeddings = 32768
 
     print(f"{config=}")
 
@@ -200,15 +204,14 @@ def load_model(args):
             model_id, **from_pretrained_kwargs)
     elif args.method == "sink":
         model = get_model(model_id, **from_pretrained_kwargs)
+    elif args.method == "hyper":
+        model = get_model(model_id, **from_pretrained_kwargs)
     else:
         raise ValueError("unsupported method")
 
     for m in model.modules():
         if hasattr(m, 'attention_method'):
             m.attention_method = args.method
-
-    # pipe = pipeline("text2text-generation", model=model_id, device=local_rank)
-    # Initialize the DeepSpeed-Inference engine
 
     if args.lora_r > 0 and args.checkpoint is not None:
         print("LoRA init")

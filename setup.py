@@ -6,19 +6,19 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setuptools.setup(
     name="hip_attention",
     version="0.0.1",
-    author="Heejun Lee",
-    author_email="gmlwns5176@gmail.com",
-    description="HiP Attention",
+    author="Jeffrey Willette",
+    author_email="jwillette@kaist.ac.kr",
+    description="Cascading Cache",
     long_description=long_description,
-    long_description_content_type="gmlwns2000/hip-attention",
-    url="https://github.com/gmlwns2000",
+    long_description_content_type="jeffwillette/cascading_cache",
+    url="https://github.com/jeffwillette",
     project_urls={
-        "Bug Tracker": "https://github.com/gmlwns2000",
+        "Bug Tracker": "https://github.com/jeffwillette/cascading_cache",
     },
     classifiers=[
         "Programming Language :: Python :: 3",
     ],
-    package_dir={"timber": "timber"},
-    packages=["timber"],
+    package_dir={"cascading_cache": "cascading_cache"},
+    packages=["cascading_cache"],
     python_requires=">=3.6",
 )

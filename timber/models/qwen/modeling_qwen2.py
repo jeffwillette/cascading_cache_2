@@ -34,6 +34,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from third_party.hyper_attn.models.attention.hyper_attn import HyperAttention
 from timber.models.sink_cache_cascade import CascadingSinkCacheTriton as CascadingSinkCache, SinkCache
 
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
@@ -319,6 +320,17 @@ class Qwen2Attention(nn.Module):
                 **kwargs,
             )
 
+        elif hasattr(self, "hyper_attn"):
+            return self.forward_hyper_attention(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                **kwargs,
+            )
+
         return self.forward_original(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -592,6 +604,71 @@ class Qwen2Attention(nn.Module):
         # print(f"returning single: {out.size()=}")
 
         return out, None, past_key_value
+
+    def forward_hyper_attention(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads,
+                                         self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
+                                     self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
+                                         self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index.")
+            kv_seq_len += past_key_value.get_usable_length(
+                kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_output = self.hyper_attn(query_states,
+                                      key_states,
+                                      value_states,
+                                      causal=True)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
 
     def forward_original(
         self,
@@ -1368,6 +1445,24 @@ class Qwen2Model(Qwen2PreTrainedModel):
             )
 
             decoder_layer.self_attn.past_key_value = cache
+
+    def setup_hyper_attention(self):
+        # adjust the window length of each cascade. The input window length is the max
+        for i, decoder_layer in enumerate(self.layers):
+            # print(f"init hyper attention for layer {i=} {self.config=}")
+
+            min_seq_len = 32
+            if i < 100:
+                min_seq_len = 32768
+
+            decoder_layer.self_attn.hyper_attn = HyperAttention(
+                input_dim=128,
+                lsh_num_projs=7,
+                block_size=64,
+                sample_size=1024,
+                min_seq_len=min_seq_len,
+                cuda=True,
+            )
 
     @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
     def forward(
