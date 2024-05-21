@@ -1,5 +1,5 @@
 [submodule "thrid_party/vllm-timber"]
-	path = thrid_party/vllm-timber
+	path = third_party/vllm-timber
 	url = git@github.com:gmlwns2000/vllm-timber.git
 [submodule "third_party/LongBench-timber"]
 	path = third_party/LongBench-timber

@@ -29,8 +29,8 @@ MODEL=llama3-8b-instruct
 
 for i in "${!GPUS[@]}";
 do 
-    # PYTHONPATH=. deepspeed --include localhost:2,0 --master_port 63280 timber/main/llama_eval.py \
-    PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python timber/main/llama_eval.py \
+    # PYTHONPATH=. deepspeed --include localhost:2,0 --master_port 63280 cascade/main/llama_eval.py \
+    PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
         --model $MODEL \
         --job passkey \
         --method sink \

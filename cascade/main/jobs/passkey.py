@@ -5,10 +5,10 @@ from tqdm import tqdm
 import json
 from aim import Run
 import numpy as np
-from timber.utils import MockRun
-from timber.dataset.passkey import Passkey
+from cascade.utils import MockRun
+from cascade.dataset.passkey import Passkey
 import deepspeed
-from timber.main.jobs.pg19 import get_injection_policy
+from cascade.main.jobs.pg19 import get_injection_policy
 
 
 def job_passkey(args, model, tokenizer, device):

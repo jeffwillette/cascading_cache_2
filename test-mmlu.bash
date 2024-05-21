@@ -9,9 +9,9 @@ CASCADE_FUNC="pow2"
 
 for i in "${!WINDOW[@]}";
 do 
-        # PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python timber/main/llama_eval.py \
-        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 timber/main/llama_eval.py \
-        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,3 --master_port 63290 timber/main/llama_eval.py \
+        # PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python cascade/main/llama_eval.py \
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 cascade/main/llama_eval.py \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,3 --master_port 63290 cascade/main/llama_eval.py \
         --model qwen7b \
         --job mmlu \
         --method sink \
@@ -34,10 +34,10 @@ done
 # HEAD_REDUCTION=mean
 # CASCADE_FUNC="pow2"
 # 
-# # PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python timber/main/llama_eval.py \
+# # PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python cascade/main/llama_eval.py \
 # for i in "${!WINDOW[@]}";
 # do 
-#         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 timber/main/llama_eval.py \
+#         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 cascade/main/llama_eval.py \
 #         --model llama7b \
 #         --job mmlu \
 #         --method sink \
@@ -59,10 +59,10 @@ done
 # HEAD_REDUCTION=mean
 # CASCADE_FUNC="pow2"
 # 
-# # PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python timber/main/llama_eval.py \
+# # PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python cascade/main/llama_eval.py \
 # for i in "${!WINDOW[@]}";
 # do 
-#         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 timber/main/llama_eval.py \
+#         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 cascade/main/llama_eval.py \
 #         --model qwen7b \
 #         --job mmlu \
 #         --method sink \
@@ -81,10 +81,10 @@ done
 # HEAD_REDUCTION=mean
 # CASCADE_FUNC="pow2"
 # 
-# # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3 --master_port 63390 timber/main/llama_eval.py \
+# # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3 --master_port 63390 cascade/main/llama_eval.py \
 # for i in "${!WINDOW[@]}";
 # do 
-#         PYTHONPATH=. CUDA_VISIBLE_DEVICES=7 python timber/main/llama_eval.py \
+#         PYTHONPATH=. CUDA_VISIBLE_DEVICES=7 python cascade/main/llama_eval.py \
 #         --model llama7b \
 #         --job mmlu \
 #         --method vanilla \

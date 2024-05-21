@@ -486,8 +486,6 @@ def _checkpoint_without_reentrant(function,
     weak_holder_list = []
 
     def pack(x):
-        # TODO(varal7): Instead of returning abstract object, we can return things metadata (such as
-        # size, device, ...) to catch certain cases of undeterministic behavior of the forward
         res = Holder()
         weak_holder_list.append(weakref.ref(res))
         return res

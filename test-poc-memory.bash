@@ -13,7 +13,7 @@ MODEL=qwen14b
 
 for i in "${!GPUS[@]}";
 do 
-    PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python timber/main/llama_eval.py \
+    PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
         --model $MODEL \
         --job ppl-memory \
         --method sink \

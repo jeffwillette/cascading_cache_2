@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple, Dict, Any
 import warnings
 import numpy as np
 from torch.nn import functional as F
-from timber.models.cuda_graph import make_graphed_callables
+from cascade.models.cuda_graph import make_graphed_callables
 
 
 class SinkCache(nn.Module):

@@ -11,18 +11,18 @@ from transformers import TextStreamer
 import deepspeed
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
-from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
-from timber.models.qwen.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config
-from timber.utils import seed, get_bench
+from cascade.models.modeling_llama import LlamaForCausalLM, LlamaConfig
+from cascade.models.qwen.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config
+from cascade.utils import seed, get_bench
 
-from timber.main.jobs.bench_single_layer import job_bench_single_layer
-from timber.main.jobs.ppl import job_ppl
-from timber.main.jobs.passkey import job_passkey
-from timber.main.jobs.ppl_memory import job_ppl_memory
-from timber.main.jobs.pg19 import job_ppl_pg19
-# from timber.main.jobs.stream import job_stream
-from timber.main.jobs.mmlu import job_mmlu
-from timber.main.eval_args import eval_args, ArgsType
+from cascade.main.jobs.bench_single_layer import job_bench_single_layer
+from cascade.main.jobs.ppl import job_ppl
+from cascade.main.jobs.passkey import job_passkey
+from cascade.main.jobs.ppl_memory import job_ppl_memory
+from cascade.main.jobs.pg19 import job_ppl_pg19
+# from cascade.main.jobs.stream import job_stream
+from cascade.main.jobs.mmlu import job_mmlu
+from cascade.main.eval_args import eval_args, ArgsType
 
 
 def get_model(model_id, **from_pretrained_kwargs):
@@ -168,12 +168,6 @@ def load_model(args):
             #     bnb_4bit_use_double_quant=True,
             #     bnb_4bit_quant_type="nf4",
             #     llm_int8_skip_modules=[
-            #         "sse_q",
-            #         "sse_k",
-            #         "sse_v",
-            #         "slots",
-            #         "norm_slots",
-            #         "norm_after",
             #         # "input_layernorm",
             #         # "post_attention_layernorm",
             #         # "norm",

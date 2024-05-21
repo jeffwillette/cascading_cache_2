@@ -5,7 +5,7 @@ import copy
 from dataclasses import asdict, dataclass
 from tqdm import tqdm
 from torchmetrics.text.perplexity import Perplexity
-from timber.trainer.scheduler import LinearWarmupCosineAnnealingLR
+from cascade.trainer.scheduler import LinearWarmupCosineAnnealingLR
 from os import PathLike
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -34,13 +34,13 @@ from lightning.pytorch.strategies import DeepSpeedStrategy
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
 
-from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig, LlamaDecoderLayer
+from cascade.models.modeling_llama import LlamaForCausalLM, LlamaConfig, LlamaDecoderLayer
 
-from timber.utils import seed
-from timber.dataset.labdataset import LabDataset
-from timber.dataset.booksum import BookSumDataset
-from timber.dataset.alpaca import AlpacaDataset
-from timber.dataset.openwebtext import OpenWebTextDataset
+from cascade.utils import seed
+from cascade.dataset.labdataset import LabDataset
+from cascade.dataset.booksum import BookSumDataset
+from cascade.dataset.alpaca import AlpacaDataset
+from cascade.dataset.openwebtext import OpenWebTextDataset
 from torch.utils.data import DataLoader, random_split
 
 torch.set_float32_matmul_precision('high')
@@ -172,7 +172,7 @@ class LabDataModule(pl.LightningDataModule):
 
 def load_model(
     train_config: TrainConfig = None,
-    method='timber',
+    method='sink',
     device='cpu',
 ):
     if train_config.using_fsdp:
@@ -203,12 +203,6 @@ def load_model(
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         llm_int8_skip_modules=[
-            "sse_q",
-            "sse_k",
-            "sse_v",
-            "slots",
-            "norm_slots",
-            "norm_after",
             # "input_layernorm",
             # "post_attention_layernorm",
             # "norm",
@@ -491,9 +485,7 @@ def main(config: TrainConfig):
                                static_graph=False)
 
     filename = "" if config.comment == "" else f"{config.comment}-"
-    if config.method == 'timber':
-        filename += f'llama32k-{config.dataset}-{config.seq_len}-bq{config.block_size_q}-bk{config.block_size_k}-k{config.k}-{{epoch:02d}}-{{step}}'
-    elif config.method == 'none':
+    if config.method == 'none':
         filename += f'llama32k-{config.dataset}-{config.seq_len}-{{epoch:02d}}-{{step}}'
     elif config.method == 'reformer':
         filename += f'llama32k-{config.method}-{config.dataset}-{config.seq_len}-k{config.k}-{{epoch:02d}}-{{step}}'

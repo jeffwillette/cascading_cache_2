@@ -9,8 +9,8 @@ import tqdm
 import numpy as np
 import deepspeed
 
-from timber.utils import seed, get_bench
-from timber.main.jobs.pg19 import get_injection_policy
+from cascade.utils import seed, get_bench
+from cascade.main.jobs.pg19 import get_injection_policy
 
 MMLU_FORMAT = """> The following are multiple choice questions (with answers) about {subject_name}.
 
@@ -45,23 +45,23 @@ The examples of similar questions are:
 I want to know the answer to question 1. The answer ({answer_placeholder}) to the question I am interested in is:"""
 
 MMLU_STEM = [
-    # 'abstract_algebra',
-    # 'anatomy',
-    # 'astronomy',
-    # 'college_biology',
-    # 'college_chemistry',
-    # 'college_computer_science',
-    # 'college_mathematics',
-    # 'college_physics',
-    # 'computer_security',
-    # 'conceptual_physics',
-    # 'electrical_engineering',
-    # 'elementary_mathematics',
-    # 'high_school_biology',
-    # 'high_school_chemistry',
-    # 'high_school_computer_science',
-    # 'high_school_mathematics',
-    # 'high_school_physics',
+    'abstract_algebra',
+    'anatomy',
+    'astronomy',
+    'college_biology',
+    'college_chemistry',
+    'college_computer_science',
+    'college_mathematics',
+    'college_physics',
+    'computer_security',
+    'conceptual_physics',
+    'electrical_engineering',
+    'elementary_mathematics',
+    'high_school_biology',
+    'high_school_chemistry',
+    'high_school_computer_science',
+    'high_school_mathematics',
+    'high_school_physics',
     'high_school_statistics',
     'machine_learning',
 ]

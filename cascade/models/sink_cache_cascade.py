@@ -1493,7 +1493,6 @@ class CascadingSinkCache(SinkCache):
 
                     s = self.start_indices[i].add(l)
 
-                    # TODO: make this use cond or not use gpu access
                     score_idx = self.score_idx * s
                     old_input_score = torch.gather(self.score_cache, 0,
                                                    score_idx)

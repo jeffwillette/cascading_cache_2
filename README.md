@@ -7,7 +7,7 @@ conda env create -f environment.yml
 pip install -e .
 
 # test that triton can compile cache correctly
-python timber/models/sink_cache_cascade.py
+python cascade/models/sink_cache_cascade.py
 ```
 
 ## RUN PG19

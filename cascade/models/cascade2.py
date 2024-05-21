@@ -6,7 +6,7 @@ import time
 import warnings
 import numpy as np
 from torch.nn import functional as F
-from timber.models.cuda_graph import make_graphed_callables
+from cascade.models.cuda_graph import make_graphed_callables
 
 
 class SinkCache(nn.Module):
@@ -524,8 +524,6 @@ class StaticSinkCache(SinkCache):
             device = self.value_cache[layer_idx].device
             self.value_cache[layer_idx] = self.value_cache[
                 layer_idx].index_select(0, beam_idx.to(device))
-
-
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ import traceback
 import torch
 import transformers
 from datasets import load_dataset
-from timber.dataset.pg19 import PG19Streaming
+from cascade.dataset.pg19 import PG19Streaming
 from tqdm import tqdm
 import argparse
 import json
@@ -13,10 +13,10 @@ from aim import Run
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
-from timber.utils import seed, get_bench, MockRun
+from cascade.utils import seed, get_bench, MockRun
 import deepspeed
-from timber.models.modeling_llama import LlamaDecoderLayer
-from timber.models.qwen.modeling_qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
+from cascade.models.modeling_llama import LlamaDecoderLayer
+from cascade.models.qwen.modeling_qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 from third_party.hyper_attn.models.attention.modeling_chatglm_fast_attention import FastCoreAttention
 
 

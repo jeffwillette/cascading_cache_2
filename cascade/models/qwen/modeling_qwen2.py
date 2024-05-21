@@ -35,7 +35,7 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from third_party.hyper_attn.models.attention.hyper_attn import HyperAttention
-from timber.models.sink_cache_cascade import CascadingSinkCacheTriton as CascadingSinkCache, SinkCache
+from cascade.models.sink_cache_cascade import CascadingSinkCacheTriton as CascadingSinkCache, SinkCache
 
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast

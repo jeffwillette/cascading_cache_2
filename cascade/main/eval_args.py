@@ -6,10 +6,9 @@ import deepspeed
 
 @dataclass
 class ArgsType:
-    model: Literal['llama32k', 'llama16b', 'qwen'] = 'llama32k'
-    job: Literal['ppl', 'ppl-memory', 'mmlu', 'mmmu', 'stream',
-                 'bench_single_layer'] = 'ppl'
-    method: Literal['none', 'timber'] = 'timber'
+    model: Literal['llama7b', 'llama13b', 'qwen7b', 'qwen14b'] = 'llama32k'
+    job: Literal['ppl', 'ppl-memory', 'mmlu'] = 'ppl'
+    method: Literal['none', 'sink'] = 'sink'
     stride: int = -1
     lora_r: int = 32
     checkpoint: Optional[str] = None
@@ -36,7 +35,6 @@ def eval_args(
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--input', type=str, default=None)
     parser.add_argument('--max_tokens', type=int, default=512)
-    parser.add_argument('--slots', default=32, type=int)
     parser.add_argument('--window', default=256, type=int)
     parser.add_argument('--chunk', default=32, type=int)
     parser.add_argument('--sinks', default=0, type=int)

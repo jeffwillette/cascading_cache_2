@@ -12,9 +12,9 @@ GPUS=(0)
 # MAIN PG19 experiment code
 for i in "${!WINDOW[@]}";
 do 
-    # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python timber/main/llama_eval.py \
-    # PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,3 python timber/main/llama_eval.py \
-    PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 timber/main/llama_eval.py \
+    # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
+    # PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,3 python cascade/main/llama_eval.py \
+    PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 cascade/main/llama_eval.py \
         --model llama7b \
         --job ppl-pg19 \
         --method sink \
@@ -40,9 +40,9 @@ done
 # # HYPER ATTENTION BASELINE ===================================================
 # for i in "${!WINDOW[@]}";
 # do 
-#     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python timber/main/llama_eval.py \
-#     # PYTHONPATH=. deepspeed --include localhost:0,1,2 --master_port 63290 timber/main/llama_eval.py \
-#     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=1 python timber/main/llama_eval.py \
+#     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
+#     # PYTHONPATH=. deepspeed --include localhost:0,1,2 --master_port 63290 cascade/main/llama_eval.py \
+#     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=1 python cascade/main/llama_eval.py \
 #     #     --model qwen7b \
 #     #     --job ppl-pg19 \
 #     #     --method hyper \
@@ -57,8 +57,8 @@ done
 #     #     --dev_run 
 #     #     sleep 1
 # 
-#     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=1 python timber/main/llama_eval.py \
-#     PYTHONPATH=. deepspeed --include localhost:4,5 --master_port 63290 timber/main/llama_eval.py \
+#     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=1 python cascade/main/llama_eval.py \
+#     PYTHONPATH=. deepspeed --include localhost:4,5 --master_port 63290 cascade/main/llama_eval.py \
 #         --model qwen14b \
 #         --job ppl-pg19 \
 #         --method hyper \
@@ -87,9 +87,9 @@ done
 # 
 # for i in "${!WINDOW[@]}";
 # do 
-#     # PYTHONPATH=. deepspeed --include localhost:0,3 --master_port 63290 timber/main/llama_eval.py \
-#     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python timber/main/llama_eval.py \
-#     PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 python timber/main/llama_eval.py \
+#     # PYTHONPATH=. deepspeed --include localhost:0,3 --master_port 63290 cascade/main/llama_eval.py \
+#     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
+#     PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 python cascade/main/llama_eval.py \
 #         --model llama7b \
 #         --job ppl-pg19 \
 #         --method sink \

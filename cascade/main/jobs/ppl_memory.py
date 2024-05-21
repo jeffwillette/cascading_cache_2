@@ -8,52 +8,34 @@ from tqdm import tqdm
 import argparse, json
 from transformers import TextStreamer
 from aim import Run
+import numpy as np
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
-from timber.models.modeling_llama import LlamaForCausalLM, LlamaConfig
-from timber.utils import seed, get_bench
+from cascade.models.modeling_llama import LlamaForCausalLM, LlamaConfig
+from cascade.utils import seed, get_bench, MockRun
 
 
-class MockRun:
+def job_ppl_memory(args, model, tokenizer, device):
+    model.model.setup_caches(args.world_size)
+    model = model.to(args.infer_dtype).cuda()
 
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def track(self, *args, **kwargs):
-        pass
-
-    def __setitem__(self, key, value):
-        pass
-
-    def __getitem__(self, key):
-        pass
-
-
-def job_ppl(args, model, tokenizer, device):
-    model.model.setup_caches()
-    model = torch.compile(
-        model,
-        mode="default",
-        # mode="default",
-        fullgraph=False,
-        # options={"trace.enabled": True},
-    )
-    run = Run(experiment=args.method,
-              read_only=args.dev_run) if not args.dev_run else MockRun()
+    run = Run(experiment=args.method) if not args.dev_run else MockRun()
     dataset = "wikitext"
     run["hparams"] = {
-        "job": "ppl",
+        "job": "ppl-memory",
         "method": args.method,
         "dataset": dataset,
         "sinks": args.sinks,
         "cascades": args.cascades,
         "window": args.window,
         "slots": args.slots,
+        "model": args.model,
+        "cascade_func": args.cascade_func,
     }
 
     os.makedirs('./cache', exist_ok=True)
-    cache_path = './cache/llama_eval.pth'
+    cache_path = f'./cache/{args.model}-wikitext103-tokenized.pth'
     if not os.path.exists(cache_path):
         # test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
         test = load_dataset(dataset, "wikitext-103-raw-v1", split="test")
@@ -70,7 +52,7 @@ def job_ppl(args, model, tokenizer, device):
     seq_len = encodings.size(1)
     max_length = stride = seq_len
 
-    nll, count = 0, 0
+    nlls, count = 0, 0
     prev_end_loc = 0
     with tqdm(range(0, seq_len, stride)[:args.count]) as pbar:
         for begin_loc in pbar:
@@ -82,17 +64,18 @@ def job_ppl(args, model, tokenizer, device):
 
             if args.method in ["sink"]:
                 with torch.no_grad():
-                    rng = input_ids.size(1) - 1
-                    past_key_values = None
+                    # rng = input_ids.size(1) - 1
+                    # 3840 because that fully populates the cache by 256 * (1 + 2 + 4 + 8)
+                    rng = 3840 + 1024
                     with tqdm(range(rng)) as pbar2:
                         for i in pbar2:
                             inp = input_ids[:, i:i + 1]
-                            output = model(
-                                inp,
-                                use_cache=True,
-                                past_key_values=past_key_values,
-                            )
-                            past_key_values = output.past_key_values
+                            output = model(inp, use_cache=False, reset=i == 0)
+
+                    with tqdm(range(rng - 2048, rng - 1024)) as pbar2:
+                        for i in pbar2:
+                            inp = input_ids[:, i:i + 1]
+                            output = model(inp, use_cache=False, reset=False)
 
                             logits = output.logits[:, -1:]
                             targets = target_ids[:, i + 1:i + 2]
@@ -100,42 +83,41 @@ def job_ppl(args, model, tokenizer, device):
                                 logits.reshape(-1, logits.size(-1)),
                                 targets.reshape(-1),
                             )
-                            nll += nll.cpu()
+                            nlls += nll.cpu().item()
                             count += 1
 
-                            if i % 100 == 0:
-                                ppl = torch.exp(nll / count).item()
-                                run.track(ppl,
-                                          name="ppl",
-                                          step=i,
-                                          context={"subset": "test"})
-                                pbar2.set_description(f"{ppl=:.6f}")
+                            ppl = np.exp(nlls / count)
+                            run.track(ppl,
+                                      name="ppl-memory",
+                                      step=i,
+                                      context={"subset": "test"})
+                            pbar2.set_description(f"{ppl=:.6f}")
 
             else:
-                raise NotImplementedError()
-                # with torch.no_grad():
-                #     outputs = model(input_ids, labels=target_ids)
-                #     neg_log_likelihood = outputs.loss
+                with torch.no_grad():
+                    outputs = model(input_ids, labels=target_ids)
+                    neg_log_likelihood = outputs.loss
 
-                # nlls.append(neg_log_likelihood.cpu())
+                nlls.append(neg_log_likelihood.cpu())
 
             prev_end_loc = end_loc
-            ppl = torch.exp(nll / count).item()
+            ppl = np.exp(nlls / count)
             pbar.set_description(f"ppl: {ppl:.3f}")
 
             if end_loc == seq_len:
                 break
 
-    ppl = torch.exp(nll / count).item()
+    ppl = np.exp(nlls / count)
 
     os.makedirs('./cache/llama_eval/', exist_ok=True)
     if args.method == "sink":
         with open(
-                f'./cache/llama_eval/ppl-{args.method}-sinks-{args.sinks}-window-{args.window}.json',
+                f'./cache/llama_eval/ppl-memory-{args.method}-sinks-{args.sinks}-window-{args.window}-cascade-{args.cascades}-{args.model}.json',
                 'w') as f:
             json.dump({'ppl': ppl}, f)
     else:
-        with open(f'./cache/llama_eval/ppl-{args.method}.json', 'w') as f:
+        with open(f'./cache/llama_eval/ppl-memory-{args.method}.json',
+                  'w') as f:
             json.dump({'ppl': ppl}, f)
 
     print(f'PPL: {ppl:.4f}')

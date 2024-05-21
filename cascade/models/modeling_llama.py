@@ -28,7 +28,7 @@ from operator import itemgetter
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from timber.models.sink_attention import sink_attention
+from cascade.models.sink_attention import sink_attention
 import numpy as np
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
@@ -36,7 +36,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from timber.models.sink_cache_cascade import CascadingSinkCacheTriton as CascadingSinkCache, SinkCache
+from cascade.models.sink_cache_cascade import CascadingSinkCacheTriton as CascadingSinkCache, SinkCache
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -193,9 +193,7 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
             inv_freq = 1.0 / (base**(torch.arange(
                 0, self.dim, 2, dtype=torch.int64).float().to(x.device) /
                                      self.dim))
-            self.register_buffer(
-                "inv_freq", inv_freq,
-                persistent=False)  # TODO joao: this may break with compilation
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         cos, sin = super().forward(x, position_ids)
         return cos, sin
@@ -2186,7 +2184,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                                       cache_position=None,
                                       **kwargs):
         # With static cache, the `past_key_values` is None
-        # TODO joao: standardize interface for the different Cache classes and remove of this if
         has_static_cache = False
         if past_key_values is None:
             past_key_values = getattr(self.model.layers[0].self_attn,
@@ -2207,7 +2204,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
                 cache_length = past_length if max_cache_length is None else torch.min(
                     max_cache_length, past_length)
-            # TODO joao: remove this `else` after `generate` prioritizes `Cache` objects
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
