@@ -3,8 +3,8 @@
 WINDOW=(2048)
 CASCADES=(4)
 SINKS=(4)
-BATCH_SIZE=5
-HEAD_REDUCTION=mean
+BATCH_SIZE=25
+HEAD_REDUCTION=independent
 # CASCADE_FUNC="pow2"
 CASCADE_FUNC="pow2"
 GPUS=(0)
@@ -14,7 +14,7 @@ for i in "${!WINDOW[@]}";
 do 
     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python timber/main/llama_eval.py \
     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,3 python timber/main/llama_eval.py \
-    PYTHONPATH=. deepspeed --include localhost:4,5,6,7 --master_port 63390 timber/main/llama_eval.py \
+    PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 timber/main/llama_eval.py \
         --model llama7b \
         --job ppl-pg19 \
         --method sink \
@@ -24,7 +24,7 @@ do
         --cascades ${CASCADES[$i]} \
         --cascade_func $CASCADE_FUNC \
         --head_reduction $HEAD_REDUCTION \
-        --comment llama7b-ema-ablation-ln1000 \
+        --comment llama7b-independent-heads \
         --batch_size $BATCH_SIZE
         sleep 1
 done

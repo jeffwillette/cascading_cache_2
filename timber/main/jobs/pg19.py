@@ -228,14 +228,12 @@ def job_ppl_pg19(args, model, tokenizer, device):
 
     os.makedirs('./cache/llama_eval/', exist_ok=True)
     if args.method == "sink":
-        with open(
-                f'./cache/llama_eval/pg19-{args.method}-sinks-{args.sinks}-window-{args.window}.json',
-                'w') as f:
-            json.dump({'ppl': ppl}, f)
+        # use the aim tracker results for sink based methods
+        pass
     else:
         with open(
                 f'./cache/llama_eval/pg19-{args.method}-{args.model}-{args.comment}.json',
                 'w') as f:
             json.dump({'ppl': ppl, "all_nll": all_nll}, f)
 
-    print(f'PPL: {ppl:.4f}')
+    # print(f'PPL: {ppl:.4f}')
