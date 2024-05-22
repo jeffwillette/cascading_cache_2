@@ -1816,7 +1816,7 @@ class LlamaModel(LlamaPreTrainedModel):
             # print(f"init hyper attention for layer {i=} {self.config=}")
 
             min_seq_len = 4096
-            if i < 100:
+            if i < 8:
                 min_seq_len = 32768
 
             decoder_layer.self_attn.hyper_attn = HyperAttention(

@@ -15,7 +15,7 @@ from cascade.models.modeling_llama import LlamaForCausalLM, LlamaConfig
 from cascade.models.qwen.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config
 from cascade.utils import seed, get_bench
 
-from cascade.main.jobs.bench_single_layer import job_bench_single_layer
+# from cascade.main.jobs.bench_single_layer import job_bench_single_layer
 from cascade.main.jobs.ppl import job_ppl
 from cascade.main.jobs.passkey import job_passkey
 from cascade.main.jobs.ppl_memory import job_ppl_memory

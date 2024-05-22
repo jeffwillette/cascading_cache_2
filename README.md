@@ -1,4 +1,4 @@
-# TimberAttention
+# Cascading KV Cache
 
 ## How to Install
 
@@ -32,7 +32,6 @@ cd third_party/LongBench-timber/
 # set parameters for desired experiment in ./test-mmlu.bash
 ./test-mmlu.bash
 ```
-
 
 
 ## Note

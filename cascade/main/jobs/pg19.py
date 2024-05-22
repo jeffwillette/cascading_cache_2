@@ -47,15 +47,19 @@ def job_ppl_pg19(args, model, tokenizer, device):
         output_attentions = True
     elif args.method == "hyper":
         model.model.setup_hyper_attention()
+
         # model = model.to(args.infer_dtype).cuda()
 
-        model = deepspeed.init_inference(
-            model,
-            tensor_parallel={"tp_size": args.world_size},
-            replace_with_kernel_inject=False,
-            dtype=args.infer_dtype,
-            injection_policy=get_injection_policy(args.model),
-        )
+        # only for Llama7B 3/4 layers which had precision errors with float16
+        model = model.to(torch.bfloat16).cuda()
+
+        # model = deepspeed.init_inference(
+        #     model,
+        #     tensor_parallel={"tp_size": args.world_size},
+        #     replace_with_kernel_inject=False,
+        #     dtype=args.infer_dtype,
+        #     injection_policy=get_injection_policy(args.model),
+        # )
 
     elif args.world_size == 1:
         model.model.setup_caches(args.world_size)
@@ -83,7 +87,6 @@ def job_ppl_pg19(args, model, tokenizer, device):
             "sinks": args.sinks,
             "cascades": args.cascades,
             "window": args.window,
-            "slots": args.slots,
             "model": args.model,
             "head_reduction": args.head_reduction,
             "cascade_func": args.cascade_func,

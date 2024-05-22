@@ -410,4 +410,4 @@ dependencies:
       - xformers==0.0.25
       - xxhash==3.4.1
       - yarl==1.9.4
-prefix: /c2/jeff/anaconda3/envs/umbc-llm
+prefix: ./anaconda3/envs/umbc-llm
