@@ -152,9 +152,18 @@ class LlamaRotaryEmbedding(nn.Module):
     @torch.no_grad()
     def forward(self, x, position_ids):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(
-            position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
+
+        if len(position_ids.size()) == 3:
+            inv_freq_expanded = self.inv_freq[None, :, None].float().expand(
+                position_ids.shape[0], position_ids.shape[1], -1, 1)
+
+            position_ids_expanded = position_ids[:, :, None, :].float()
+        else:
+            inv_freq_expanded = self.inv_freq[None, :, None].float().expand(
+                position_ids.shape[0], -1, 1)
+
+            position_ids_expanded = position_ids[:, None, :].float()
+
         # Force float32 since bfloat16 loses precision on long contexts
         # See https://github.com/huggingface/transformers/pull/29285
         device_type = x.device.type
@@ -162,7 +171,7 @@ class LlamaRotaryEmbedding(nn.Module):
             device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float()
-                     @ position_ids_expanded.float()).transpose(1, 2)
+                     @ position_ids_expanded.float()).transpose(2, 3)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
@@ -772,6 +781,7 @@ class LlamaAttention(nn.Module):
         query_pos = torch.amax(torch.cat((sink_pos, key_pos), dim=-1),
                                dim=-1,
                                keepdim=True)
+
         key_states = self.rope(key_states, key_pos)
 
         mask = repeat_mask(mask, self.num_key_value_groups)
@@ -1226,8 +1236,9 @@ class LlamaFlashAttention2(LlamaAttention):
 
 
 def apply_rotary_pos_emb_one(x, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
+    if len(cos.size()) != 4:
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
     x_embed = (x * cos) + (rotate_half(x) * sin)
     return x_embed
 

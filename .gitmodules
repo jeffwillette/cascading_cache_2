@@ -5,5 +5,5 @@
 	path = third_party/LongBench-timber
 	url = git@github.com:jeffwillette/LongBench-timber.git
 [submodule "third_party/hyper-attn"]
-	path = third_party/hyper-attn
-	url = git@github.com:jeffwillette/hyper-attn.git
+	path = third_party/hyper_attn
+	url = git@github.com:jeffwillette/hyper_attn.git

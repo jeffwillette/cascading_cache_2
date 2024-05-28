@@ -106,39 +106,6 @@ def _update_sink_cache(
 
 
 @triton.jit
-def _update_positional_idx(
-    POS,
-    stride_p_n,
-    stride_p_h,
-    stride_p_t,
-    idx_n,
-    idx_h,
-    u,
-    l,
-    segment_len,
-    pos_ub,
-    stored_tokens_i,
-    start_idx_i,
-    WINDOW_SIZE_CONST,
-):
-
-    u = min(u, l + stored_tokens_i)
-    segment_len = min(segment_len, stored_tokens_i)
-
-    pos = (tl.arange(0, WINDOW_SIZE_CONST) + (segment_len - start_idx_i)) % segment_len + \
-        pos_ub - segment_len
-
-    pos_idx = tl.arange(0, WINDOW_SIZE_CONST).to(IDTYPE)
-    tl.store(
-        POS + \
-            idx_n.to(IDTYPE) * stride_p_n + \
-            idx_h.to(IDTYPE) * stride_p_h + \
-            (l + pos_idx).to(IDTYPE) * stride_p_t,
-        value=pos
-    )
-
-
-@triton.jit
 def _update_kv_cache(
     # input tensors
     KEY,
@@ -296,22 +263,6 @@ def _update_kv_cache(
                 tl.store(STORED_TOKENS + stored_shift,
                          value=(stored_tokens_i + 1).to(IDTYPE))
 
-                _update_positional_idx(
-                    POS,
-                    stride_p_n,
-                    stride_p_h,
-                    stride_p_t,
-                    idx_n,
-                    idx_h,
-                    u,
-                    l,
-                    segment_len,
-                    pos_ub,
-                    stored_tokens_i + 1,
-                    start_idx_i,
-                    WINDOW_SIZE_CONST,
-                )
-
                 do_break = True
 
             else:
@@ -368,23 +319,6 @@ def _update_kv_cache(
                         i.to(IDTYPE) * stride_st_c,
                      value=((start_idx_i + 1) % segment_len).to(IDTYPE)
                 )
-
-                _update_positional_idx(
-                    POS,
-                    stride_p_n,
-                    stride_p_h,
-                    stride_p_t,
-                    idx_n,
-                    idx_h,
-                    u,
-                    l,
-                    segment_len,
-                    pos_ub,
-                    stored_tokens_i,
-                    (start_idx_i + 1) % segment_len,
-                    WINDOW_SIZE_CONST,
-                )
-                pos_ub = pos_ub - segment_len
 
                 i += 1
         else:
@@ -444,22 +378,6 @@ def _update_kv_cache(
                     value=(stored_tokens_i + 1).to(IDTYPE)
                 )
 
-                _update_positional_idx(
-                    POS,
-                    stride_p_n,
-                    stride_p_h,
-                    stride_p_t,
-                    idx_n,
-                    idx_h,
-                    u,
-                    l,
-                    segment_len,
-                    pos_ub,
-                    stored_tokens_i + 1,
-                    start_idx_i,
-                    WINDOW_SIZE_CONST,
-                )
-
                 do_break = True
 
             else:
@@ -483,15 +401,8 @@ def _update_kv_cache(
 
                 # print("score: ", score.dtype)
                 # print("old score: ", old_score.dtype)
-                if (old_score > score):
-                    # old input_score is better, do nothing.
-                    # increment cascade index for next iter
-                    # break onstead of cotinue because this stops the cascade
-                    # print("overwrite break")
-                    do_break = True
-                else:
+                if score >= old_score:
                     # print("overwrite do")
-
                     kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
                         idx_h.to(IDTYPE) * stride_ck_h + \
                         t.to(IDTYPE) * stride_ck_t + \
@@ -514,22 +425,6 @@ def _update_kv_cache(
                     )
 
                     tl.store(CACHE_S + cs_shift, value=score)
-
-                    _update_positional_idx(
-                        POS,
-                        stride_p_n,
-                        stride_p_h,
-                        stride_p_t,
-                        idx_n,
-                        idx_h,
-                        u,
-                        l,
-                        segment_len,
-                        pos_ub,
-                        stored_tokens_i,
-                        start_idx_i,
-                        WINDOW_SIZE_CONST,
-                    )
 
                 do_break = True
 
@@ -1051,16 +946,14 @@ class CascadingSinkCacheTriton(SinkCache):
             self._seen_tokens - 1,
         )
 
-        pos_shift = self.num_sink_tokens if self._seen_tokens > self.num_sink_tokens else 0
-
         return (
             self.sink_keys,
             self.sink_values,
-            self.sink_pos[:1, 0],
+            self.sink_pos,
             self.sink_mask,
             self.key_cache,
             self.value_cache,
-            self.pos[:1, 0] + pos_shift,
+            self.og_pos,
             self.mask,
         )
 
@@ -1732,6 +1625,8 @@ def test_against_reference():
             pos_slow = torch.cat((pos_slow, pos_nosink_slow),
                                  dim=-1).squeeze(0)
 
+            print(f"{pos_slow=}")
+
             # print(f"{k[0, 0, :,  0]=}")
             mask = torch.cat((sink_mask_slow, mask_slow), dim=-1)
 
@@ -1752,9 +1647,10 @@ def test_against_reference():
             fast_times.append(time.perf_counter() - tic)
 
             print(
-                f"fast from mdoel out {pos.size()=} {pos_nosink.size()=} {k.size()=} {k_nosink.size()=}"
+                f"fast from model out {pos.size()=} {pos_nosink.size()=} {k.size()=} {k_nosink.size()=}"
             )
-            print(f"og pos: {cache.og_pos[0, 0]=}")
+
+            print(f"og pos: {cache.og_pos=}")
             idx = 0
             pos, mask, sink_mask, pos_nosink = pos[idx], mask[
                 idx, 0], sink_mask[idx, 0], pos_nosink[idx]
@@ -1800,6 +1696,70 @@ def test_against_reference():
     slow_times = sum(slow_times) / len(slow_times)
     fast_times = sum(fast_times) / len(fast_times)
     print(f"{slow_times=} {fast_times=}")
+
+
+def test_new_pos_method():
+    cache = CascadingSinkCacheTriton(window_length=WIND,
+                                     num_sink_tokens=NSINK,
+                                     max_batch_size=N,
+                                     heads=HEAD,
+                                     dim=HID,
+                                     max_seq_len=MAX_SEQ,
+                                     head_reduction="independent",
+                                     device=DEVICE,
+                                     dtype=DTYPE)
+
+    with torch.no_grad():
+        fast_times = []
+        for i in range(6000):
+            print(f"{'='*50}")
+            k, v = torch.ones(N, HEAD, 1, HID, device=DEVICE, dtype=DTYPE) * (
+                i + 1), torch.ones(N, HEAD, 1, HID, device=DEVICE,
+                                   dtype=DTYPE) * (i + 1)
+            # k, v = torch.randn(1, HEAD, 1, HID, device=DEVICE,
+            #                    dtype=DTYPE), torch.randn(1,
+            #                                              HEAD,
+            #                                              1,
+            #                                              HID,
+            #                                              device=DEVICE,
+            #                                              dtype=DTYPE)
+
+            # ============================================================================================
+            tic = time.perf_counter()
+            k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache.update(
+                k, v)
+            cache.update_attention_scores(torch.randn(N, HEAD, 1, MAX_SEQ, device=DEVICE, dtype=DTYPE))
+            fast_times.append(time.perf_counter() - tic)
+
+            idx = 0
+            pos, mask, sink_mask, pos_nosink = pos[idx], mask[
+                idx, 0], sink_mask[idx, 0], pos_nosink[idx]
+
+            # print(f"{k.size()=}")
+            # print(f"{k=}")
+            # print(f"{k[idx:idx+1].view(-1)=}\n{pos=}\n{sink_mask=}")
+            k, v = torch.cat((k, k_nosink), dim=-2), torch.cat((v, v_nosink),
+                                                               dim=-2)
+            print(f"fast {pos.size()=} {pos_nosink.size()=}")
+            pos = torch.cat((pos, pos_nosink), dim=-1)
+
+            # print(f"{k[0, 0, :,  0]=}")
+            mask = torch.cat((sink_mask, mask), dim=-1)
+
+            n = (mask == 0).sum()
+            k, v = k[idx:idx + 1, :, :n], v[idx:idx + 1, :, :n]
+            argsort = torch.argsort(pos[:n])
+            # print(
+            #     f"fast: {mask=}\n{k[:, :].reshape(-1)=}\n{v[:, :].reshape(-1)=}"
+            # )
+
+            # print(f"before sort: \n{k.reshape(-1)=}\n{pos.reshape(-1)=}")
+
+            k, v = k[:, :, argsort], v[:, :, argsort]
+
+    fast_times = fast_times[100:]
+    fast_times = sum(fast_times) / len(fast_times)
+    print(f"{fast_times=}")
 
 
 def test_pows():
@@ -1944,10 +1904,10 @@ if __name__ == '__main__':
     N = 1
     HID = 1
     NSINK = 4
-    WIND = 8
-    HEAD = 1
-    MAX_SEQ = 32
-    DEVICE = "cuda:3"
+    WIND = 4
+    HEAD = 4
+    MAX_SEQ = 16
+    DEVICE = "cuda:0"
     DTYPE = torch.float16
 
     # k = torch.arange(27 * 3).reshape(3, 3, 3, 3).contiguous().cuda()
@@ -1956,7 +1916,8 @@ if __name__ == '__main__':
     # print(f"{loaded=}")
 
     # test_pows()
-    test_against_reference()
+    # test_against_reference()
+    test_new_pos_method()
 
     # bench_against_naive()
     # test_batch()

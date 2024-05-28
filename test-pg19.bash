@@ -3,11 +3,11 @@
 WINDOW=(2048)
 CASCADES=(4)
 SINKS=(4)
-BATCH_SIZE=1
+BATCH_SIZE=5
 HEAD_REDUCTION=independent
 # CASCADE_FUNC="pow2"
 CASCADE_FUNC="pow2"
-GPUS=(1)
+GPUS=(0)
 
 # MAIN PG19 experiment code
 for i in "${!WINDOW[@]}";
@@ -15,16 +15,16 @@ do
     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,3 python cascade/main/llama_eval.py \
     # PYTHONPATH=. deepspeed --include localhost:0,1,2,3 --master_port 63290 cascade/main/llama_eval.py \
     PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
-        --model llama7b \
+        --model llama1.3b \
         --job ppl-pg19 \
-        --method hyper \
+        --method sink \
         --lora_r 0 \
         --window ${WINDOW[$i]} \
         --sinks ${SINKS[$i]} \
         --cascades ${CASCADES[$i]} \
         --cascade_func $CASCADE_FUNC \
         --head_reduction $HEAD_REDUCTION \
-        --comment llama7b-hyper-attention-natural-bottom8-rerun \
+        --comment llama1.3b-og-pos-test \
         --batch_size $BATCH_SIZE \
         --dev_run
         sleep 1
