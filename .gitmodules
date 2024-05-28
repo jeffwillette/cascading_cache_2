@@ -1,6 +1,6 @@
 [submodule "third_party/LongBench-timber"]
 	path = third_party/LongBench-timber
 	url = git@github.com:jeffwillette/LongBench-timber.git
-[submodule "third_party/hyper-attn"]
-	path = third_party/hyper-attn
+[submodule "third_party/hyper_attn"]
+	path = third_party/hyper_attn
 	url = git@github.com:jeffwillette/hyper-attn.git
