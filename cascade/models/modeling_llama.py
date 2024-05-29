@@ -771,6 +771,8 @@ class LlamaAttention(nn.Module):
         sink_key_states, sink_value_states, sink_pos, sink_mask, key_states, value_states, key_pos, mask =\
             past_key_value.update(key_states, value_states)
 
+        key_pos = past_key_value.compress_original_pos()
+
         sink_key_states = self.rope(sink_key_states, sink_pos)
 
         sink_mask = repeat_mask(sink_mask, self.num_key_value_groups)

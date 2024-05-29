@@ -906,6 +906,31 @@ class CascadingSinkCacheTriton(SinkCache):
         self.score_cache = self.beta * self.score_cache + (
             1 - self.beta) * attention_scores
 
+    def compress_original_pos(self):
+        og_pos = self.og_pos
+        new_pos = torch.zeros_like(og_pos)
+        for b in range(og_pos.size(0)):
+            min_pos = self.num_sink_tokens
+            for i in range(self.max_seq_len // self.window_length):  # cascades
+                csc = self.max_seq_len // self.window_length - i - 1
+                start_idx = self.start_indices[b, 0, csc]
+                stored_tokens = self.stored_tokens[b, 0, csc]
+                for j in range(stored_tokens):  # for every item in cascade subwindow
+                    idx = (csc * WIND) + (start_idx + j) % WIND
+                    argsort_indices = og_pos[b, :, idx].argsort()
+                    for k, v in enumerate(argsort_indices):
+                        if k == 0 or og_pos[b, v, idx] == og_pos[b, argsort_indices[k - 1], idx]:
+                            new_pos[b, v, idx] = min_pos
+                        else:
+                            min_pos += 1
+                            new_pos[b, v, idx] = min_pos
+
+                        # if we are at the end of this token, we always need to increment
+                        if k == argsort_indices.size(0) - 1:
+                            min_pos += 1
+
+        return new_pos
+
     @torch._dynamo.disable(recursive=True)
     def update(
         self,
@@ -1743,19 +1768,9 @@ def test_new_pos_method():
             print(f"fast {pos.size()=} {pos_nosink.size()=}")
             pos = torch.cat((pos, pos_nosink), dim=-1)
 
-            # print(f"{k[0, 0, :,  0]=}")
-            mask = torch.cat((sink_mask, mask), dim=-1)
-
-            n = (mask == 0).sum()
-            k, v = k[idx:idx + 1, :, :n], v[idx:idx + 1, :, :n]
-            argsort = torch.argsort(pos[:n])
-            # print(
-            #     f"fast: {mask=}\n{k[:, :].reshape(-1)=}\n{v[:, :].reshape(-1)=}"
-            # )
-
-            # print(f"before sort: \n{k.reshape(-1)=}\n{pos.reshape(-1)=}")
-
-            k, v = k[:, :, argsort], v[:, :, argsort]
+            og_pos = cache.og_pos
+            new_pos = cache.compress_original_pos()
+            print(f"og pos:\n{og_pos}\nnew pos:\n{new_pos}")
 
     fast_times = fast_times[100:]
     fast_times = sum(fast_times) / len(fast_times)
@@ -1901,7 +1916,7 @@ if __name__ == '__main__':
     # DTYPE = torch.float16
 
     # toy settings
-    N = 1
+    N = 2
     HID = 1
     NSINK = 4
     WIND = 4
