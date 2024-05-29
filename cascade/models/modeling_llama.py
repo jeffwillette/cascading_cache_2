@@ -665,7 +665,7 @@ class LlamaAttention(nn.Module):
         # In case static cache is used, it is an instance attribute.
         past_key_value = getattr(self, "past_key_value", past_key_value)
         if kwargs.get("reset", False):
-            past_key_value.reset()
+            past_key_value.reset(verbose=False)
 
         layer_idx = self.layer_idx if not hasattr(self,
                                                   "past_key_value") else 0
@@ -761,7 +761,7 @@ class LlamaAttention(nn.Module):
         # In case static cache is used, it is an instance attribute.
         past_key_value = getattr(self, "past_key_value", past_key_value)
         if kwargs.get("reset", False):
-            past_key_value.reset()
+            past_key_value.reset(verbose=False)
 
         layer_idx = self.layer_idx if not hasattr(self,
                                                   "past_key_value") else 0
@@ -771,7 +771,7 @@ class LlamaAttention(nn.Module):
         sink_key_states, sink_value_states, sink_pos, sink_mask, key_states, value_states, key_pos, mask =\
             past_key_value.update(key_states, value_states)
 
-        key_pos = past_key_value.compress_original_pos()
+        # key_pos = past_key_value.compress_original_pos()
 
         sink_key_states = self.rope(sink_key_states, sink_pos)
 

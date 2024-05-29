@@ -464,7 +464,7 @@ class SinkCacheFunc(Function):
         assert cache_k.stride() == cache_v.stride()
         assert stored_tokens.stride() == start_indices.stride()
 
-        device = k.device
+        # device = k.device
         # dtype = k.dtype
 
         BLOCK_HID = triton.next_power_of_2(HID)
@@ -492,77 +492,112 @@ class SinkCacheFunc(Function):
         # print(f"{stored_sinks.size()=} {stored_sinks.stride()=}")
         # print(f"{HID=} {BLOCK_HID=}")
 
-        _device = torch.cuda.current_device()
-        torch.cuda.set_device(device)
+        # _device = torch.cuda.current_device()
+        # torch.cuda.set_device(device)
+
+        # try:
+        #     if stored_sinks[0, 0] < num_sink:
+
+        #         _update_sink_cache[grid](
+        #             k,
+        #             v,
+        #             *k.stride(),
+        #             sink_k,
+        #             sink_v,
+        #             *sink_k.stride(),
+        #             sink_mask,
+        #             *sink_mask.stride(),
+        #             sink_pos,
+        #             *sink_pos.stride(),
+        #             stored_sinks,
+        #             *stored_sinks.stride(),
+        #             N,
+        #             K,
+        #             HID,
+        #             num_sink,
+        #             window_size,
+        #             BLOCK_HID,
+        #             num_warps=1,
+        #             num_stages=1,
+        #         )
+
+        #     else:
+        #         _update_kv_cache[grid](
+        #             k,
+        #             v,
+        #             *k.stride(),
+        #             s,
+        #             *s.stride(),
+        #             cache_k,
+        #             cache_v,
+        #             *cache_k.stride(),
+        #             cache_s,
+        #             *cache_s.stride(),
+        #             mask,
+        #             *mask.stride(),
+        #             pos,
+        #             *pos.stride(),
+        #             og_pos,
+        #             *og_pos.stride(),
+        #             stored_tokens,
+        #             start_indices,
+        #             *stored_tokens.stride(),
+        #             do_cache,
+        #             N,
+        #             K,
+        #             HID,
+        #             num_sink,
+        #             window_size,
+        #             real_token_idx,
+        #             window_size,
+        #             CASCADES,
+        #             BLOCK_HID,
+        #             num_warps=1,
+        #             num_stages=1,
+        #         )
 
         try:
-            if stored_sinks[0, 0] < num_sink:
-
-                _update_sink_cache[grid](
-                    k,
-                    v,
-                    *k.stride(),
-                    sink_k,
-                    sink_v,
-                    *sink_k.stride(),
-                    sink_mask,
-                    *sink_mask.stride(),
-                    sink_pos,
-                    *sink_pos.stride(),
-                    stored_sinks,
-                    *stored_sinks.stride(),
-                    N,
-                    K,
-                    HID,
-                    num_sink,
-                    window_size,
-                    BLOCK_HID,
-                    num_warps=1,
-                    num_stages=1,
-                )
-
-            else:
-                _update_kv_cache[grid](
-                    k,
-                    v,
-                    *k.stride(),
-                    s,
-                    *s.stride(),
-                    cache_k,
-                    cache_v,
-                    *cache_k.stride(),
-                    cache_s,
-                    *cache_s.stride(),
-                    mask,
-                    *mask.stride(),
-                    pos,
-                    *pos.stride(),
-                    og_pos,
-                    *og_pos.stride(),
-                    stored_tokens,
-                    start_indices,
-                    *stored_tokens.stride(),
-                    do_cache,
-                    N,
-                    K,
-                    HID,
-                    num_sink,
-                    window_size,
-                    real_token_idx,
-                    window_size,
-                    CASCADES,
-                    BLOCK_HID,
-                    num_warps=1,
-                    num_stages=1,
-                )
+            _update_kv_cache[grid](
+                k,
+                v,
+                *k.stride(),
+                s,
+                *s.stride(),
+                cache_k,
+                cache_v,
+                *cache_k.stride(),
+                cache_s,
+                *cache_s.stride(),
+                mask,
+                *mask.stride(),
+                pos,
+                *pos.stride(),
+                og_pos,
+                *og_pos.stride(),
+                stored_tokens,
+                start_indices,
+                *stored_tokens.stride(),
+                do_cache,
+                N,
+                K,
+                HID,
+                num_sink,
+                window_size,
+                real_token_idx,
+                window_size,
+                CASCADES,
+                BLOCK_HID,
+                # num_warps=1,
+                # num_stages=1,
+            )
 
         except RuntimeError as ex:
-            print(N, K, HID, BLOCK_HID,
-                  num_sink, window_size, _device, k.shape, k.dtype,
-                  k.is_contiguous(), k.device, k.shape, k.dtype,
-                  v.is_contiguous(), v.device)
+            print("error")
+            # print(N, K, HID, BLOCK_HID, num_sink, window_size, k.shape,
+            #       k.dtype, k.is_contiguous(), k.device, k.shape, k.dtype,
+            #       v.is_contiguous(), v.device)
             raise Exception() from ex
-        torch.cuda.set_device(_device)
+        # torch.cuda.set_device(_device)
 
         return stored_sinks, start_indices, stored_tokens
 
@@ -915,11 +950,14 @@ class CascadingSinkCacheTriton(SinkCache):
                 csc = self.max_seq_len // self.window_length - i - 1
                 start_idx = self.start_indices[b, 0, csc]
                 stored_tokens = self.stored_tokens[b, 0, csc]
-                for j in range(stored_tokens):  # for every item in cascade subwindow
-                    idx = (csc * WIND) + (start_idx + j) % WIND
+                for j in range(
+                        stored_tokens):  # for every item in cascade subwindow
+                    idx = (csc * self.window_length) + (start_idx +
+                                                        j) % self.window_length
                     argsort_indices = og_pos[b, :, idx].argsort()
                     for k, v in enumerate(argsort_indices):
-                        if k == 0 or og_pos[b, v, idx] == og_pos[b, argsort_indices[k - 1], idx]:
+                        if k == 0 or og_pos[b, v, idx] == og_pos[
+                                b, argsort_indices[k - 1], idx]:
                             new_pos[b, v, idx] = min_pos
                         else:
                             min_pos += 1
@@ -931,7 +969,7 @@ class CascadingSinkCacheTriton(SinkCache):
 
         return new_pos
 
-    @torch._dynamo.disable(recursive=True)
+    # @torch._dynamo.disable(recursive=True)
     def update(
         self,
         key_states: torch.Tensor,
@@ -1753,7 +1791,8 @@ def test_new_pos_method():
             tic = time.perf_counter()
             k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache.update(
                 k, v)
-            cache.update_attention_scores(torch.randn(N, HEAD, 1, MAX_SEQ, device=DEVICE, dtype=DTYPE))
+            cache.update_attention_scores(
+                torch.randn(N, HEAD, 1, MAX_SEQ, device=DEVICE, dtype=DTYPE))
             fast_times.append(time.perf_counter() - tic)
 
             idx = 0

@@ -64,7 +64,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
     elif args.world_size == 1:
         model.model.setup_caches(args.world_size)
         model = model.to(args.infer_dtype).cuda()
-        # model = torch.compile(model, mode="max-autotune", fullgraph=False)
+        model = torch.compile(model, mode="max-autotune", fullgraph=True)
     else:
         model.model.setup_caches(args.world_size)
         model = deepspeed.init_inference(
