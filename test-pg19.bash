@@ -13,9 +13,9 @@ GPUS=(0)
 for i in "${!WINDOW[@]}";
 do 
     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,3 python cascade/main/llama_eval.py \
-    # PYTHONPATH=. deepspeed --include localhost:0,1,2,3 --master_port 63290 cascade/main/llama_eval.py \
-    PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
-        --model llama1.3b \
+    # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
+    PYTHONPATH=. deepspeed --include localhost:0,1,2,3 --master_port 63290 cascade/main/llama_eval.py \
+        --model llama7b \
         --job ppl-pg19 \
         --method sink \
         --lora_r 0 \
@@ -24,9 +24,8 @@ do
         --cascades ${CASCADES[$i]} \
         --cascade_func $CASCADE_FUNC \
         --head_reduction $HEAD_REDUCTION \
-        --comment llama1.3b-og-pos-test \
-        --batch_size $BATCH_SIZE \
-        --dev_run
+        --comment llama7b-og-pos \
+        --batch_size $BATCH_SIZE
         sleep 1
 done
 
