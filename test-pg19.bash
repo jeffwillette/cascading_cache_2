@@ -4,10 +4,10 @@ WINDOW=(2048)
 CASCADES=(4)
 SINKS=(4)
 BATCH_SIZE=5
-HEAD_REDUCTION=independent
+HEAD_REDUCTION=max
 # CASCADE_FUNC="pow2"
 CASCADE_FUNC="pow2"
-GPUS=(4)
+GPUS=(0)
 
 # MAIN PG19 experiment code
 for i in "${!WINDOW[@]}";

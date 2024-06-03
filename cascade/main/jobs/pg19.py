@@ -9,7 +9,7 @@ from tqdm import tqdm
 import argparse
 import json
 from transformers import TextStreamer
-from aim import Run
+# from aim import Run
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
@@ -64,7 +64,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
     elif args.world_size == 1:
         model.model.setup_caches(args.world_size)
         model = model.to(args.infer_dtype).cuda()
-        model = torch.compile(model, mode="max-autotune", fullgraph=True)
+        model = torch.compile(model, backend="cudagraphs")
     else:
         model.model.setup_caches(args.world_size)
         model = deepspeed.init_inference(
@@ -77,8 +77,10 @@ def job_ppl_pg19(args, model, tokenizer, device):
 
     run = MockRun()
     if args.local_rank == 0:
-        run = Run(experiment=f"{args.method}-pg19"
-                  ) if not args.dev_run else MockRun()
+        # run = Run(experiment=f"{args.method}-pg19"
+        #           ) if not args.dev_run else MockRun()
+
+        run = MockRun()
         dataset = "pg19"
         run["hparams"] = {
             "job": "ppl",
@@ -120,10 +122,11 @@ def job_ppl_pg19(args, model, tokenizer, device):
 
             ATTN_ROWS_LIMIT = 8192
             attn_rows = []
-            with tqdm(range(x.size(1) - 1), ncols=150) as pbar:
+            stride = 512
+            with tqdm(range(0, x.size(1) - 1, stride), ncols=150) as pbar:
                 for i in pbar:
                     with torch.no_grad():
-                        inp = input_ids[:, i:i + 1]
+                        inp = input_ids[:, i: i + stride]
                         # use cache false means to use static cascading cache inside the model
                         output = model(inp,
                                        use_cache=False,
@@ -154,11 +157,11 @@ def job_ppl_pg19(args, model, tokenizer, device):
 
                         nll_total += _nll.sum()
                         count_total += (targets >= 0).sum().item()
+                        print(f"nll: {nll_total / count_total}")
 
                         l, u = j * args.batch_size, (j + 1) * args.batch_size
                         nll_individual[l:u] += _nll.cpu()
-                        count_individual[l:u] += (targets
-                                                  >= 0).sum(dim=-1).cpu()
+                        count_individual[l:u] += (targets >= 0).sum(dim=-1).cpu()
                         step += 1
 
                         if step % 100 == 0:
