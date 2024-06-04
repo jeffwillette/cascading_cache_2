@@ -73,6 +73,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
             replace_with_kernel_inject=False,
             dtype=args.infer_dtype,
             injection_policy=get_injection_policy(args.model),
+            enable_cuda_graph=True,
         )
 
     run = MockRun()

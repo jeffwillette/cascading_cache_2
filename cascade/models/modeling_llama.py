@@ -461,7 +461,7 @@ class LlamaAttention(nn.Module):
                     **kwargs,
                 )
 
-            # we are in a batch processing scenario. 
+            # we are in a batch processing scenario.
             return self.forward_cascade_batch(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -514,7 +514,7 @@ class LlamaAttention(nn.Module):
         self,
         q,
         sink_k,
-        sink_m,
+        # sink_m,
         sink_v,
         k,
         m,
@@ -522,7 +522,6 @@ class LlamaAttention(nn.Module):
         cache,
         size,
         output_attentions=False,
-        include_o=True,
     ):
         scale = 1 / np.sqrt(q.size(-1))
         sink_out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
@@ -532,103 +531,147 @@ class LlamaAttention(nn.Module):
                            k * np.sqrt(scale))
 
         if not hasattr(self, "causal_mask"):
-            # there is no causal mask stored, which means this must be the 
+            # there is no causal mask stored, which means this must be the
             # first iteration. This mask is a special case where we can create
-            # a normal causal mask which is concatted with the repeated mask from 
+            # a normal causal mask which is concatted with the repeated mask from
             # the cascading cache.
+            first_it = True
             val = torch.finfo(q.dtype).min
             cm = torch.full((q.size(2), q.size(2)),
-                val, device=q.device, dtype=q.dtype).triu(1)
-            cm_rest = torch.full((q.size(2), (sink_k.size(2) + k.size(2)) - q.size(2)),
-                val, device=q.device, dtype=q.dtype)
+                            val,
+                            device=q.device,
+                            dtype=q.dtype).triu(1)
+            cm_rest = torch.full(
+                (q.size(2), (sink_k.size(2) + k.size(2)) - q.size(2)),
+                val,
+                device=q.device,
+                dtype=q.dtype)
 
             self.causal_mask = torch.cat((cm, cm_rest), dim=-1)
-            self.causal_mask = self.causal_mask.view(1, 1, q.size(2), k.size(2) + sink_k.size(2))
+            self.causal_mask = self.causal_mask.view(
+                1, 1, q.size(2),
+                k.size(2) + sink_k.size(2))
 
         else:
             # causal mask exists which means this is at least the second iteration.
             # in this case the starting index in the cache will be q_len - sink_tokens
-            # and so we have to build a causal mask wich is slightly 
-            if not hasattr(self, "causal_mask_isdone"):
-                val = torch.finfo(q.dtype).min
+            # and so we have to build a causal mask wich is slightly
+            first_it = False
 
-                cm = torch.full((q.size(2), q.size(2)),
-                    val, device=q.device, dtype=q.dtype).triu(1)
+            val = torch.finfo(q.dtype).min
+            cm = torch.full((q.size(2), q.size(2)),
+                            val,
+                            device=q.device,
+                            dtype=q.dtype).triu(1)
 
-                # the last 'n_sink' come first because of the separate
-                # sinks and circular buffers in the first iteration. Move around
-                # the mask so it is causal given the order.
-                cm[:-sink_k.size(2), -sink_k.size(2):] = 0
-                cm[-sink_k.size(2):, :-sink_k.size(2)] = val
+            # the last 'n_sink' come first because of the separate
+            # sinks and circular buffers in the first iteration. Move around
+            # the mask so it is causal given the order.
+            cm[:-sink_k.size(2), -sink_k.size(2):] = 0
+            cm[-sink_k.size(2):, :-sink_k.size(2)] = val
 
-                # sinks should have a zero causal mask for all
-                cm_sink = torch.zeros(q.size(2), sink_k.size(2), device=q.device, dtype=q.dtype)
+            # sinks should have a zero causal mask for all
+            cm_sink = torch.zeros(q.size(2),
+                                  sink_k.size(2),
+                                  device=q.device,
+                                  dtype=q.dtype)
 
-                m_zero = m[0, 0, q.size(2):]
-                # if m_zero == k.size(2) - q.size(2):
-                #     # once the cache is fully populates, the causal mask will remain fixed
-                #     self.causal_mask_isdone = True
+            m_zero = m[0, 0, q.size(2):] < 0
+            # if m_zero == k.size(2) - q.size(2):
+            #     # once the cache is fully populates, the causal mask will remain fixed
+            #     self.causal_mask_isdone = True
 
-                cm_rest = torch.full((q.size(2), k.size(2) - q.size(2)),
-                    val, device=q.device, dtype=q.dtype)
-                cm_rest = cm_rest * m_zero
+            cm_rest = torch.full((q.size(2), k.size(2) - q.size(2)),
+                                 val,
+                                 device=q.device,
+                                 dtype=q.dtype)
 
-                self.causal_mask = torch.cat((cm_sink, cm, cm_rest), dim=-1)
-                self.causal_mask = self.causal_mask.view(1, 1, q.size(2), sink_k.size(2) + k.size(2))
+            cm_rest = cm_rest * m_zero
+
+            self.causal_mask = torch.cat((cm_sink, cm, cm_rest), dim=-1)
+
+            # if self.layer_idx in [0, 1]:
+            #     from matplotlib import pyplot as plt
+            #     fig, ax = plt.subplots(1, 1, figsize=(100, 100))
+            #     ax.imshow((self.causal_mask
+            #                < 0).to(torch.long).cpu().numpy())
+            #     n = torch.randint(0, 15000, (1, ))
+            #     fig.savefig(f"./mask-{n.item()}-{self.layer_idx}.pdf")
+            #     plt.close()
+
+            self.causal_mask = self.causal_mask.view(
+                1, 1, q.size(2),
+                sink_k.size(2) + k.size(2))
 
         total_out = torch.cat((sink_out, out), dim=-1)
         total_out += self.causal_mask
         scores = total_out.softmax(dim=-1)
 
+        # if self.layer_idx in [0, 1]:
+        #     from matplotlib import pyplot as plt
+        #     fig, ax = plt.subplots(1, 1, figsize=(100, 100))
+        #     ax.imshow(scores[0].amax(dim=0).cpu().numpy()**0.2)
+        #     n = torch.randint(0, 15000, (1, ))
+        #     fig.savefig(f"./attn-{n.item()}-{self.layer_idx}.pdf")
+        #     plt.close()
+
         out_attn = None
-        if output_attentions:
-            og_pos = torch.cat(
-                (torch.arange(sink_out.size(-1),
-                              device=sink_out.device), cache.og_pos[0, 0]))
+        # if output_attentions:
+        #     og_pos = torch.cat(
+        #         (torch.arange(sink_out.size(-1),
+        #                       device=sink_out.device), cache.og_pos[0, 0]))
 
-            out_attn = torch.zeros(out.size(0),
-                                   out.size(1),
-                                   1,
-                                   max(og_pos.amax() + 1, og_pos.size(0)),
-                                   device=out.device,
-                                   dtype=out.dtype)
+        #     out_attn = torch.zeros(out.size(0),
+        #                            out.size(1),
+        #                            1,
+        #                            max(og_pos.amax() + 1, og_pos.size(0)),
+        #                            device=out.device,
+        #                            dtype=out.dtype)
 
-            og_pos = og_pos.view(1, 1, 1, -1).repeat(out.size(0), out.size(1),
-                                                     1, 1)
+        #     og_pos = og_pos.view(1, 1, 1, -1).repeat(out.size(0), out.size(1),
+        #                                              1, 1)
 
-            # print(f"{og_pos.size()=} {scores.size()=} {out_attn.size()=}")
-            out_attn.scatter_(-1, og_pos, scores)
-            # print(f"out_attn: {out_attn[0, 0, 0]=}")
+        #     # print(f"{og_pos.size()=} {scores.size()=} {out_attn.size()=}")
+        #     out_attn.scatter_(-1, og_pos, scores)
+        #     # print(f"out_attn: {out_attn[0, 0, 0]=}")
 
         out = scores[:, :, :, :sink_k.size(-2)] @ sink_v
         out += scores[:, :, :, sink_k.size(-2):] @ v
 
-        if torch.distributed.is_initialized():
-            lst = [
-                torch.zeros_like(scores) for _ in range(self.config.world_size)
-            ]
-            torch.distributed.all_gather(lst, scores)
-            if self.config._head_reduction == "mean":
-                scores = torch.cat(lst, dim=1).mean(dim=1, keepdim=True)
-            elif self.config._head_reduction == "max":
-                scores = torch.cat(lst, dim=1).amax(dim=1, keepdim=True)
-            elif self.config._head_reduction == "median":
-                scores = torch.cat(lst, dim=1).median(dim=1,
-                                                      keepdim=True).values
-            elif self.config._head_reduction in ["none", "independent"]:
-                pass
-            else:
-                raise ValueError(
-                    f"unknown head reduction: {self.config.head_reduction=}")
+        # if torch.distributed.is_initialized():
+        #     lst = [
+        #         torch.zeros_like(scores) for _ in range(self.config.world_size)
+        #     ]
+        #     torch.distributed.all_gather(lst, scores)
+        #     if self.config._head_reduction == "mean":
+        #         scores = torch.cat(lst, dim=1).mean(dim=1, keepdim=True)
+        #     elif self.config._head_reduction == "max":
+        #         scores = torch.cat(lst, dim=1).amax(dim=1, keepdim=True)
+        #     elif self.config._head_reduction == "median":
+        #         scores = torch.cat(lst, dim=1).median(dim=1,
+        #                                               keepdim=True).values
+        #     elif self.config._head_reduction in ["none", "independent"]:
+        #         pass
+        #     else:
+        #         raise ValueError(
+        #             f"unknown head reduction: {self.config.head_reduction=}")
 
-        scores = scores[:, :, :, sink_k.size(-2):].amax(dim=1, keepdim=True).mean(dim=2, keepdim=True)
-        cache.update_attention_scores(scores, 0)
+        # offset = 0
+        # if first_it:
+        #     offset = sink_k.size(2)
+
+        # scores = scores[:, :, offset:, sink_k.size(-2):]
+        # scores = scores.mean(dim=2, keepdim=True)
+        # scores = scores.amax(dim=1, keepdim=True)
+        # print(f"{scores.size()=}")
+
+        # for i in range(scores.size(2)):
+        #     cache.update_attention_scores(scores[:, :, i:i + 1], 0)
 
         out = out.transpose(1, 2).contiguous()
         out = out.view(*size)
 
-        if include_o:
-            out = self.o(out)
+        out = self.o(out)
 
         return out, out_attn
 
@@ -738,40 +781,78 @@ class LlamaAttention(nn.Module):
             hidden_states, (bsz, q_len, self.num_heads, self.head_dim),
             (bsz, q_len, self.num_key_value_heads, self.head_dim))
 
+        # if self.layer_idx in [0, 1]:
+        #     pos = torch.arange(258,
+        #                        258 + 512,
+        #                        device=query_states.device,
+        #                        dtype=torch.long).view(1, -1)
+        #     scale = 1 / np.sqrt(query_states.size(-1))
+        #     q = self.rope(query_states, pos)
+        #     k = self.rope(key_states, pos)
+        #     a = torch.einsum("bhqd,bhkd->bhqk",
+        #                      np.sqrt(scale) * q,
+        #                      np.sqrt(scale) * k)
+        #     cm = torch.full((query_states.size(2), query_states.size(2)),
+        #                     torch.finfo(query_states.dtype).min,
+        #                     device=query_states.device,
+        #                     dtype=query_states.dtype).triu(1)
+        #     a += cm
+        #     a = a.softmax(dim=-1)
+
+        #     from matplotlib import pyplot as plt
+        #     fig, ax = plt.subplots(1, 1, figsize=(100, 100))
+        #     ax.imshow(a[0].amax(dim=0).cpu().numpy()**0.2)
+        #     fig.savefig(f"./attn-gt-{self.layer_idx}.pdf")
+        #     plt.close()
+
         # In case static cache is used, it is an instance attribute.
         past_key_value = getattr(self, "past_key_value", past_key_value)
         first_it = past_key_value._seen_tokens == 0
         if kwargs.get("reset", False):
             past_key_value.reset(verbose=False)
 
-        layer_idx = self.layer_idx if not hasattr(self, "past_key_value") else 0
-        # 0. loop to add everything to the cache.
-        # for i in tqdm(
-        #         range(q_len),
-        #         leave=False,
-        #         ncols=150,
-        #         desc=f"layer: {self.layer_idx}",
-        # ):
         for i in range(q_len):
             k_states, v_states = \
                 key_states[:, :, i: i + 1], value_states[:, :, i: i + 1]
 
             sink_key_states, sink_value_states, sink_pos, sink_mask, k_states, v_states, key_pos, mask =\
                 past_key_value.update(k_states, v_states)
-            # past_key_value.update_attention_scores(score)
+
+        # s = sink_key_states.size(2)
+        # k_states_2 = torch.cat((key_states[:, :, s:], key_states[:, :, :s]),
+        #                        dim=2)
+        # v_states_2 = torch.cat(
+        #     (value_states[:, :, s:], value_states[:, :, :s]), dim=2)
+        # if not first_it:
+        #     print(f"{(k_states[:, :, :512] - k_states_2).abs().amax()=}")
+        #     print(f"{(v_states[:, :, :512] - v_states_2).abs().amax()=}")
+
+        # sink_key_states, sink_value_states, sink_pos, sink_mask, k_states, v_states, key_pos, mask =\
+        #     past_key_value.update_batch(key_states, value_states)
+
+        print(f"{sink_pos=}")
 
         sink_key_states = self.rope(sink_key_states, sink_pos)
 
-        sink_mask = repeat_mask(sink_mask, self.num_key_value_groups)
-        sink_key_states = repeat_kv(sink_key_states,
-                                    self.num_key_value_groups)
+        # sink_mask = repeat_mask(sink_mask, self.num_key_value_groups)
+        sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
         sink_value_states = repeat_kv(sink_value_states,
                                       self.num_key_value_groups)
 
         if first_it:
-            query_pos = torch.cat((sink_pos, key_pos), dim=-1)[:, :query_states.size(2)]
+            query_pos = torch.cat((sink_pos, key_pos),
+                                  dim=-1)[:, :query_states.size(2)]
         else:
             query_pos = key_pos[:, :query_states.size(2)]
+            # query states will be out of order on the second iteration. We need to move the
+            # first four to the end.
+            print(f"{query_pos=} {key_pos[:, 512:768]=}")
+            print(f"{sink_key_states.size()=}")
+            print(f"{query_states.size()=}")
+            query_states = torch.cat(
+                (query_states[:, :, sink_key_states.size(2):],
+                 query_states[:, :, :sink_key_states.size(2)]),
+                dim=2)
 
         query_pos = query_pos.view(1, -1)
 
@@ -793,15 +874,21 @@ class LlamaAttention(nn.Module):
         out, out_attn = self.qkto_batch(
             q_states,
             sink_key_states,
-            sink_mask,
+            # sink_mask,
             sink_value_states,
             k_states,
             mask,
             v_states,
             past_key_value,
             (bsz, q_len, -1),
-            include_o=True,
         )
+
+        if not first_it:
+            print(f"not first it")
+            s = sink_key_states.size(2)
+            out = torch.cat((out[:, -s:], out[:, s:]), dim=1)
+
+        print(f"{out.size()=}")
 
         return out, None, past_key_value
 
@@ -1868,9 +1955,9 @@ class LlamaModel(LlamaPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    def clear_caches(self):
+    def clear_caches(self, verbose=True):
         for i, decoder_layer in enumerate(self.layers):
-            decoder_layer.self_attn.past_key_value.reset()
+            decoder_layer.self_attn.past_key_value.reset(verbose=verbose)
 
     def setup_caches(self, world_size=1):
         # adjust the window length of each cascade. The input window length is the max
