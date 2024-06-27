@@ -127,7 +127,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
             with tqdm(range(0, x.size(1) - 1, stride), ncols=150) as pbar:
                 for i in pbar:
                     with torch.no_grad():
-                        inp = input_ids[:, i: i + stride]
+                        inp = input_ids[:, i:i + stride]
                         # use cache false means to use static cascading cache inside the model
                         output = model(inp,
                                        use_cache=False,
@@ -162,7 +162,8 @@ def job_ppl_pg19(args, model, tokenizer, device):
 
                         l, u = j * args.batch_size, (j + 1) * args.batch_size
                         nll_individual[l:u] += _nll.cpu()
-                        count_individual[l:u] += (targets >= 0).sum(dim=-1).cpu()
+                        count_individual[l:u] += (targets
+                                                  >= 0).sum(dim=-1).cpu()
                         step += 1
 
                         if step % 100 == 0:

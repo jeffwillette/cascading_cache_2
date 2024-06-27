@@ -9,7 +9,7 @@ from tqdm import tqdm
 import argparse
 import json
 from transformers import TextStreamer
-# from aim import Run
+from aim import Run
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
@@ -79,11 +79,14 @@ def job_ppl_pg19_compile(args, model, tokenizer, device):
                 )
                 logits = output.logits
 
+        mdl = model.model
         # ================================================================
 
     else:
         model.model.setup_caches(args.world_size)
         model = model.to(args.infer_dtype).cuda()
+        mdl = model.model
+
         # model = deepspeed.init_inference(
         #     model,
         #     tensor_parallel={"tp_size": args.world_size},
@@ -91,13 +94,12 @@ def job_ppl_pg19_compile(args, model, tokenizer, device):
         #     dtype=args.infer_dtype,
         #     injection_policy=get_injection_policy(args.model),
         # )
+        # mdl = model.module.model
 
-    run = MockRun()
     if args.local_rank == 0:
-        # run = Run(experiment=f"{args.method}-pg19"
-        #           ) if not args.dev_run else MockRun()
+        run = Run(experiment=f"{args.method}-pg19"
+                  ) if not args.dev_run else MockRun()
 
-        run = MockRun()
         dataset = "pg19"
         run["hparams"] = {
             "job": "ppl",
@@ -137,39 +139,46 @@ def job_ppl_pg19_compile(args, model, tokenizer, device):
                     # inp = input_ids[:, i:i + 1]
                     # use cache false means to use static cascading cache inside the model
 
+                    inputs = input_ids[:, i:i + stride]
+                    targets = target_ids[:, i + 1:i + stride + 1]
+                    if inputs.size(1) < stride:
+                        pad = torch.zeros(inputs.size(0),
+                                          stride - inputs.size(1),
+                                          device=inputs.device,
+                                          dtype=inputs.dtype)
+
+                        target_pad = torch.full(
+                            (inputs.size(0), stride - inputs.size(1) + 1),
+                            -100,
+                            device=inputs.device,
+                            dtype=inputs.dtype)
+
+                        inputs = torch.cat((inputs, pad), dim=-1)
+                        targets = torch.cat((targets, target_pad), dim=-1)
+                    elif targets.size(1) < inputs.size(1):
+                        target_pad = torch.full(
+                            (inputs.size(0), inputs.size(1) - targets.size(1)),
+                            -100,
+                            device=inputs.device,
+                            dtype=inputs.dtype)
+
+                        targets = torch.cat((targets, target_pad), dim=-1)
+
+                    if i == 0:
+                        mdl.clear_caches()
+
                     if args.world_size == 1 and args.graph:
-                        if i == 0:
-                            model.model.clear_caches()
-
-                        inputs = input_ids[:, i:i + stride]
-                        if inputs.size(1) < stride:
-                            pad = torch.zeros(inputs.size(0),
-                                              stride - inputs.size(1),
-                                              device=inputs.device,
-                                              dtype=inputs.dtype)
-
-                            target_pad = torch.full(
-                                (inputs.size(0), stride - inputs.size(1) + 1),
-                                -100,
-                                device=inputs.device,
-                                dtype=inputs.dtype)
-
-                            inputs = torch.cat((inputs, pad), dim=-1)
-                            target_ids = torch.cat((target_ids, target_pad),
-                                                   dim=-1)
-
                         inp.copy_(inputs)
                         g.replay()
 
                     else:
-                        inp = input_ids[:, i:i + stride]
+                        inp = inputs
                         output = model(inp,
                                        use_cache=False,
                                        reset=i == 0,
                                        output_attentions=False)
                         logits = output.logits
 
-                    targets = target_ids[:, i + 1:i + stride + 1]
                     _nll = torch.nn.functional.cross_entropy(
                         logits.reshape(-1, logits.size(-1)).float(),
                         targets.reshape(-1),
@@ -182,36 +191,25 @@ def job_ppl_pg19_compile(args, model, tokenizer, device):
                     pbar.set_description(
                         f"ppl: {(nll_total / count_total).exp()}")
 
-                    print(f"\n\n{(nll_total / count_total).exp()=}\n\n")
-
                     l, u = j * args.batch_size, (j + 1) * args.batch_size
+                    _nll = _nll.reshape(args.batch_size, -1)
                     nll_individual[l:u] += _nll.cpu().sum(dim=-1)
                     count_individual[l:u] += (targets >= 0).sum(dim=-1).cpu()
                     step += stride
-                    if step == 1024:
-                        exit()
 
-                    if step % 100 == 0:
-                        # ppl = torch.exp(nll_total / count_total).item()
-                        # run.track(ppl,
-                        #           name="ppl-pg19",
-                        #           step=step,
-                        #           context={"subset": "test"})
-                        # pbar.set_description(f"{ppl=:.6f}")
+                    book_idx = l + torch.arange(args.batch_size)
+                    book_ppl = torch.exp(nll_individual[book_idx] /
+                                         count_individual[book_idx])
 
-                        book_idx = l + torch.arange(args.batch_size)
-                        book_ppl = torch.exp(nll_individual[book_idx] /
-                                             count_individual[book_idx])
+                    stats = {}
+                    for k in range(args.batch_size):
+                        key = f"ppl-pg19-book-{l + k}"
+                        val = book_ppl[k].item()
+                        # only track items which have not reached EOS
+                        if targets.reshape(-1)[k] >= 0:
+                            stats[key] = val
 
-                        stats = {}
-                        for k in range(args.batch_size):
-                            key = f"ppl-pg19-book-{l + k}"
-                            val = book_ppl[k].item()
-                            # only track items which have not reached EOS
-                            if targets.reshape(-1)[k] >= 0:
-                                stats[key] = val
-
-                        run.track(stats, step=i, context={"subset": "test"})
+                    run.track(stats, step=i, context={"subset": "test"})
 
     ppl = torch.exp(nll_total / count_total).item()
 

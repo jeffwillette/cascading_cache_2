@@ -56,6 +56,7 @@ def _update_sink_cache(
 
     # kernel constants
     BLOCK_HID: tl.constexpr,
+    batch_iter: tl.constexpr = -1,
 ):
 
     idx_hid = tl.arange(0, BLOCK_HID).to(IDTYPE)
@@ -63,7 +64,11 @@ def _update_sink_cache(
 
     idx_n = tl.program_id(0).to(IDTYPE)
     idx_h = tl.program_id(1).to(IDTYPE)
-    idx_t = tl.program_id(2).to(IDTYPE)
+
+    if batch_iter == -1:
+        idx_t = tl.program_id(2).to(IDTYPE)
+    else:
+        idx_t = batch_iter.to(IDTYPE)
 
     kv_shift = idx_n.to(IDTYPE) * stride_k_n + \
         idx_h.to(IDTYPE) * stride_k_h + \
@@ -75,7 +80,9 @@ def _update_sink_cache(
     val = tl.load(VAL + kv_shift, mask=mask_hid, other=0)
     dtype = key.dtype
 
-    stored_shift = idx_n * stride_ss_n + idx_h * stride_ss_h
+    stored_shift = idx_n.to(IDTYPE) * stride_ss_n + \
+        idx_h.to(IDTYPE) * stride_ss_h
+
     stored = tl.load(STORED_SINKS + stored_shift)
     # print(f"stored: ", stored)
 
@@ -84,6 +91,7 @@ def _update_sink_cache(
         stored.to(IDTYPE) * stride_sk_t + \
         idx_hid.to(IDTYPE) * stride_sk_hid
 
+    # print("storing sink: ", key, idx_n, idx_h)
     tl.store(SINK_K + kv_cshift, value=key.to(dtype), mask=mask_hid)
     tl.store(SINK_V + kv_cshift, value=val.to(dtype), mask=mask_hid)
 
@@ -372,14 +380,26 @@ def _update_kv_cache(
 
     idx_n = tl.program_id(0).to(IDTYPE)
     idx_h = tl.program_id(1).to(IDTYPE)
-    idx_t = tl.program_id(2).to(IDTYPE)
 
     if batch_iter == -1:
+        idx_t = tl.program_id(2).to(IDTYPE)
         real_token_idx = tl.load(REAL_TOKEN_IDX)
+
+        # not needed in loop if batch_iter == -1, but needs to be defined to avoid
+        # compiler error
+        rti = real_token_idx
+        # if idx_n == 0:
+        #     print("single iter real token idx: ", real_token_idx)
     else:
-        # set real token idx for this iter.
-        rti = tl.load(REAL_TOKEN_IDX)
-        real_token_idx = rti + batch_iter
+        idx_t = batch_iter.to(IDTYPE)
+        # set real token idx for this iter. We need two of these variables
+        # because (rti) will be used to update do_cache settings, and real_token_idx
+        # will fill the role of real_token_idx whcih was originally used to track
+        # original positional encodings (and is reset in the eviction algorithm loop)
+        rti = tl.load(REAL_TOKEN_IDX) + batch_iter + 1
+        real_token_idx = rti
+        # if idx_n == 0:
+        #     print("batch iter real token idx: ", real_token_idx)
 
     stored_sinks = tl.load(
         STORED_SINKS + \
@@ -418,6 +438,7 @@ def _update_kv_cache(
             NUM_SINK,
             WINDOW_SIZE,
             BLOCK_HID,
+            batch_iter=batch_iter,
         )
     else:
         idx_hid = tl.arange(0, BLOCK_HID).to(IDTYPE)
@@ -437,10 +458,8 @@ def _update_kv_cache(
         if batch_iter == -1:
             do_cache = tl.load(DO_CACHE + cascades_idx).to(tl.int64)
         else:
-            tmp = tl.full((CASCADES, ),
-                          value=real_token_idx + batch_iter,
-                          dtype=tl.int64)
-            cascades_idx = tl.arange(0, CASCADES).to(IDTYPE)
+            tmp = tl.full((CASCADES, ), value=rti, dtype=tl.int64)
+
             do_cache_every_n = tl.load(DO_CACHE_EVERY_N + cascades_idx)
             do_cache = ((tmp - 1 - NUM_SINK) % do_cache_every_n) == 0
             do_cache = do_cache.to(tl.int64)
@@ -475,7 +494,17 @@ def _update_kv_cache(
             segment_len = WINDOW_SIZE.to(IDTYPE)
 
             # all N will be the same here, so there is no n dimension included
-            do_cache_i = tl.load(DO_CACHE + i.to(IDTYPE))
+            if batch_iter == -1:
+                do_cache_i = tl.load(DO_CACHE + i.to(IDTYPE)).to(tl.int1)
+            else:
+                do_cache_every_n_i = tl.load(DO_CACHE_EVERY_N + i.to(IDTYPE))
+                # not minus 1 because seen tokens is not incremented before the loop in
+                # the batched version.
+                do_cache_i = (((rti - 1 - NUM_SINK) %
+                               do_cache_every_n_i) == 0).to(tl.int1)
+
+            # if idx_n == 0:
+            #     print(f"do cache i: ", do_cache_i)
 
             stored_shift = idx_n.to(tl.int64) * stride_st_n + \
                 idx_h.to(tl.int64) * stride_st_h + \
@@ -487,7 +516,8 @@ def _update_kv_cache(
             # print("do cache i before loop: ", do_cache_i, i)
             if do_cache_i:
                 if stored_tokens_i < segment_len:
-                    # print("append first")
+                    # if idx_n == 0:
+                    #     print("append first")
                     t = start_idx_i.to(IDTYPE) + stored_tokens_i.to(
                         IDTYPE) + l.to(IDTYPE)
 
@@ -506,9 +536,9 @@ def _update_kv_cache(
 
                     tl.store(
                         CACHE_S + \
-                             idx_n.to(IDTYPE) * stride_s_n + \
-                             idx_h.to(IDTYPE) * stride_s_h + \
-                             t.to(IDTYPE) * stride_s_t,
+                             idx_n.to(IDTYPE) * stride_cs_n + \
+                             idx_h.to(IDTYPE) * stride_cs_h + \
+                             t.to(IDTYPE) * stride_cs_t,
                              value=score.to(dtype)
                     )
 
@@ -553,7 +583,8 @@ def _update_kv_cache(
                     do_break = True
 
                 else:
-                    # print("evict")
+                    # if idx_n == 0:
+                    #     print("evict")
                     t = start_idx_i.to(IDTYPE) + l.to(IDTYPE)
 
                     # load the key value and score states which are going do be evicted
@@ -633,7 +664,8 @@ def _update_kv_cache(
                     i += 1
             else:
                 if stored_tokens_i == 0:
-                    # print("eager add")
+                    # if idx_n == 0:
+                    #     print("eager add")
                     # if we are not supposed to move the cache, but we were called
                     # with states as an input. Then there are two possibilities:
                     # 1. We are not supposed to do cache, but the length of this cache is zero.
@@ -709,7 +741,8 @@ def _update_kv_cache(
                     do_break = True
 
                 else:
-                    # print("overwrite")
+                    # if idx_n == 0:
+                    #     print("overwrite")
                     # 2. Since we know this cache has something in it, and we are not to do caching,
                     #    find the most recent thing in this cache, compare attention input_scores,
                     #    and remove if needed.
@@ -732,7 +765,9 @@ def _update_kv_cache(
                     # print("old score: ", old_score.dtype)
                     if score >= old_score:
                         # old input_score is better, do nothing.
-                        # print("overwrite do")
+                        # if idx_n == 0:
+                        #     print("overwrite do: ", t)
+
                         kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
                             idx_h.to(IDTYPE) * stride_ck_h + \
                             t.to(IDTYPE) * stride_ck_t + \
@@ -1487,18 +1522,35 @@ class CascadingSinkCacheTriton(SinkCache):
         self.score_cache = self.beta * self.score_cache + (
             1 - self.beta) * attention_scores
 
+    def get_vals(self):
+        pos_shift = self.num_sink_tokens if self._seen_tokens > self.num_sink_tokens else 0
+
+        return (
+            self.sink_keys,
+            self.sink_values,
+            self.sink_pos[:1, 0],
+            self.sink_mask,
+            self.key_cache,
+            self.value_cache,
+            self.pos[:1, 0] + pos_shift,
+            self.mask,
+            self.og_pos,
+        )
+
     def update_batch(
         self,
         key_states: torch.tensor,
         value_states: torch.tensor,
+        score_states: torch.Tensor = None,
     ) -> tuple[torch.tensor, torch.tensor]:
 
         # init new scores for this incoming kv which has none so far
-        score_states = torch.zeros(self.max_batch_size,
-                                   self.heads,
-                                   1,
-                                   device=key_states.device,
-                                   dtype=key_states.dtype)
+        if score_states is None:
+            score_states = torch.zeros(self.max_batch_size,
+                                       self.heads,
+                                       key_states.size(2),
+                                       device=key_states.device,
+                                       dtype=key_states.dtype)
 
         self._seen_tokens += key_states.shape[-2]
 
@@ -1534,8 +1586,6 @@ class CascadingSinkCacheTriton(SinkCache):
 
         pos_shift = self.num_sink_tokens if self._seen_tokens > self.num_sink_tokens else 0
 
-        # TODO:
-        #  - print out the pos to make sure all heads are getting the same pos
         # print(f"in cascade: {self.sink_pos=}")
         # print(f"in cascade: {self.pos=}")
 
@@ -1548,20 +1598,23 @@ class CascadingSinkCacheTriton(SinkCache):
             self.value_cache,
             self.pos[:1, 0] + pos_shift,
             self.mask,
+            self.og_pos,
         )
 
     def update(
         self,
         key_states: torch.tensor,
         value_states: torch.tensor,
+        score_states: torch.Tensor = None,
     ) -> tuple[torch.tensor, torch.tensor]:
 
         # init new scores for this incoming kv which has none so far
-        score_states = torch.zeros(self.max_batch_size,
-                                   self.heads,
-                                   1,
-                                   device=key_states.device,
-                                   dtype=key_states.dtype)
+        if score_states is None:
+            score_states = torch.zeros(self.max_batch_size,
+                                       self.heads,
+                                       1,
+                                       device=key_states.device,
+                                       dtype=key_states.dtype)
 
         self._seen_tokens += key_states.shape[-2]
         self.seen_tokens += key_states.shape[-2]
@@ -1605,6 +1658,7 @@ class CascadingSinkCacheTriton(SinkCache):
             self.value_cache,
             self.pos[:1, 0] + pos_shift,
             self.mask,
+            self.og_pos,
         )
 
 
@@ -2140,80 +2194,6 @@ class SinkAttentionNaive(nn.Module):
         return self.sink_k_cache, self.sink_v_cache, self.k_cache, self.v_cache
 
 
-def test_batch():
-    cache = CascadingSinkCacheTriton(window_length=WIND,
-                                     num_sink_tokens=NSINK,
-                                     max_batch_size=N,
-                                     heads=HEAD,
-                                     dim=HID,
-                                     n_layers=1,
-                                     max_seq_len=MAX_SEQ,
-                                     device=DEVICE,
-                                     dtype=DTYPE)
-
-    with torch.no_grad():
-        slow_times, fast_times = [], []
-        for i in range(3000):
-            print(f"{'='*50}")
-            k, v = torch.ones(N, HEAD, 1, HID, device=DEVICE, dtype=DTYPE) * (
-                i + 1), torch.ones(N, HEAD, 1, HID, device=DEVICE,
-                                   dtype=DTYPE) * (i + 1)
-            # k, v = torch.randn(1, 1, 1, HID, device=DEVICE,
-            #                    dtype=DTYPE).repeat(N, HEAD, 1, 1), torch.randn(
-            #                        1, 1, 1, HID, device=DEVICE,
-            #                        dtype=DTYPE).repeat(N, HEAD, 1, 1)
-
-            # print(f"\n\n{'='*100}\n\n")
-            # ============================================================================================
-            tic = time.perf_counter()
-            k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask = cache.update(
-                k, v)
-            fast_times.append(time.perf_counter() - tic)
-
-            # print(f"{k=}\n{v=}\n{pos=}\n{sink_mask=}")
-            k, v = torch.cat((k, k_nosink), dim=-2), torch.cat((v, v_nosink),
-                                                               dim=-2)
-
-            k0, k1 = k[0], k[1]
-            print(f"{k.size()=}")
-            for i in range(k0.size(0)):
-                print(f"head: {i}")
-                print(f"0: {k0[i, :, 0]=}")
-                print(f"1: {k1[i, :, 0]=}")
-                diff = (k0[i, :, 0] - k1[i, :, 0]).abs()
-                print(
-                    f"stored tokens: {cache.stored_tokens[0]=} {cache.stored_tokens[1]=}"
-                )
-                print(
-                    f"start indices: {cache.start_indices[0]=} {cache.start_indices[1]=}"
-                )
-                print(f"{diff=}")
-
-            equal = k0 == k1
-            if not torch.all(equal):
-                print(f"equal: ", k0 == k1)
-                print(f"{(k0 - k1).abs().amax()=}")
-                exit()
-            pos = torch.cat((pos, pos_nosink), dim=-1).squeeze(0)
-
-            # print(f"{k[0, 0, :,  0]=}")
-            mask = torch.cat((sink_mask, mask), dim=-1)
-
-            # n = (mask == 0).sum()
-            # k, v = k[:, :, :n], v[:, :, :n]
-            # argsort = torch.argsort(pos[:n])
-            # # print(f"{mask=} {k=} {v=}")
-
-            # print(f"before sort: \n{k.reshape(-1)=}\n{pos.reshape(-1)=}")
-
-            # k, v = k[:, :, argsort], v[:, :, argsort]
-
-            # print(f"after sort: {k.view(-1)}")
-    fast_times = fast_times[100:]
-    fast_times = sum(fast_times) / len(fast_times)
-    print(f"{fast_times=}")
-
-
 def test_against_reference():
     cache_slow = CascadingSinkCache(window_length=WIND,
                                     num_sink_tokens=NSINK,
@@ -2347,6 +2327,84 @@ def test_against_reference():
     fast_times = fast_times[100:]
     slow_times = sum(slow_times) / len(slow_times)
     fast_times = sum(fast_times) / len(fast_times)
+    print(f"{slow_times=} {fast_times=}")
+
+
+def test_batch_vs_single():
+    cache = CascadingSinkCacheTriton(window_length=WIND,
+                                     num_sink_tokens=NSINK,
+                                     max_batch_size=N,
+                                     heads=HEAD,
+                                     dim=HID,
+                                     max_seq_len=MAX_SEQ,
+                                     device=DEVICE,
+                                     dtype=DTYPE)
+
+    ITS = 1024
+    with torch.no_grad():
+        slow_times, fast_times = [], []
+
+        # k_in = torch.arange(ITS, device=DEVICE,
+        #                     dtype=DTYPE).view(1, 1, -1,
+        #                                       1).repeat(N, HEAD, 1, HID)
+        # v_in = torch.arange(ITS, device=DEVICE,
+        #                     dtype=DTYPE).view(1, 1, -1,
+        #                                       1).repeat(N, HEAD, 1, HID)
+
+        s_in = torch.randn(N, HEAD, ITS, device=DEVICE, dtype=DTYPE)
+        k_in = torch.randn(N, HEAD, ITS, HID, device=DEVICE, dtype=DTYPE)
+        v_in = torch.randn(N, HEAD, ITS, HID, device=DEVICE, dtype=DTYPE)
+
+        names = ("k_sink", "v_sink", "pos_sink", "sink_mask", "k", "v", "pos",
+                 "mask", "og pos")
+
+        for k_i, v_i, s_i in zip(k_in.chunk(8, dim=2), v_in.chunk(8, dim=2),
+                                 s_in.chunk(8, dim=2)):
+            out = cache.update_batch(k_i, v_i, s_i)
+
+        torch.cuda.synchronize()
+        cache.reset()
+
+        tic = time.perf_counter()
+        for k_i, v_i, s_i in zip(k_in.chunk(1, dim=2), v_in.chunk(1, dim=2),
+                                 s_in.chunk(1, dim=2)):
+            out = cache.update_batch(k_i, v_i, s_i)
+        # k_fast, v_fast, pos_fast, sink_mask_fast, k_nosink_fast, v_nosink_fast, pos_nosink_fast, mask_fast = cache.update_batch(
+        #     k_in, v_in)
+        torch.cuda.synchronize()
+        fast_times.append(time.perf_counter() - tic)
+        out = [v.clone() for v in out]
+        # print(out)
+        torch.cuda.synchronize()
+
+        cache.reset()
+        for i in range(ITS):
+            # ============================================================================================
+            tic = time.perf_counter()
+            out_slow = cache.update(k_in[:, :, i:i + 1], v_in[:, :, i:i + 1],
+                                    s_in[:, :, i:i + 1])
+            torch.cuda.synchronize()
+            slow_times.append(time.perf_counter() - tic)
+
+    do_exit = False
+    for fast, slow, name in zip(out, out_slow, names):
+        diff = (fast - slow).abs()
+        if diff.sum() > 0:
+            print(f"{name=}\n{diff=}\n{fast=}\n{slow=}")
+            idx = diff.nonzero(as_tuple=True)
+            print("indices: ", idx)
+            print(f"{diff[idx]=}")
+            do_exit = True
+
+        else:
+            print(f"{name} OK!")
+
+    if do_exit:
+        exit()
+
+    slow_times = slow_times[100:]
+    slow_times = sum(slow_times) / len(slow_times)
+    fast_times = sum(fast_times) / len(fast_times) / ITS
     print(f"{slow_times=} {fast_times=}")
 
 
@@ -2492,9 +2550,9 @@ if __name__ == '__main__':
     N = 5
     HID = 128
     NSINK = 4
-    WIND = 8
-    HEAD = 1
-    MAX_SEQ = 128
+    WIND = 512
+    HEAD = 32
+    MAX_SEQ = 2048
     DEVICE = "cuda:0"
     DTYPE = torch.float16
 
@@ -2504,7 +2562,8 @@ if __name__ == '__main__':
     # print(f"{loaded=}")
 
     # test_pows()
-    test_against_reference()
+    # test_against_reference()
+    test_batch_vs_single()
 
     # bench_against_naive()
     # test_batch()

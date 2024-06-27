@@ -4,17 +4,17 @@ WINDOW=(2048)
 CASCADES=(4)
 SINKS=(4)
 BATCH_SIZE=5
-HEAD_REDUCTION=max
+HEAD_REDUCTION=mean
 # CASCADE_FUNC="pow2"
 CASCADE_FUNC="pow2"
-GPUS=(4)
+GPUS=(3)
 
 # MAIN PG19 experiment code
 for i in "${!WINDOW[@]}";
 do 
     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,3 python cascade/main/llama_eval.py \
-    # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
-    PYTHONPATH=. deepspeed --include localhost:4 --master_port 63190 cascade/main/llama_eval.py \
+    # PYTHONPATH=. deepspeed --include localhost:6 --master_port 63190 cascade/main/llama_eval.py \
+    PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
         --model llama7b \
         --job ppl-pg19 \
         --method sink \
@@ -24,9 +24,8 @@ do
         --cascades ${CASCADES[$i]} \
         --cascade_func $CASCADE_FUNC \
         --head_reduction $HEAD_REDUCTION \
-        --comment llama7b-compile-test \
-        --batch_size $BATCH_SIZE \
-        --dev_run
+        --comment llama7b-attn-before-cache \
+        --batch_size $BATCH_SIZE
         sleep 1
 done
 
