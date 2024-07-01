@@ -25,6 +25,7 @@ def _attn_fwd_inner(
     stride_mn,
     SCORES,
     stride_sn,
+    beta: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,  #
@@ -48,23 +49,18 @@ def _attn_fwd_inner(
         mask = tl.load(MASK + Mask_block).to(tl.int64)
 
         qk = tl.dot(q, k)
-
-        unmasked = tl.where(mask, 0, 1)
-
         qk = qk * qk_scale + tl.where(mask, -1.0e6, 0)
 
-        # make a reversed arange and multiply it by the mask
-        beta = 0.991
         exps = tl.flip(tl.arange(0, BLOCK_M))[:, None]
         # do beta ** exps * (1 - beta)
-        exps = tl.exp(exps.to(tl.float16) * tl.log(beta)) * unmasked
-        coeff = exps * (1 - beta)
+        unmasked = tl.where(mask, 0, 1)
+        exps = tl.exp2(exps.to(tl.float16) * tl.log2(beta))
+        coeff = exps * (1 - beta) * unmasked
         score_offset = (start_n + tl.arange(0, BLOCK_N)).to(
             tl.int64) * stride_sn
 
-        local_qk = tl.where(qk <= 5, 0, qk)
-        # local_qk = tl.exp2(qk - tl.max(qk, 1)[:, None])
-        # local_qk = local_qk / tl.sum(local_qk, 1)[:, None]
+        local_qk = tl.exp2(qk - tl.max(qk, 1)[:, None])
+        local_qk = local_qk / tl.sum(local_qk, 1)[:, None]
         tl.atomic_add(SCORES + score_offset, val=tl.sum(local_qk * coeff, 0))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -74,6 +70,7 @@ def _attn_fwd_inner(
         # -- update m_i and l_i
         alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
+
         # -- update output accumulator --
         acc = acc * alpha[:, None]
         # update acc
@@ -99,14 +96,10 @@ def _attn_fwd_inner(
 # re-tuning.
 configs = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
-    # for BM in [64, 128]\
-    # for BN in [32, 64]\
-    # for s in ([1] if is_hip() else [3, 4, 7])\
-    # for w in [4, 8]\
-    for BM in [32]\
-    for BN in [16]\
-    for s in ([1] if is_hip() else [1])\
-    for w in [1]\
+    for BM in [64, 128]\
+    for BN in [32, 64]\
+    for s in ([1] if is_hip() else [3, 4, 7])\
+    for w in [4, 8]\
 ]
 
 
@@ -154,6 +147,7 @@ def _attn_fwd(
         H,
         N_CTX,  #
         N_KV,
+        beta: tl.constexpr,
         BLOCK_M: tl.constexpr,  #
         BLOCK_N: tl.constexpr,  #
         HEAD_DIM: tl.constexpr,  #
@@ -235,6 +229,7 @@ def _attn_fwd(
         stride_mn,
         SCORES + score_offset,
         stride_sn,
+        beta,
         BLOCK_M,
         HEAD_DIM,
         BLOCK_N,  #
@@ -590,7 +585,7 @@ def _attn_bwd(
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, mask):
+    def forward(ctx, q, k, v, causal, sm_scale, mask, beta):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -677,6 +672,7 @@ class _attention(torch.autograd.Function):
             q.shape[1],  #
             N_CTX=q.shape[2],  #
             N_KV=N_KV,
+            beta=beta,
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
             **extra_kern_args)

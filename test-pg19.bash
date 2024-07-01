@@ -1,6 +1,6 @@
 #!/bin/bash
 
-WINDOW=(2048)
+WINDOW=(8192)
 CASCADES=(4)
 SINKS=(4)
 BATCH_SIZE=5

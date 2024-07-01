@@ -451,17 +451,16 @@ class LlamaAttention(nn.Module):
         cascade = isinstance(past_key_value, CascadingSinkCache)
         if static_cascade or cascade:
             if hidden_states.size(1) == 1:
-                pass
-                # return self.forward_cascade(
-                #     hidden_states=hidden_states,
-                #     attention_mask=attention_mask,
-                #     position_ids=position_ids,
-                #     past_key_value=past_key_value,
-                #     output_attentions=output_attentions,
-                #     use_cache=use_cache,
-                #     cache_position=cache_position,
-                #     **kwargs,
-                # )
+                return self.forward_cascade(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
 
             # we are in a batch processing scenario.
             return self.forward_cascade_batch(
@@ -914,26 +913,27 @@ class LlamaAttention(nn.Module):
                     dtype=torch.bool)
 
                 self.causal_mask = torch.cat(
-                    (causal_mask, sink_mask, cache_mask), dim=-1)
+                    (sink_mask, cache_mask, causal_mask), dim=-1)
 
             n_sink = sink_key_states.size(2)
-            self.causal_mask[:, q_len:q_len + n_sink] =\
-                self.causal_mask[:, q_len:q_len + n_sink] * sk_masked[0, 0]
+            self.causal_mask[:, :n_sink] =\
+                self.causal_mask[:, :n_sink] * sk_masked[0, 0]
 
-            self.causal_mask[:, -k_states.size(2):] =\
-                self.causal_mask[:, -k_states.size(2):] * k_masked[0, 0]
+            self.causal_mask[:, n_sink:n_sink + k_states.size(2)] =\
+                self.causal_mask[:, n_sink:n_sink + k_states.size(2)] * k_masked[0, 0]
 
             out, scores = attention(
                 query_states,
-                torch.cat((key_states_pos, sink_key_states, k_states), dim=2),
-                torch.cat((value_states, sink_value_states, v_states), dim=2),
+                torch.cat((sink_key_states, k_states, key_states_pos), dim=2),
+                torch.cat((sink_value_states, v_states, value_states), dim=2),
                 True,
                 scale,
                 self.causal_mask,
+                past_key_value.beta,
             )
 
             beta = past_key_value.beta
-            ema_scores = scores[:, :, q_len + sink_key_states.size(2):].mean(
+            ema_scores = scores[:, :, n_sink:n_sink + k_states.size(2)].mean(
                 dim=1, keepdim=True)
             past_key_value.score_cache = beta**out.size(
                 2) * past_key_value.score_cache + ema_scores
@@ -941,172 +941,10 @@ class LlamaAttention(nn.Module):
             _ = past_key_value.update_batch(
                 key_states,
                 value_states,
-                score_states=scores[:, :, :q_len].mean(
-                    dim=1, keepdim=True).repeat(1, scores.size(1), 1),
+                score_states=scores[:, :,
+                                    -q_len:].mean(dim=1, keepdim=True).repeat(
+                                        1, scores.size(1), 1),
             )
-
-        out = out.transpose(1, 2).contiguous()
-        out = out.view(bsz, q_len, -1)
-
-        out = self.o(out)
-
-        return out, None, past_key_value
-
-    def forward_cascade_batch_full(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        use_flash: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-               Optional[Tuple[torch.Tensor]]]:
-
-        bsz, q_len, _ = hidden_states.size()
-
-        # project qkv first for this layer
-        query_states, key_states, value_states = self.qkv(
-            hidden_states, (bsz, q_len, self.num_heads, self.head_dim),
-            (bsz, q_len, self.num_key_value_heads, self.head_dim))
-
-        # In case static cache is used, it is an instance attribute.
-        past_key_value = getattr(self, "past_key_value", past_key_value)
-        first_it = past_key_value._seen_tokens == 0
-        if kwargs.get("reset", False):
-            past_key_value.reset(verbose=True)
-            if hasattr(self, "causal_mask"):
-                delattr(self, "causal_mask")
-
-        sink_key_states, sink_value_states, sink_pos, sink_mask, k_states, v_states, key_pos, mask, og_pos =\
-            past_key_value.get_vals()
-
-        sk_masked = sink_mask < 0
-        k_masked = mask < 0
-
-        max_pos = 0  # may be reset later
-        if not hasattr(self, "query_pos"):
-            self.query_pos = torch.arange(0,
-                                          query_states.size(2),
-                                          device=query_states.device,
-                                          dtype=torch.long).view(1, -1)
-
-        if not first_it:
-            max_pos = torch.cat((sink_pos, key_pos), dim=-1).amax() + 1
-
-        query_pos = self.query_pos + max_pos
-
-        query_states = self.rope(query_states, query_pos)
-        key_states_pos = self.rope(key_states, query_pos)
-        sink_key_states = self.rope(sink_key_states, sink_pos)
-        k_states = self.rope(k_states, key_pos)
-
-        key_states_pos = repeat_kv(key_states_pos, self.num_key_value_groups)
-        sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
-        k_states = repeat_kv(k_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-        scale = 1 / math.sqrt(query_states.size(-1))
-
-        if not use_flash:
-            val = torch.finfo(query_states.dtype).min
-            if not hasattr(self, "causal_mask"):
-                self.causal_mask = torch.full(
-                    (query_states.size(2), query_states.size(2)),
-                    val,
-                    device=query_states.device,
-                    dtype=query_states.dtype).triu(1)
-
-                self.sink_mask = torch.full(
-                    (query_states.size(2), sink_key_states.size(2)),
-                    val,
-                    device=query_states.device,
-                    dtype=query_states.dtype)
-
-                self.cache_mask = torch.full(
-                    (query_states.size(2), k_states.size(2)),
-                    val,
-                    device=query_states.device,
-                    dtype=query_states.dtype)
-
-            qattn = torch.einsum("bhqd,bhkd->bhqk",
-                                 query_states * np.sqrt(scale),
-                                 key_states_pos * np.sqrt(scale))
-            qattn = qattn + self.causal_mask
-            sattn = torch.einsum("bhqd,bhkd->bhqk",
-                                 query_states * np.sqrt(scale),
-                                 sink_key_states * np.sqrt(scale))
-
-            sattn = sattn + (self.sink_mask[None, None, :] *
-                             sk_masked[:, :, None, :])
-
-            cattn = torch.einsum("bhqd,bhkd->bhqk",
-                                 query_states * np.sqrt(scale),
-                                 k_states * np.sqrt(scale))
-            cattn = cattn + (self.cache_mask[None, None, :] *
-                             k_masked[:, :, None, :])
-
-            attn = torch.cat((qattn, sattn, cattn), dim=-1)
-            attn = attn.softmax(dim=-1)
-
-            out = attn[:, :, :, :q_len] @ value_states + \
-                attn[:, :, :, q_len : q_len + sink_key_states.size(2)] @ sink_value_states + \
-                attn[:, :, :, -v_states.size(2):] @ v_states
-
-            scores = attn.sum(dim=2) / (attn > 1e-6).sum(dim=2)
-            scores = scores.mean(dim=1,
-                                 keepdim=True).repeat(1, attn.size(1), 1)
-
-        else:
-            if not hasattr(self, "causal_mask"):
-                causal_mask = torch.full(
-                    (query_states.size(2), query_states.size(2)),
-                    1,
-                    device=query_states.device,
-                    dtype=torch.bool).triu(1)
-
-                sink_mask = torch.full(
-                    (query_states.size(2), sink_key_states.size(2)),
-                    1,
-                    device=query_states.device,
-                    dtype=torch.bool)
-
-                cache_mask = torch.full(
-                    (query_states.size(2), k_states.size(2)),
-                    1,
-                    device=query_states.device,
-                    dtype=torch.bool)
-
-                self.causal_mask = torch.cat(
-                    (causal_mask, sink_mask, cache_mask), dim=-1)
-
-            n_sink = sink_key_states.size(2)
-            self.causal_mask[:, q_len:q_len + n_sink] =\
-                self.causal_mask[:, q_len:q_len + n_sink] * sk_masked[0, 0]
-
-            self.causal_mask[:, -k_states.size(2):] =\
-                self.causal_mask[:, -k_states.size(2):] * k_masked[0, 0]
-
-            out, scores = attention(
-                query_states,
-                torch.cat((key_states_pos, sink_key_states, k_states), dim=2),
-                torch.cat((value_states, sink_value_states, v_states), dim=2),
-                True,
-                scale,
-                self.causal_mask,
-            )
-            scores = scores.mean(dim=1,
-                                 keepdim=True).repeat(1, scores.size(1), 1)
-
-        past_key_value.update_attention_scores(
-            scores[:, :, None, q_len + sink_key_states.size(2):])
-        _ = past_key_value.update_batch(
-            key_states,
-            value_states,
-            score_states=(1 - past_key_value.beta) * scores[:, :, :q_len],
-        )
 
         out = out.transpose(1, 2).contiguous()
         out = out.view(bsz, q_len, -1)

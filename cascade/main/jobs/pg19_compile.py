@@ -40,7 +40,7 @@ def get_injection_policy(model_id):
 
 
 def job_ppl_pg19_compile(args, model, tokenizer, device):
-    stride = 512
+    stride = 1024
     args.graph = False
     if args.world_size == 1 and args.graph:
         model.model.setup_caches(args.world_size)
