@@ -20,6 +20,7 @@ from cascade.main.jobs.ppl import job_ppl
 from cascade.main.jobs.passkey import job_passkey
 from cascade.main.jobs.ppl_memory import job_ppl_memory
 from cascade.main.jobs.pg19 import job_ppl_pg19
+from cascade.main.jobs.profile import job_profile
 from cascade.main.jobs.pg19_compile import job_ppl_pg19_compile
  # from cascade.main.jobs.stream import job_stream
 from cascade.main.jobs.mmlu import job_mmlu
@@ -274,6 +275,8 @@ def main():
     elif args.job == 'ppl-pg19':
         # job_ppl_pg19(args, model, tokenizer, device)
         job_ppl_pg19_compile(args, model, tokenizer, device)
+    elif args.job == 'profile':
+        job_profile(args, model, tokenizer, device)
     elif args.job == 'stream':
         raise NotImplementedError(
             "implementation needs to be updated to current")

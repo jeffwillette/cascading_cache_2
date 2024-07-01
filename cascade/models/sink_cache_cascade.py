@@ -2408,6 +2408,30 @@ def test_batch_vs_single():
     print(f"{slow_times=} {fast_times=}")
 
 
+def nsys():
+    cache = CascadingSinkCacheTriton(window_length=WIND,
+                                     num_sink_tokens=NSINK,
+                                     max_batch_size=N,
+                                     heads=HEAD,
+                                     dim=HID,
+                                     max_seq_len=MAX_SEQ,
+                                     device=DEVICE,
+                                     dtype=DTYPE)
+
+    ITS = 16384
+    with torch.no_grad():
+        s_in = torch.randn(N, HEAD, ITS, device=DEVICE, dtype=DTYPE)
+        k_in = torch.randn(N, HEAD, ITS, HID, device=DEVICE, dtype=DTYPE)
+        v_in = torch.randn(N, HEAD, ITS, HID, device=DEVICE, dtype=DTYPE)
+
+        names = ("k_sink", "v_sink", "pos_sink", "sink_mask", "k", "v", "pos",
+                 "mask", "og pos")
+
+        for k_i, v_i, s_i in zip(k_in.chunk(1, dim=2), v_in.chunk(1, dim=2),
+                                 s_in.chunk(1, dim=2)):
+            out = cache.update_batch(k_i, v_i, s_i)
+
+
 def test_pows():
     cache = CascadingSinkCacheTriton(window_length=WIND,
                                      num_sink_tokens=NSINK,
@@ -2563,7 +2587,8 @@ if __name__ == '__main__':
 
     # test_pows()
     # test_against_reference()
-    test_batch_vs_single()
+    # test_batch_vs_single()
+    nsys()
 
     # bench_against_naive()
     # test_batch()
