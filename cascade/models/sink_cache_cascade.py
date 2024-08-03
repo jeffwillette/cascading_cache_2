@@ -594,8 +594,8 @@ def _update_kv_cache(
                         idx_hid.to(IDTYPE) * stride_ck_hid
 
                     real_pos_adds = idx_n.to(IDTYPE) * stride_op_n + \
-                            idx_h.to(IDTYPE) * stride_op_h + \
-                            t.to(IDTYPE) * stride_op_t
+                        idx_h.to(IDTYPE) * stride_op_h + \
+                        t.to(IDTYPE) * stride_op_t
 
                     # we need to evict
                     # 1. find the oldest token (start point), remove it and
@@ -763,51 +763,51 @@ def _update_kv_cache(
 
                     # print("score: ", score.dtype)
                     # print("old score: ", old_score.dtype)
-                    if score >= old_score:
-                        # old input_score is better, do nothing.
-                        # if idx_n == 0:
-                        #     print("overwrite do: ", t)
+                    # if score >= old_score:
+                    # old input_score is better, do nothing.
+                    # if idx_n == 0:
+                    #     print("overwrite do: ", t)
 
-                        kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
-                            idx_h.to(IDTYPE) * stride_ck_h + \
-                            t.to(IDTYPE) * stride_ck_t + \
-                            idx_hid.to(IDTYPE) * stride_ck_hid
+                    kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
+                        idx_h.to(IDTYPE) * stride_ck_h + \
+                        t.to(IDTYPE) * stride_ck_t + \
+                        idx_hid.to(IDTYPE) * stride_ck_hid
 
-                        tl.store(CACHE_K + kv_adds,
-                                 value=key.to(dtype),
-                                 mask=mask_hid)
-                        tl.store(CACHE_V + kv_adds,
-                                 value=value.to(dtype),
-                                 mask=mask_hid)
+                    tl.store(CACHE_K + kv_adds,
+                             value=key.to(dtype),
+                             mask=mask_hid)
+                    tl.store(CACHE_V + kv_adds,
+                             value=value.to(dtype),
+                             mask=mask_hid)
 
-                        # print("store in token swap: ", real_token_idx)
-                        tl.store(
-                            OG_POS + \
-                                idx_n.to(IDTYPE) * stride_op_n + \
-                                idx_h.to(IDTYPE) * stride_op_h + \
-                                t.to(IDTYPE) * stride_op_t,
-                            value=real_token_idx.to(IDTYPE),
-                        )
+                    # print("store in token swap: ", real_token_idx)
+                    tl.store(
+                        OG_POS + \
+                            idx_n.to(IDTYPE) * stride_op_n + \
+                            idx_h.to(IDTYPE) * stride_op_h + \
+                            t.to(IDTYPE) * stride_op_t,
+                        value=real_token_idx.to(IDTYPE),
+                    )
 
-                        tl.store(CACHE_S + cs_shift, value=score)
+                    tl.store(CACHE_S + cs_shift, value=score)
 
-                        _update_positional_idx(
-                            POS,
-                            stride_p_n,
-                            stride_p_h,
-                            stride_p_t,
-                            idx_n,
-                            idx_h,
-                            u,
-                            l,
-                            segment_len,
-                            pos_ub,
-                            stored_tokens_i,
-                            start_idx_i,
-                            WINDOW_SIZE_CONST,
-                        )
+                    _update_positional_idx(
+                        POS,
+                        stride_p_n,
+                        stride_p_h,
+                        stride_p_t,
+                        idx_n,
+                        idx_h,
+                        u,
+                        l,
+                        segment_len,
+                        pos_ub,
+                        stored_tokens_i,
+                        start_idx_i,
+                        WINDOW_SIZE_CONST,
+                    )
 
-                    do_break = True
+                    do_break = True  # keep at this indent level
 
 
 class SinkCacheBatchFunc(Function):

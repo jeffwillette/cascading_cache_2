@@ -5,122 +5,97 @@ from torch.utils.data import Dataset
 import numpy as np
 
 # PREFIX = "There is important info hidden inside a lot of irrelevant text. Find the important info and memorize it. I will quiz you about the the important information. "
-PREFIX = "There is a pass key hidden inside a lot of irrelevant text. Find the pass key and memorize it. I will quiz you about the the pass key. "
-FILLER_TEXT = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. Remember the pass key."
-QUERY = "What is the pass key? The pass key is "
+# PREFIX = "There is a pass key token [KEY]<numbers>[/KEY] hidden inside a lot of irrelevant text. Find the <numbers> in the [KEY] token and memorize them. I will quiz you about the the <numbers>. Do not forget the <numbers> inside the [KEY]"
+# FILLER_TEXT = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again"
+# FILLER_TEXT = "If you see <numbers> inside a [KEY], don't forget the <numbers> inside the [KEY]<numbers>[/KEY]."
+# QUERY = "What is the pass key [KEY]<numbers>[/KEY]? The pass key <numbers> are "
+
+PREFIX = """<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 26 Jul 2024
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+There is a pass key hidden inside a lot of irrelevant text. Find the pass key and memorize it. I will quiz you about the the pass key.
+
+"""
+# FILLER_TEXT = """The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. """
+QUERY = """\n So now, I will ask the question. What is the five digit pass key?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Sure! I surely remember the five digits pass key. The pass key is $"""
 
 
 def interpolate_passkey(k):
-    return f"The pass key is {k}. Remember it. {k} is the pass key. "
+    keyline = f"HERE IS THE PASSKEY! The pass key is {k}. {k} is the pass key. **the pass key is {k}** LOOK BEHIND FOR PASSKEY"
+    return f"=== NOW IMPORTANT INFORMATION STARTS ===\n{keyline}\nREPEAT THE INFORMATION\n{keyline}\n=== IMPORTANT INFORMATION STOPS ==="
 
 
-def gen_text():
-    os.makedirs('./cache/passkey', exist_ok=True)
-    text_path = './cache/passkey/passkey.txt'
-    label_path = './cache/passkey/passkey-label.txt'
+def gen_filler_text(num_words):
+    import random
 
-    if os.path.exists(text_path):
-        print(f"loading cached text from: {text_path}")
+    out = []
+    word_file = "/usr/share/dict/words"
+    WORDS = open(word_file).read().splitlines()
+    for i in range(num_words):
+        out += [random.choice(WORDS)]
 
-        with open(text_path) as f:
-            out = f.readlines()
-        out = [o[:-1] for o in out]
+    return " ".join(out)
 
-        with open(label_path) as f:
-            out_labels = f.readlines()
-        out_labels = [o[:-1] for o in out_labels]
 
-        return out, out_labels
-    else:
-        print("generating text")
-        prefix_len = len(PREFIX[:-1].split(" "))
-        filler_len = len(FILLER_TEXT[:-1].split(" "))
-        query_len = len(QUERY[:-1].split(" "))
+FILLER_TEXT = gen_filler_text(128000)
 
-        inputs, targets = [], []
-        # prompt_lens = [2000, 4000, 8000, 16000, 32000, 64000]
-        prompt_lens = [2000, 4000, 8000, 16000, 32000]
-        # prompt_lens.reverse()
+print(FILLER_TEXT[:10000])
 
-        for l in prompt_lens:
-            n_fillers = (l - prefix_len - query_len) // filler_len + 1
-            for i in range(50):
 
-                text = [PREFIX] + [FILLER_TEXT] * n_fillers
+def gen_text(tokenizer):
+    prefix_tok = tokenizer(PREFIX, return_tensors="pt", truncation=False).input_ids[0]
+    prefix_len = prefix_tok.shape[0]
 
-                k = np.random.randint(10000, 50000)
+    query_tok = tokenizer(QUERY, return_tensors="pt", truncation=False).input_ids[0]
+    query_len = query_tok.shape[0]
+
+    filler_tok = tokenizer(FILLER_TEXT, return_tensors="pt", truncation=False).input_ids[0]
+    # filler_tok = torch.randperm(128000)
+
+    inputs, targets, len_loc = [], [], []
+    prompt_lens = [2048, 4096, 8192, 16384, 32768, 65536]
+    insert_locs = [0.2, 0.4, 0.6, 0.8, 1.0]
+
+    for l in prompt_lens:
+        n_fillers = (l - prefix_len - query_len)
+        filler = filler_tok[:n_fillers]
+        for loc in insert_locs:
+            for i in range(25):
+
+                k = np.random.randint(10000, 100000)
 
                 key_phrase = interpolate_passkey(k)
                 target = f"{k}"
+                key_tok = tokenizer(key_phrase, return_tensors="pt", truncation=False).input_ids[0]
+                local_filler = filler[:-key_tok.shape[0]]
 
-                insert_loc = np.random.randint(2, (len(text) - 1) // 2)
-                text = text[:insert_loc] + \
-                    [key_phrase] + text[insert_loc:] + [QUERY]
+                start, end = int((loc - 0.2) * l), int(loc * l)
+                insert_loc = np.random.randint(start, end)
+                tokens = torch.cat((prefix_tok, local_filler[:insert_loc], key_tok, local_filler[insert_loc:], query_tok))
 
-                text = "".join(text)
-
-                inputs.append(text)
+                inputs.append(tokens)
                 targets.append(target)
+                len_loc.append((l, loc))
 
-        with open(text_path, "w+") as f:
-            for t in inputs:
-                f.write(t)
-                f.write("\n")
-
-        with open(label_path, "w+") as f:
-            for t in targets:
-                f.write(t)
-                f.write("\n")
-
-        return gen_text()
-
-
-def gen_dataset(tokenizer):
-    print(tokenizer, vars(tokenizer))
-
-    os.makedirs('./cache/passkey', exist_ok=True)
-    name = tokenizer.name_or_path.replace("/", "-")
-    if name[0] == "-":
-        name = name[1:]
-
-    cache_path = f'./cache/passkey/{name}-tokenized.pth'
-
-    if os.path.exists(cache_path):
-        print(f"loading cached tokenized text from: {cache_path}")
-        return torch.load(cache_path)
-    else:
-        inputs, targets = gen_text()
-
-        x, y = [], []
-        for inp, tgt in zip(inputs, targets):
-            x += [
-                tokenizer(inp, return_tensors="pt", truncation=False).input_ids
-            ]
-            y += [
-                tokenizer(
-                    tgt,
-                    return_tensors="pt",
-                    truncation=False,
-                    add_special_tokens=False,
-                ).input_ids
-            ]
-
-        for i in range(len(x)):
-            print(x[i].size(), y[i].size())
-
-        torch.save([x, y], cache_path)
-        return gen_dataset(tokenizer)
+    return inputs, targets, len_loc
 
 
 class Passkey(Dataset):
 
     def __init__(self, tokenizer, batch_size=10):
         self.tokenizer = tokenizer
-        self.dataset = gen_dataset(self.tokenizer)
+        inputs, targets, len_loc = gen_text(self.tokenizer)
         self.batch_size = batch_size
 
-        self.inputs = self.dataset[0]
-        self.targets = self.dataset[1]
+        self.inputs = inputs
+        self.targets = targets
+        self.len_loc = len_loc
 
     def __len__(self):
         return (len(self.inputs) // self.batch_size)
@@ -130,34 +105,16 @@ class Passkey(Dataset):
             raise IndexError("Index out of range")
 
         inputs = self.inputs[idx * self.batch_size:(idx + 1) * self.batch_size]
-        targets = self.targets[idx * self.batch_size:(idx + 1) *
-                               self.batch_size]
+        targets = self.targets[idx * self.batch_size:(idx + 1) * self.batch_size]
+        len_loc = self.len_loc[idx * self.batch_size:(idx + 1) * self.batch_size]
 
-        # max_size = max([v.size(1) for v in inputs])
-        # max_size_target = max([v.size(1) for v in targets])
-
-        # out_inputs, out_targets = [], []
-        # for v, u in zip(inputs, targets):
-        #     out_inputs.append(
-        #         torch.cat((v, -100 * torch.ones(
-        #             1, max_size - v.size(1), device=v.device, dtype=v.dtype)),
-        #                   dim=-1))
-
-        #     out_targets.append(
-        #         torch.cat((u,
-        #                    torch.full((1, max_size_target - u.size(1)),
-        #                               fill_value=-100,
-        #                               device=u.device,
-        #                               dtype=u.dtype)),
-        #                   dim=-1))
-
-        return torch.cat(inputs, dim=0), torch.cat(targets, dim=0)
+        return torch.stack(inputs, dim=0), targets, len_loc
 
 
 if __name__ == '__main__':
     import transformers
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        'togethercomputer/LLaMA-2-7B-32K')
+        'meta-llama/Meta-Llama-3-8B-Instruct')
 
     token_prefix = tokenizer(PREFIX, return_tensors="pt",
                              truncation=False).input_ids

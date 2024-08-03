@@ -18,11 +18,12 @@ from cascade.utils import seed, get_bench
 # from cascade.main.jobs.bench_single_layer import job_bench_single_layer
 from cascade.main.jobs.ppl import job_ppl
 from cascade.main.jobs.passkey import job_passkey
+from cascade.main.jobs.latency import job_latency
 from cascade.main.jobs.ppl_memory import job_ppl_memory
 from cascade.main.jobs.pg19 import job_ppl_pg19
 from cascade.main.jobs.profile import job_profile
 from cascade.main.jobs.pg19_compile import job_ppl_pg19_compile
- # from cascade.main.jobs.stream import job_stream
+# from cascade.main.jobs.stream import job_stream
 from cascade.main.jobs.mmlu import job_mmlu
 from cascade.main.eval_args import eval_args, ArgsType
 
@@ -111,6 +112,8 @@ def load_model(args):
 
     device = 'cuda:0'
     MODELS = {
+        'llama3.1-8b-instruct': 'meta-llama/Meta-Llama-3.1-8B-Instruct',
+        'llama3.1-8b': 'meta-llama/Meta-Llama-3.1-8B',
         'llama7b': 'togethercomputer/LLaMA-2-7B-32K',
         'llama13b': 'meta-llama/Llama-2-13b-hf',
         'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
@@ -144,6 +147,12 @@ def load_model(args):
     config = get_config(model_id)
 
     config._attn_implementation = config.attn_implementation = 'eager'
+    if args.method == "vanilla":
+        config._attn_implementation = config.attn_implementation = 'flash_attention_2'
+
+    if args.job == "latency":
+        config.max_position_embeddings = 2 ** 19
+
     config._batch_size = args.batch_size
     config._sinks = args.sinks
     config._cascades = args.cascades
@@ -151,7 +160,8 @@ def load_model(args):
     config.world_size = args.world_size
     config._cascade_func = args.cascade_func
     config._head_reduction = args.head_reduction
-    config._hyper = args.method == "hyper"
+    # config._hyper = args.method == "hyper"
+    config._method = args.method
 
     if args.model == "llama13b_32k":
         config.max_position_embeddings = 32768
@@ -259,7 +269,7 @@ def main():
 
     assert args.job in [
         'ppl', 'ppl-pg19', 'ppl-memory', 'stream', 'mmlu',
-        'bench_single_layer', 'passkey'
+        'bench_single_layer', 'passkey', 'profile', "latency"
     ]
 
     model, tokenizer, device = load_model(args)
@@ -270,6 +280,8 @@ def main():
         # job_ppl(args, model, tokenizer, device)
     elif args.job == 'ppl-memory':
         job_ppl_memory(args, model, tokenizer, device)
+    elif args.job == 'latency':
+        job_latency(args, model, tokenizer, device)
     elif args.job == 'passkey':
         job_passkey(args, model, tokenizer, device)
     elif args.job == 'ppl-pg19':

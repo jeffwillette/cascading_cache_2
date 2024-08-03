@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # passkey experiment
-GPUS=(5)
-WINDOW=(2048)
-CASCADES=(8)
+GPUS=(6)
+WINDOW=(4096)
+CASCADES=(4)
 SINKS=(64)
-BATCH_SIZE=5
+BATCH_SIZE=1
 
 # GPUS=(2)
 # WINDOW=(512)
@@ -30,10 +30,10 @@ MODEL=llama3.1-8b-instruct
 
 for i in "${!GPUS[@]}";
 do 
-    # PYTHONPATH=. deepspeed --include localhost:3,4,5,6 --master_port 63280 cascade/main/llama_eval.py \
+    # PYTHONPATH=. deepspeed --include localhost:5,6 --master_port 63280 cascade/main/llama_eval.py \
     PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
         --model $MODEL \
-        --job passkey \
+        --job latency \
         --method sink \
         --lora_r 0 \
         --window ${WINDOW[$i]} \

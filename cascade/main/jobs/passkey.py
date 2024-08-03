@@ -11,8 +11,14 @@ import deepspeed
 from cascade.main.jobs.pg19 import get_injection_policy
 
 
+def get_numbers(s):
+    lst = [c for c in s if c.isdigit()]
+    return ''.join(lst)
+
+
 def job_passkey(args, model, tokenizer, device):
-    model.model.setup_caches(args.world_size)
+    if args.method != "vanilla":
+        model.model.setup_caches(args.world_size, verbose=False)
 
     if args.world_size > 1:
         model = deepspeed.init_inference(
@@ -20,79 +26,79 @@ def job_passkey(args, model, tokenizer, device):
             tensor_parallel={"tp_size": args.world_size},
             replace_with_kernel_inject=False,
             dtype=args.infer_dtype,
+
             injection_policy=get_injection_policy(args.model),
         )
         m = model.module.model
     else:
         model = model.to(args.infer_dtype).cuda()
-        model = torch.compile(model, mode="max-autotune", fullgraph=False)
+        # model = torch.compile(model, mode="max-autotune", fullgraph=False)
         m = model.model
 
     dataset = Passkey(tokenizer, batch_size=args.batch_size)
 
-    total_acc, total_acc_per_token = [], []
-    for j, (input_ids, target_ids) in enumerate(tqdm(dataset, ncols=150)):
+    stride = 1024
+    total_acc = {}
+    for j, (input_ids, targets, len_locs) in enumerate(tqdm(dataset, ncols=150)):
         input_ids = input_ids.cuda()
-        target_ids = target_ids.cuda()
 
-        m.clear_caches()
+        if args.method != "vanilla":
+            m.clear_caches()
+
         correct, count = 0, 0
-        correct_per_token, count_per_token = 0, 0
 
         with torch.no_grad():
-            with tqdm(range(input_ids.size(1)), ncols=150) as pbar2:
-                for i in pbar2:
-                    inp = input_ids[:, i:i + 1]
-                    output = model(inp, use_cache=False, reset=i == 0)
+            if args.method == "sink":
+                with tqdm(range(0, input_ids.size(1), stride), ncols=150) as pbar2:
+                    for i in pbar2:
+                        inp = input_ids[:, i:i + stride]
+                        output = model(inp, use_cache=False, reset=i == 0)
 
-                guesses, terminated, i = [], [False] * target_ids.size(0), 0
-                while not all(terminated):
+                # print(f"{inp.size()=} {input_ids.size()=}")
+                guesses, i = [], 0
+                for i in range(100):
                     pred = output.logits[:, -1:].argmax(dim=-1)
                     guesses += [pred]
                     output = model(pred, use_cache=False, reset=False)
 
-                    for j in range(output.logits.size(0)):
-                        if output.logits[j,
-                                         0].argmax() == tokenizer.eos_token_id:
-                            terminated[j] = True
-
-                    i += 1
-                    if i == 100:
-                        break
-
                 guesses = torch.cat(guesses, dim=-1)
 
-                guess_string = tokenizer.batch_decode(guesses)
-                target_string = tokenizer.batch_decode(target_ids)
-                print(f"{guess_string=} {target_string=}")
+            else:
+                output = model.generate(
+                    input_ids,
+                    max_new_tokens=100,
+                    min_new_tokens=100,
+                    do_sample=False,
+                    num_beams=1,
+                )
+                guesses = output[:, input_ids.shape[1]:]
 
-                correct = sum(
-                    [t in g for t, g in zip(target_string, guess_string)])
-                count += len(guess_string)
+            guess_string = [get_numbers(s.strip())[:5] for s in tokenizer.batch_decode(guesses)]
+            # print(f"{guess_string=} {targets=}")
+            guess_string, target_string = "".join(guess_string), "".join(targets)
+            print(guess_string, target_string)
 
-                for (t, g) in zip(target_string, guess_string):
-                    for n in t:
-                        count_per_token += 1
-                        if n in g:
-                            correct_per_token += 1
+            for x, y in zip(guess_string, target_string):
+                if x == y:
+                    correct += 1
+                count += 1
 
-                acc = correct / count
-                acc_per_token = correct_per_token / count_per_token
+            len_loc = len_locs[0]  # they should all be the same in a single batch
 
-                print(f"{acc=} {acc_per_token=}")
-                total_acc.append(acc)
-                total_acc_per_token.append(acc_per_token)
-                # total_acc_per_token.append(acc_per_token)
+            if len_loc not in total_acc.keys():
+                total_acc[len_loc] = [correct, count]
+            else:
+                total_acc[len_loc][0] += correct
+                total_acc[len_loc][1] += count
+
+            for k, v in total_acc.items():
+                print(f"{k}: {v[0] / v[1]}")
 
     os.makedirs('./cache/llama_eval/', exist_ok=True)
     if args.method == "sink":
         with open(
                 f'./cache/llama_eval/ppl-passkey-{args.method}-sinks-{args.sinks}-window-{args.window}-cascade-{args.cascades}-{args.model}.json',
                 'w') as f:
-            json.dump(
-                {
-                    'accuracy': total_acc,
-                    "acc_per_token": total_acc_per_token
-                }, f)
+            json.dump(total_acc, f)
     else:
         raise NotImplementedError(f"{args.method} not implemented")
