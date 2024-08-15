@@ -263,7 +263,7 @@ def load_model(args):
 
 
 def main():
-    seed()
+    seed(seed=42)
 
     args = eval_args()
 

@@ -111,7 +111,7 @@ def keep(conf):
     return True
 
 
-@triton.autotune(list(filter(keep, configs)), key=["N_CTX"])
+# @triton.autotune(list(filter(keep, configs)), key=["N_CTX"])
 @triton.jit
 def _attn_fwd(
         Q,
@@ -598,9 +598,10 @@ class _attention(torch.autograd.Function):
 
         # pad the key values because the BLOCK_N is always expecting some multiple of BLOCK_N
         # we will have to mask out the unwanted values in the attention_inner
+        b, h, s, d = k.shape
+        N_SCORES = N_KV
         if N_KV % 32 != 0:
-            b, h, s, d = k.shape
-            n = 32 - (N_KV % 32)
+            n = 32 - (N_KV % 32)  # + 32
             k = torch.cat(
                 (k, torch.zeros(b, h, n, d, dtype=k.dtype, device=k.device)),
                 dim=2)
@@ -614,6 +615,24 @@ class _attention(torch.autograd.Function):
                      mask.size(0), n, dtype=mask.dtype, device=mask.device)),
                 dim=-1)
 
+            N_SCORES += n
+
+        scores = torch.zeros(q.size(0),
+                             q.size(1),
+                             N_SCORES,
+                             device=q.device,
+                             dtype=q.dtype)
+
+        og_q = q.size(2)
+        if q.size(2) % 64 != 0:
+            n = 64 - (q.size(2) % 64)
+            q = torch.cat((q, torch.zeros(b, h, n, d, dtype=q.dtype, device=q.device)), dim=2)
+            mask = torch.cat(
+                (mask,
+                 torch.ones(
+                     n, mask.size(1), dtype=mask.dtype, device=mask.device)),
+                dim=0)
+
         o = torch.empty_like(q)
         stage = 3 if causal else 1
         extra_kern_args = {}
@@ -625,18 +644,24 @@ class _attention(torch.autograd.Function):
                 "allow_flush_denorm": True
             }
 
-        grid = lambda args: (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[
+        def grid(args): return (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[
             0] * q.shape[1], 1)
+        # def grid(args):
+        #     return triton.cdiv(q.shape[2], args["BLOCK_M"]), 1, 1
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]),
                         device=q.device,
                         dtype=torch.float32)
 
-        scores = torch.zeros(q.size(0),
-                             q.size(1),
-                             N_KV,
-                             device=q.device,
-                             dtype=q.dtype)
+        # scores = torch.zeros(q.size(0),
+        #                      q.size(1),
+        #                      N_KV,
+        #                      device=q.device,
+        #                      dtype=q.dtype)
+
+        # print(f"{q.size()=} {k.size()=} {v.size()=} {sm_scale=} {M.size()=} {o.size()=}")
+        # print(f"{mask.size()=} {scores.size()=} {q.stride()=} {k.stride()=} {v.stride()=}")
+        # print(f"{o.stride()=} {mask.stride()=} {scores.stride()=}")
 
         _attn_fwd[grid](
             q,
@@ -675,7 +700,17 @@ class _attention(torch.autograd.Function):
             beta=beta,
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
+            # temporary fix to hardcode
+            BLOCK_M=64,
+            BLOCK_N=64,
+            num_warps=4,
+            num_stages=3,
             **extra_kern_args)
+
+        o = o[:, :, :og_q].contiguous()
+        scores = scores[:, :, :N_KV]
+
+        # print(f"{o.size()=} {scores.size()=}")
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.grid = grid
@@ -841,8 +876,7 @@ for mode in ["fwd", "bwd"]:
                 (["Flash-2"] if HAS_FLASH else []),
                 styles=[("red", "-"), ("blue", "-")],
                 ylabel="ms",
-                plot_name=
-                f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}",
+                plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}",
                 args={
                     "H": N_HEADS,
                     "BATCH": BATCH,
@@ -885,22 +919,23 @@ def bench_flash_attention(BATCH,
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale)
+        def fn(): return attention(q, k, v, causal, sm_scale)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
+            def fn(): return o.backward(do, retain_graph=True)
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
     if provider == "flash":
         qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM),
                           dtype=dtype,
                           device=device,
                           requires_grad=True)
-        fn = lambda: flash_attn_func(qkv, causal=causal)
+
+        def fn(): return flash_attn_func(qkv, causal=causal)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
+            def fn(): return o.backward(do, retain_graph=True)
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
     total_flops = 2 * flops_per_matmul

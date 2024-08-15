@@ -40,7 +40,7 @@ def get_injection_policy(model_id):
 
 
 def job_ppl_pg19_compile(args, model, tokenizer, device):
-    stride = 1024
+    stride = 128
     args.graph = False
     if args.world_size == 1 and args.graph:
         model.model.setup_caches(args.world_size)
@@ -126,6 +126,9 @@ def job_ppl_pg19_compile(args, model, tokenizer, device):
 
     nll_total, count_total = 0, 0
     for j, (x, y) in enumerate(dataset):
+        # print(f"\n\n\nwarning: truncating sequence for homogeneous heads rebuttal experiment\n\n\n")
+        # x = x[:, :mdl.config.max_position_embeddings]
+        # y = y[:, :mdl.config.max_position_embeddings]
         input_ids = x.cuda()
         target_ids = y.cuda()
 

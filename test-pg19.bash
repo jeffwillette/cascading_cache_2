@@ -1,13 +1,13 @@
 #!/bin/bash
 
-WINDOW=(2048)
-CASCADES=(4)
+WINDOW=(16384)
+CASCADES=(8)
 SINKS=(4)
 BATCH_SIZE=5
 HEAD_REDUCTION=mean
 # CASCADE_FUNC="pow2"
 CASCADE_FUNC="pow2"
-GPUS=(4)
+GPUS=(0)
 
 # MAIN PG19 experiment code
 for i in "${!WINDOW[@]}";
@@ -25,7 +25,7 @@ do
         --cascades ${CASCADES[$i]} \
         --cascade_func $CASCADE_FUNC \
         --head_reduction $HEAD_REDUCTION \
-        --comment llama7b \
+        --comment llama3.1 \
         --batch_size $BATCH_SIZE \
         --dev_run
         sleep 1

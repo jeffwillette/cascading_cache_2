@@ -206,6 +206,7 @@ class LlamaRotaryEmbedding(nn.Module):
         # Core RoPE block
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
+
         # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
@@ -793,12 +794,14 @@ class LlamaCascadeAttention(LlamaAttention):
 
         # In case static cache is used, it is an instance attribute.
         past_key_value = getattr(self, "past_key_value", past_key_value)
-        first_it = past_key_value._seen_tokens == 0
         if kwargs.get("reset", False):
             past_key_value.reset(verbose=False)
             if hasattr(self, "causal_mask"):
                 delattr(self, "causal_mask")
+            if hasattr(self, "query_pos"):
+                delattr(self, "query_pos")
 
+        first_it = past_key_value._seen_tokens == 0
         sink_key_states, sink_value_states, sink_pos, sink_mask, k_states, v_states, key_pos, mask, og_pos =\
             past_key_value.get_vals()
 
@@ -812,6 +815,13 @@ class LlamaCascadeAttention(LlamaAttention):
                                           query_states.size(2),
                                           device=query_states.device,
                                           dtype=torch.long).view(1, -1)
+
+        # not homogeneous + og_pos = independent head
+        # homogeneous + not og_pos = original
+        # homogeneous + og_pos = streaming llm with original pos
+        # not homogeneous + not og_pos = naive
+        homogeneous_heads = True
+        do_og_pos = False
 
         if not first_it:
             if use_selfextend:
@@ -828,16 +838,27 @@ class LlamaCascadeAttention(LlamaAttention):
                     dim=-1).amax() + 1
                 key_pos = og_pos
             else:
-                max_pos = torch.cat(
-                    (sink_pos.amax().view(1), key_pos.amax().view(1)),
-                    dim=-1).amax() + 1
+                if do_og_pos:
+                    max_pos = torch.cat(
+                        (sink_pos.amax().view(1), og_pos.amax().view(1)),
+                        dim=-1).amax() + 1
+                else:
+                    max_pos = torch.cat(
+                        (sink_pos.amax().view(1), key_pos.amax().view(1)),
+                        dim=-1).amax() + 1
 
         query_pos = self.query_pos[:, :query_states.size(-2)] + max_pos
 
         query_states = self.rope(query_states, query_pos)
         key_states_pos = self.rope(key_states, query_pos)
         sink_key_states = self.rope(sink_key_states, sink_pos)
-        k_states = self.rope(k_states, key_pos)
+
+        if do_og_pos:
+            b, h, s, d = k_states.size()
+            k_states = self.rope(k_states.view(b * h, 1, s, d), og_pos.view(b * h, -1))
+            k_states = k_states.view(b, h, s, d)
+        else:
+            k_states = self.rope(k_states, key_pos)
 
         key_states_pos = repeat_kv(key_states_pos, self.num_key_value_groups)
         sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
@@ -915,8 +936,7 @@ class LlamaCascadeAttention(LlamaAttention):
 
             ema_scores = (
                 scores[:, :, :, q_len + sink_key_states.size(2):].mean(
-                    dim=1, keepdim=True) *
-                exps[None, None, :, None]).sum(dim=2)
+                    dim=1, keepdim=True) * exps[None, None, :, None]).sum(dim=2)
 
             past_key_value.score_cache = beta**scores.size(
                 2) * past_key_value.score_cache + ema_scores
@@ -974,19 +994,27 @@ class LlamaCascadeAttention(LlamaAttention):
             )
 
             beta = past_key_value.beta
-            ema_scores = scores[:, :, n_sink:n_sink + k_states.size(2)].mean(
-                dim=1, keepdim=True)
+
+            kvh = self.num_key_value_heads
+            if homogeneous_heads:
+                if self.config._head_reduction == "mean":
+                    ema_scores = scores[:, :, n_sink:n_sink + k_states.size(2)].mean(dim=1, keepdim=True)
+                    scores = scores[:, :, -q_len:].mean(dim=1, keepdim=True).repeat(1, kvh, 1)
+                elif self.config._head_reduction == "max":
+                    ema_scores = scores[:, :, n_sink:n_sink + k_states.size(2)].amax(dim=1, keepdim=True)
+                    scores = scores[:, :, -q_len:].amax(dim=1, keepdim=True).repeat(1, kvh, 1)
+                elif self.config._head_reduction == "median":
+                    ema_scores = scores[:, :, n_sink:n_sink + k_states.size(2)].median(dim=1, keepdim=True).values
+                    scores = scores[:, :, -q_len:].median(dim=1, keepdim=True).values.repeat(1, kvh, 1)
+            else:
+                b, h, s = scores.size()
+                ema_scores = scores[:, :, n_sink:n_sink + k_states.size(2)].view(b, kvh, h // kvh, -1).mean(dim=2)
+                scores = scores[:, :, -q_len:].view(b, kvh, h // kvh, -1).mean(dim=2)
 
             past_key_value.score_cache = beta**out.size(
                 2) * past_key_value.score_cache + ema_scores
 
-            _ = past_key_value.update_batch(
-                key_states,
-                value_states,
-                score_states=scores[:, :,
-                                    -q_len:].mean(dim=1, keepdim=True).repeat(
-                                        1, scores.size(1), 1),
-            )
+            _ = past_key_value.update_batch(key_states, value_states, score_states=scores)
 
         out = out.transpose(1, 2).contiguous()
         out = out.view(bsz, q_len, -1)

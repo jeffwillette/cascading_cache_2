@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # passkey experiment
-GPUS=(6)
+GPUS=(4)
 WINDOW=(4096)
 CASCADES=(4)
 SINKS=(64)

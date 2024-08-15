@@ -1,3 +1,4 @@
+
 # coding=utf-8
 # Copyright 2024 The Qwen team, Alibaba Group and The HuggingFace Inc. team. All rights reserved.
 #
@@ -16,10 +17,11 @@
 
 from typing import Optional, Tuple
 
-from transformers.tokenization_utils import AddedToken
-from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
-from transformers.utils import logging
+from ...tokenization_utils import AddedToken
+from ...tokenization_utils_fast import PreTrainedTokenizerFast
+from ...utils import logging
 from .tokenization_qwen2 import Qwen2Tokenizer
+
 
 logger = logging.get_logger(__name__)
 
@@ -28,6 +30,7 @@ VOCAB_FILES_NAMES = {
     "merges_file": "merges.txt",
     "tokenizer_file": "tokenizer.json",
 }
+
 
 MAX_MODEL_INPUT_SIZES = {"qwen/qwen-tokenizer": 32768}
 
@@ -94,34 +97,30 @@ class Qwen2TokenizerFast(PreTrainedTokenizerFast):
         # configured through files.
         # following GPT2TokenizerFast, also adding unk_token, bos_token, and eos_token
 
-        bos_token = (AddedToken(bos_token,
-                                lstrip=False,
-                                rstrip=False,
-                                special=True,
-                                normalized=False) if isinstance(
-                                    bos_token, str) else bos_token)
-        eos_token = (AddedToken(eos_token,
-                                lstrip=False,
-                                rstrip=False,
-                                special=True,
-                                normalized=False) if isinstance(
-                                    eos_token, str) else eos_token)
-        unk_token = (AddedToken(unk_token,
-                                lstrip=False,
-                                rstrip=False,
-                                special=True,
-                                normalized=False) if isinstance(
-                                    unk_token, str) else unk_token)
-        pad_token = (AddedToken(pad_token,
-                                lstrip=False,
-                                rstrip=False,
-                                special=True,
-                                normalized=False) if isinstance(
-                                    pad_token, str) else pad_token)
+        bos_token = (
+            AddedToken(bos_token, lstrip=False, rstrip=False, special=True, normalized=False)
+            if isinstance(bos_token, str)
+            else bos_token
+        )
+        eos_token = (
+            AddedToken(eos_token, lstrip=False, rstrip=False, special=True, normalized=False)
+            if isinstance(eos_token, str)
+            else eos_token
+        )
+        unk_token = (
+            AddedToken(unk_token, lstrip=False, rstrip=False, special=True, normalized=False)
+            if isinstance(unk_token, str)
+            else unk_token
+        )
+        pad_token = (
+            AddedToken(pad_token, lstrip=False, rstrip=False, special=True, normalized=False)
+            if isinstance(pad_token, str)
+            else pad_token
+        )
 
         super().__init__(
-            vocab_file,
-            merges_file,
+            vocab_file=vocab_file,
+            merges_file=merges_file,
             tokenizer_file=tokenizer_file,
             unk_token=unk_token,
             bos_token=bos_token,
@@ -131,9 +130,6 @@ class Qwen2TokenizerFast(PreTrainedTokenizerFast):
         )
 
     # Copied from transformers.models.gpt2.tokenization_gpt2_fast.GPT2TokenizerFast.save_vocabulary
-    def save_vocabulary(self,
-                        save_directory: str,
-                        filename_prefix: Optional[str] = None) -> Tuple[str]:
-        files = self._tokenizer.model.save(save_directory,
-                                           name=filename_prefix)
+    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
+        files = self._tokenizer.model.save(save_directory, name=filename_prefix)
         return tuple(files)

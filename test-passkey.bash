@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # passkey experiment
-GPUS=(5)
-WINDOW=(2048)
+GPUS=(0)
+WINDOW=(4096)
 CASCADES=(8)
 SINKS=(64)
-BATCH_SIZE=5
+BATCH_SIZE=1
 
 # GPUS=(2)
 # WINDOW=(512)
@@ -18,10 +18,11 @@ BATCH_SIZE=5
 # CASCADES=(1)
 # SINKS=(4)
 # BATCH_SIZE=50
-HEAD_REDUCTION=mean
+HEAD_REDUCTION=max
 # MODEL=llama7b
 # MODEL=llama3-8b-instruct
 MODEL=llama3.1-8b-instruct
+CASCADE_FUNC="pow2"
 # MODEL=llama7b-chat
 # MODEL=llama13b
 # MODEL=qwen14b
@@ -39,6 +40,7 @@ do
         --window ${WINDOW[$i]} \
         --sinks ${SINKS[$i]} \
         --head_reduction $HEAD_REDUCTION \
+        --cascade_func $CASCADE_FUNC \
         --cascades ${CASCADES[$i]} \
         --batch_size $BATCH_SIZE
         

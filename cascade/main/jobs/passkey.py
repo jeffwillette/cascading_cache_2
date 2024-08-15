@@ -7,37 +7,31 @@ from aim import Run
 import numpy as np
 from cascade.utils import MockRun
 from cascade.dataset.passkey import Passkey
-import deepspeed
-from cascade.main.jobs.pg19 import get_injection_policy
 
 
 def get_numbers(s):
     lst = [c for c in s if c.isdigit()]
-    return ''.join(lst)
+    out = ''.join(lst)[:5]
+    if len(out) < 5:
+        out += "A" * (5 - len(out))
+    return out
+
+
+def len_loc_str(len_loc):
+    length, loc = len_loc
+    return f"{length}-{loc}"
 
 
 def job_passkey(args, model, tokenizer, device):
     if args.method != "vanilla":
         model.model.setup_caches(args.world_size, verbose=False)
 
-    if args.world_size > 1:
-        model = deepspeed.init_inference(
-            model,
-            tensor_parallel={"tp_size": args.world_size},
-            replace_with_kernel_inject=False,
-            dtype=args.infer_dtype,
-
-            injection_policy=get_injection_policy(args.model),
-        )
-        m = model.module.model
-    else:
-        model = model.to(args.infer_dtype).cuda()
-        # model = torch.compile(model, mode="max-autotune", fullgraph=False)
-        m = model.model
+    model = model.to(args.infer_dtype).cuda()
+    m = model.model
 
     dataset = Passkey(tokenizer, batch_size=args.batch_size)
 
-    stride = 1024
+    stride = 4096
     total_acc = {}
     for j, (input_ids, targets, len_locs) in enumerate(tqdm(dataset, ncols=150)):
         input_ids = input_ids.cuda()
@@ -73,7 +67,7 @@ def job_passkey(args, model, tokenizer, device):
                 )
                 guesses = output[:, input_ids.shape[1]:]
 
-            guess_string = [get_numbers(s.strip())[:5] for s in tokenizer.batch_decode(guesses)]
+            guess_string = [get_numbers(s.strip()) for s in tokenizer.batch_decode(guesses)]
             # print(f"{guess_string=} {targets=}")
             guess_string, target_string = "".join(guess_string), "".join(targets)
             print(guess_string, target_string)
@@ -85,11 +79,12 @@ def job_passkey(args, model, tokenizer, device):
 
             len_loc = len_locs[0]  # they should all be the same in a single batch
 
-            if len_loc not in total_acc.keys():
-                total_acc[len_loc] = [correct, count]
+            ll_str = len_loc_str(len_loc)
+            if ll_str not in total_acc.keys():
+                total_acc[ll_str] = [correct, count]
             else:
-                total_acc[len_loc][0] += correct
-                total_acc[len_loc][1] += count
+                total_acc[ll_str][0] += correct
+                total_acc[ll_str][1] += count
 
             for k, v in total_acc.items():
                 print(f"{k}: {v[0] / v[1]}")
@@ -97,8 +92,11 @@ def job_passkey(args, model, tokenizer, device):
     os.makedirs('./cache/llama_eval/', exist_ok=True)
     if args.method == "sink":
         with open(
-                f'./cache/llama_eval/ppl-passkey-{args.method}-sinks-{args.sinks}-window-{args.window}-cascade-{args.cascades}-{args.model}.json',
+                f'./cache/llama_eval/ppl-passkey-{args.method}-sinks-{args.sinks}-window-{args.window}-cascade-{args.cascades}-{args.model}-head-reduction-{args.head_reduction}-cascade-func-{args.cascade_func}.json',
                 'w') as f:
             json.dump(total_acc, f)
-    else:
-        raise NotImplementedError(f"{args.method} not implemented")
+
+
+if __name__ == "__main__":
+    out = get_numbers("some string 1 with a 3 few numbers 4")
+    print(out)

@@ -77,6 +77,7 @@ class PG19Streaming(Dataset):
 
         print([v.size(1) for v in sub])
         print(torch.tensor([v.size(1) for v in sub]).cumsum(0))
+        exit()
         self.inputs = sub
 
     def __len__(self):

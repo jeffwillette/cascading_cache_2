@@ -394,7 +394,7 @@ def _update_kv_cache(
         idx_t = batch_iter.to(IDTYPE)
         # set real token idx for this iter. We need two of these variables
         # because (rti) will be used to update do_cache settings, and real_token_idx
-        # will fill the role of real_token_idx whcih was originally used to track
+        # will fill the role of real_token_idx which was originally used to track
         # original positional encodings (and is reset in the eviction algorithm loop)
         rti = tl.load(REAL_TOKEN_IDX) + batch_iter + 1
         real_token_idx = rti
@@ -763,49 +763,48 @@ def _update_kv_cache(
 
                     # print("score: ", score.dtype)
                     # print("old score: ", old_score.dtype)
-                    # if score >= old_score:
-                    # old input_score is better, do nothing.
-                    # if idx_n == 0:
-                    #     print("overwrite do: ", t)
+                    if score >= old_score:
+                        # if idx_n == 0:
+                        #     print("overwrite do: ", t)
 
-                    kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
-                        idx_h.to(IDTYPE) * stride_ck_h + \
-                        t.to(IDTYPE) * stride_ck_t + \
-                        idx_hid.to(IDTYPE) * stride_ck_hid
+                        kv_adds = idx_n.to(IDTYPE) * stride_ck_n + \
+                            idx_h.to(IDTYPE) * stride_ck_h + \
+                            t.to(IDTYPE) * stride_ck_t + \
+                            idx_hid.to(IDTYPE) * stride_ck_hid
 
-                    tl.store(CACHE_K + kv_adds,
-                             value=key.to(dtype),
-                             mask=mask_hid)
-                    tl.store(CACHE_V + kv_adds,
-                             value=value.to(dtype),
-                             mask=mask_hid)
+                        tl.store(CACHE_K + kv_adds,
+                                 value=key.to(dtype),
+                                 mask=mask_hid)
+                        tl.store(CACHE_V + kv_adds,
+                                 value=value.to(dtype),
+                                 mask=mask_hid)
 
-                    # print("store in token swap: ", real_token_idx)
-                    tl.store(
-                        OG_POS + \
-                            idx_n.to(IDTYPE) * stride_op_n + \
-                            idx_h.to(IDTYPE) * stride_op_h + \
-                            t.to(IDTYPE) * stride_op_t,
-                        value=real_token_idx.to(IDTYPE),
-                    )
+                        # print("store in token swap: ", real_token_idx)
+                        tl.store(
+                            OG_POS + \
+                                idx_n.to(IDTYPE) * stride_op_n + \
+                                idx_h.to(IDTYPE) * stride_op_h + \
+                                t.to(IDTYPE) * stride_op_t,
+                            value=real_token_idx.to(IDTYPE),
+                        )
 
-                    tl.store(CACHE_S + cs_shift, value=score)
+                        tl.store(CACHE_S + cs_shift, value=score)
 
-                    _update_positional_idx(
-                        POS,
-                        stride_p_n,
-                        stride_p_h,
-                        stride_p_t,
-                        idx_n,
-                        idx_h,
-                        u,
-                        l,
-                        segment_len,
-                        pos_ub,
-                        stored_tokens_i,
-                        start_idx_i,
-                        WINDOW_SIZE_CONST,
-                    )
+                        _update_positional_idx(
+                            POS,
+                            stride_p_n,
+                            stride_p_h,
+                            stride_p_t,
+                            idx_n,
+                            idx_h,
+                            u,
+                            l,
+                            segment_len,
+                            pos_ub,
+                            stored_tokens_i,
+                            start_idx_i,
+                            WINDOW_SIZE_CONST,
+                        )
 
                     do_break = True  # keep at this indent level
 
@@ -1380,6 +1379,41 @@ class CascadingSinkCacheTriton(SinkCache):
                 torch.tensor([2**i for i in range(self.cascades)],
                              device=dev,
                              dtype=torch.long))
+        elif self.cascade_func == "pow2-1":
+            self.register_buffer(
+                "do_cache_every_n",
+                torch.tensor(
+                    [1 for i in range(self.cascades - 1)] + \
+                    [2**i for i in range(self.cascades - 1, self.cascades)],
+                     device=dev,
+                     dtype=torch.long))
+        elif self.cascade_func == "pow2-1-4":
+            n = self.cascades // 4
+            self.register_buffer(
+                "do_cache_every_n",
+                torch.tensor(
+                    [1 for i in range(3 * n)] + \
+                    [2**i for i in range(3 * n, self.cascades)],
+                     device=dev,
+                     dtype=torch.long))
+        elif self.cascade_func == "pow2-2-4":
+            n = self.cascades // 4
+            self.register_buffer(
+                "do_cache_every_n",
+                torch.tensor(
+                    [1 for i in range(2 * n)] + \
+                    [2**i for i in range(2 * n, self.cascades)],
+                     device=dev,
+                     dtype=torch.long))
+        elif self.cascade_func == "pow2-3-4":
+            n = self.cascades // 4
+            self.register_buffer(
+                "do_cache_every_n",
+                torch.tensor(
+                    [1 for i in range(1 * n)] + \
+                    [2**i for i in range(1 * n, self.cascades)],
+                     device=dev,
+                     dtype=torch.long))
         elif self.cascade_func == "pow3":
             self.register_buffer(
                 "do_cache_every_n",

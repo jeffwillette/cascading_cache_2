@@ -1,3 +1,4 @@
+
 # coding=utf-8
 # Copyright 2024 The Qwen team, Alibaba Group and The HuggingFace Inc. team. All rights reserved.
 #
@@ -25,12 +26,14 @@ import regex as re
 from ...tokenization_utils import AddedToken, PreTrainedTokenizer
 from ...utils import logging
 
+
 logger = logging.get_logger(__name__)
 
 VOCAB_FILES_NAMES = {
     "vocab_file": "vocab.json",
     "merges_file": "merges.txt",
 }
+
 
 MAX_MODEL_INPUT_SIZES = {"qwen/qwen-tokenizer": 32768}
 
@@ -49,11 +52,9 @@ def bytes_to_unicode():
     decent coverage. This is a significant percentage of your normal, say, 32K bpe vocab. To avoid that, we want lookup
     tables between utf-8 bytes and unicode strings.
     """
-    bs = (list(range(ord("!"),
-                     ord("~") + 1)) + list(range(ord("¡"),
-                                                 ord("¬") + 1)) +
-          list(range(ord("®"),
-                     ord("ÿ") + 1)))
+    bs = (
+        list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    )
     cs = bs[:]
     n = 0
     for b in range(2**8):
@@ -148,30 +149,26 @@ class Qwen2Tokenizer(PreTrainedTokenizer):
         **kwargs,
     ):
         # Qwen vocab does not contain control tokens; added tokens need to be special
-        bos_token = (AddedToken(bos_token,
-                                lstrip=False,
-                                rstrip=False,
-                                special=True,
-                                normalized=False) if isinstance(
-                                    bos_token, str) else bos_token)
-        eos_token = (AddedToken(eos_token,
-                                lstrip=False,
-                                rstrip=False,
-                                special=True,
-                                normalized=False) if isinstance(
-                                    eos_token, str) else eos_token)
-        unk_token = (AddedToken(unk_token,
-                                lstrip=False,
-                                rstrip=False,
-                                special=True,
-                                normalized=False) if isinstance(
-                                    unk_token, str) else unk_token)
-        pad_token = (AddedToken(pad_token,
-                                lstrip=False,
-                                rstrip=False,
-                                special=True,
-                                normalized=False) if isinstance(
-                                    pad_token, str) else pad_token)
+        bos_token = (
+            AddedToken(bos_token, lstrip=False, rstrip=False, special=True, normalized=False)
+            if isinstance(bos_token, str)
+            else bos_token
+        )
+        eos_token = (
+            AddedToken(eos_token, lstrip=False, rstrip=False, special=True, normalized=False)
+            if isinstance(eos_token, str)
+            else eos_token
+        )
+        unk_token = (
+            AddedToken(unk_token, lstrip=False, rstrip=False, special=True, normalized=False)
+            if isinstance(unk_token, str)
+            else unk_token
+        )
+        pad_token = (
+            AddedToken(pad_token, lstrip=False, rstrip=False, special=True, normalized=False)
+            if isinstance(pad_token, str)
+            else pad_token
+        )
 
         with open(vocab_file, encoding="utf-8") as vocab_handle:
             self.encoder = json.load(vocab_handle)
@@ -230,8 +227,7 @@ class Qwen2Tokenizer(PreTrainedTokenizer):
             return token
 
         while True:
-            bigram = min(
-                pairs, key=lambda pair: self.bpe_ranks.get(pair, float("inf")))
+            bigram = min(pairs, key=lambda pair: self.bpe_ranks.get(pair, float("inf")))
             if bigram not in self.bpe_ranks:
                 break
             first, second = bigram
@@ -247,8 +243,7 @@ class Qwen2Tokenizer(PreTrainedTokenizer):
                     new_word.extend(word[i:j])
                     i = j
 
-                if word[i] == first and i < len(word) - 1 and word[
-                        i + 1] == second:
+                if word[i] == first and i < len(word) - 1 and word[i + 1] == second:
                     new_word.append(first + second)
                     i += 2
                 else:
@@ -272,8 +267,7 @@ class Qwen2Tokenizer(PreTrainedTokenizer):
             token = "".join(
                 self.byte_encoder[b] for b in token.encode("utf-8")
             )  # Maps all our bytes to unicode strings, avoiding control tokens of the BPE (spaces in our case)
-            bpe_tokens.extend(bpe_token
-                              for bpe_token in self.bpe(token).split(" "))
+            bpe_tokens.extend(bpe_token for bpe_token in self.bpe(token).split(" "))
         return bpe_tokens
 
     # Copied from transformers.models.gpt2.tokenization_gpt2.GPT2Tokenizer._convert_token_to_id
@@ -290,8 +284,7 @@ class Qwen2Tokenizer(PreTrainedTokenizer):
     def convert_tokens_to_string(self, tokens):
         """Converts a sequence of tokens (string) in a single string."""
         text = "".join(tokens)
-        text = bytearray([self.byte_decoder[c]
-                          for c in text]).decode("utf-8", errors=self.errors)
+        text = bytearray([self.byte_decoder[c] for c in text]).decode("utf-8", errors=self.errors)
         return text
 
     def decode(
@@ -313,37 +306,29 @@ class Qwen2Tokenizer(PreTrainedTokenizer):
         )
 
     # Copied from transformers.models.gpt2.tokenization_gpt2.GPT2Tokenizer.save_vocabulary
-    def save_vocabulary(self,
-                        save_directory: str,
-                        filename_prefix: Optional[str] = None) -> Tuple[str]:
+    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
         if not os.path.isdir(save_directory):
-            logger.error(
-                f"Vocabulary path ({save_directory}) should be a directory")
+            logger.error(f"Vocabulary path ({save_directory}) should be a directory")
             return
         vocab_file = os.path.join(
-            save_directory,
-            (filename_prefix + "-" if filename_prefix else "") +
-            VOCAB_FILES_NAMES["vocab_file"])
+            save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"]
+        )
         merge_file = os.path.join(
-            save_directory,
-            (filename_prefix + "-" if filename_prefix else "") +
-            VOCAB_FILES_NAMES["merges_file"])
+            save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["merges_file"]
+        )
 
         with open(vocab_file, "w", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    self.encoder, indent=2, sort_keys=True, ensure_ascii=False)
-                + "\n")
+            f.write(json.dumps(self.encoder, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
         index = 0
         with open(merge_file, "w", encoding="utf-8") as writer:
             writer.write("#version: 0.2\n")
-            for bpe_tokens, token_index in sorted(self.bpe_ranks.items(),
-                                                  key=lambda kv: kv[1]):
+            for bpe_tokens, token_index in sorted(self.bpe_ranks.items(), key=lambda kv: kv[1]):
                 if index != token_index:
                     logger.warning(
                         f"Saving vocabulary to {merge_file}: BPE merge indices are not consecutive."
-                        " Please check that the tokenizer is not corrupted!")
+                        " Please check that the tokenizer is not corrupted!"
+                    )
                     index = token_index
                 writer.write(" ".join(bpe_tokens) + "\n")
                 index += 1

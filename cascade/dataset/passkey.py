@@ -43,12 +43,9 @@ def gen_filler_text(num_words):
     return " ".join(out)
 
 
-FILLER_TEXT = gen_filler_text(128000)
-
-print(FILLER_TEXT[:10000])
-
-
 def gen_text(tokenizer):
+    FILLER_TEXT = gen_filler_text(1000000)
+
     prefix_tok = tokenizer(PREFIX, return_tensors="pt", truncation=False).input_ids[0]
     prefix_len = prefix_tok.shape[0]
 
@@ -59,14 +56,27 @@ def gen_text(tokenizer):
     # filler_tok = torch.randperm(128000)
 
     inputs, targets, len_loc = [], [], []
-    prompt_lens = [2048, 4096, 8192, 16384, 32768, 65536]
-    insert_locs = [0.2, 0.4, 0.6, 0.8, 1.0]
+    # prompt_lens = [16384, 32768, 65536, 131072, 262144, 524288]
+    # prompt_lens = [16384, 32768]
+    # prompt_lens = [65536, 131072]
+
+    # prompt_lens = [65536]
+    # prompt_lens = [131072]
+
+    # prompt_lens = [262144, 524288]
+    # prompt_lens = [262144]
+    # prompt_lens = [524288]
+    # insert_locs = [0.2, 0.4, 0.6, 0.8, 1.0]
+
+    # rebuttal discussion phase response
+    prompt_lens = [8192, 16384, 32768]
+    insert_locs = [0.2]
 
     for l in prompt_lens:
         n_fillers = (l - prefix_len - query_len)
         filler = filler_tok[:n_fillers]
         for loc in insert_locs:
-            for i in range(25):
+            for i in range(20):
 
                 k = np.random.randint(10000, 100000)
 
