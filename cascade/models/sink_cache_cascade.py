@@ -217,6 +217,7 @@ def _update_kv_cache_batch(
     NUM_SINK,
     WINDOW_SIZE,
     REAL_TOKEN_IDX,
+    max_seq_len,
 
     # kernel constants
     WINDOW_SIZE_CONST: tl.constexpr,
@@ -292,6 +293,7 @@ def _update_kv_cache_batch(
             NUM_SINK,
             WINDOW_SIZE,
             REAL_TOKEN_IDX,
+            max_seq_len,
 
             # kernel constants
             WINDOW_SIZE_CONST,
@@ -370,6 +372,7 @@ def _update_kv_cache(
     NUM_SINK,
     WINDOW_SIZE,
     REAL_TOKEN_IDX,
+    max_seq_len,
 
     # kernel constants
     WINDOW_SIZE_CONST: tl.constexpr,
@@ -458,11 +461,20 @@ def _update_kv_cache(
         if batch_iter == -1:
             do_cache = tl.load(DO_CACHE + cascades_idx).to(tl.int64)
         else:
+            # only selectively add to the cache when it is already full.
             tmp = tl.full((CASCADES, ), value=rti, dtype=tl.int64)
+            if rti - 1 > max_seq_len:
 
-            do_cache_every_n = tl.load(DO_CACHE_EVERY_N + cascades_idx)
-            do_cache = ((tmp - 1 - NUM_SINK) % do_cache_every_n) == 0
-            do_cache = do_cache.to(tl.int64)
+                do_cache_every_n = tl.load(DO_CACHE_EVERY_N + cascades_idx)
+                do_cache = ((tmp - 1 - NUM_SINK) % do_cache_every_n) == 0
+                do_cache = do_cache.to(tl.int64)
+            else:
+                do_cache = (tmp >= -1).to(tl.int64)  # always true
+
+            # sanity check
+            # tl.store(DO_CACHE + cascades_idx, value=do_cache.to(tl.int1))
+            # if idx_n == 0 and idx_h == 0:
+            #     print(f"do cache: ", do_cache.to(tl.int1))
 
         add_to_cache = tl.sum(do_cache) * WINDOW_SIZE > pos_ub
         eager_add = tl.sum(do_cache) * WINDOW_SIZE == pos_ub
@@ -497,11 +509,14 @@ def _update_kv_cache(
             if batch_iter == -1:
                 do_cache_i = tl.load(DO_CACHE + i.to(IDTYPE)).to(tl.int1)
             else:
-                do_cache_every_n_i = tl.load(DO_CACHE_EVERY_N + i.to(IDTYPE))
-                # not minus 1 because seen tokens is not incremented before the loop in
-                # the batched version.
-                do_cache_i = (((rti - 1 - NUM_SINK) %
-                               do_cache_every_n_i) == 0).to(tl.int1)
+                if rti - 1 > max_seq_len:
+                    do_cache_every_n_i = tl.load(DO_CACHE_EVERY_N + i.to(IDTYPE))
+                    # not minus 1 because seen tokens is not incremented before the loop in
+                    # the batched version.
+                    do_cache_i = (((rti - 1 - NUM_SINK) %
+                                   do_cache_every_n_i) == 0).to(tl.int1)
+                else:
+                    do_cache_i = True
 
             # if idx_n == 0:
             #     print(f"do cache i: ", do_cache_i)
@@ -835,6 +850,7 @@ class SinkCacheBatchFunc(Function):
         num_sink: int,
         window_size: int,
         real_token_idx: Tensor,
+        max_seq_len: int,
     ):
         assert k.ndim == 4
         assert v.ndim == 4
@@ -914,6 +930,7 @@ class SinkCacheBatchFunc(Function):
                 num_sink,
                 window_size,
                 real_token_idx,
+                max_seq_len,
                 window_size,
                 CASCADES,
                 BLOCK_HID,
@@ -962,6 +979,7 @@ class SinkCacheFunc(Function):
         num_sink: int,
         window_size: int,
         real_token_idx: Tensor,
+        max_seq_len: int,
     ):
         assert k.ndim == 4
         assert v.ndim == 4
@@ -1041,6 +1059,7 @@ class SinkCacheFunc(Function):
                 num_sink,
                 window_size,
                 real_token_idx,
+                max_seq_len,
                 window_size,
                 CASCADES,
                 BLOCK_HID,
@@ -1085,6 +1104,7 @@ def _sink_cache_batch(
     num_sink,
     window_size,
     real_token_idx,
+    max_seq_len,
 ):
     N, H, K, HID = k.shape
 
@@ -1110,6 +1130,7 @@ def _sink_cache_batch(
         num_sink,
         window_size,
         real_token_idx,
+        max_seq_len,
     )
 
 
@@ -1135,6 +1156,7 @@ def _sink_cache(
     num_sink,
     window_size,
     real_token_idx,
+    max_seq_len,
 ):
     N, H, K, HID = k.shape
 
@@ -1160,6 +1182,7 @@ def _sink_cache(
         num_sink,
         window_size,
         real_token_idx,
+        max_seq_len,
     )
 
 
@@ -1185,6 +1208,7 @@ def sink_cache_batch(
     num_sink,
     window_size,
     real_token_idx,
+    max_seq_len,
     BENCHMARK: bool = False,
 ):
     if BENCHMARK:
@@ -1214,6 +1238,7 @@ def sink_cache_batch(
         num_sink=num_sink,
         window_size=window_size,
         real_token_idx=real_token_idx,
+        max_seq_len=max_seq_len,
     )
 
     if BENCHMARK:
@@ -1250,6 +1275,7 @@ def sink_cache(
     num_sink,
     window_size,
     real_token_idx,
+    max_seq_len,
     BENCHMARK: bool = False,
 ):
     if BENCHMARK:
@@ -1279,6 +1305,7 @@ def sink_cache(
         num_sink=num_sink,
         window_size=window_size,
         real_token_idx=real_token_idx,
+        max_seq_len=max_seq_len,
     )
 
     if BENCHMARK:
@@ -1311,6 +1338,7 @@ class CascadingSinkCacheTriton(SinkCache):
         dtype: torch.dtype = torch.float16,
         cascade_func: str = "pow2",
         head_reduction: str = "mean",
+        layer_idx: int = 0,
     ) -> None:
         super().__init__()
         self.max_seq_len = max_seq_len
@@ -1323,6 +1351,7 @@ class CascadingSinkCacheTriton(SinkCache):
         self.num_sink_tokens = num_sink_tokens
         self.cascade_func = cascade_func
         self.head_reduction = head_reduction
+        self.layer_idx = layer_idx
 
         self.key_cache: torch.Tensor
         self.value_cache: torch.Tensor
@@ -1365,7 +1394,8 @@ class CascadingSinkCacheTriton(SinkCache):
     def init_static_cache(self, device):
         B, H, S, D = self.max_batch_size, self.heads, self.max_seq_len, self.dim
         nsink, dev, dtp = self.num_sink_tokens, device, self.dtype
-        print(f"INIT CLEAN TRITON CACHE {self.cascade_func=}")
+        if self.layer_idx == 0:
+            print(f"INIT CLEAN TRITON CACHE {self.cascade_func=}")
 
         self.register_buffer(
             "do_cache",
@@ -1516,8 +1546,11 @@ class CascadingSinkCacheTriton(SinkCache):
         self.sink_mask.fill_(torch.finfo(dtp).min)
 
     def set_cache_bools(self):
-        self.do_cache = ((self._seen_tokens - 1 - self.num_sink_tokens) %
-                         self.do_cache_every_n) == 0
+        if self._seen_tokens - 1 < self.max_seq_len:
+            self.do_cache = self.do_cache > -1
+        else:
+            self.do_cache = ((self._seen_tokens - 1 - self.num_sink_tokens) %
+                             self.do_cache_every_n) == 0
 
     def get_seq_length(self,
                        layer_idx: Optional[int] = 0,
@@ -1610,6 +1643,7 @@ class CascadingSinkCacheTriton(SinkCache):
             self.num_sink_tokens,
             self.window_length,
             self.seen_tokens,
+            self.max_seq_len,
         )
 
         # place this after the kernel in this method because the batch kernel will iterate
@@ -1619,9 +1653,6 @@ class CascadingSinkCacheTriton(SinkCache):
         self.seen_tokens += key_states.shape[-2]
 
         pos_shift = self.num_sink_tokens if self._seen_tokens > self.num_sink_tokens else 0
-
-        # print(f"in cascade: {self.sink_pos=}")
-        # print(f"in cascade: {self.pos=}")
 
         return (
             self.sink_keys,
@@ -1676,6 +1707,7 @@ class CascadingSinkCacheTriton(SinkCache):
             self.num_sink_tokens,
             self.window_length,
             self.seen_tokens,
+            self.max_seq_len,
         )
 
         pos_shift = self.num_sink_tokens if self._seen_tokens > self.num_sink_tokens else 0

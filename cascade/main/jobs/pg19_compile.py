@@ -1,23 +1,14 @@
 import os
-import time
-import traceback
 import torch
-import transformers
-from datasets import load_dataset
 from cascade.dataset.pg19 import PG19Streaming
 from tqdm import tqdm
-import argparse
 import json
-from transformers import TextStreamer
 from aim import Run
 
-from peft import LoraConfig, TaskType
-from peft import get_peft_model, prepare_model_for_kbit_training
-from cascade.utils import seed, get_bench, MockRun
-import deepspeed
+from cascade.utils import MockRun
+# import deepspeed
 from cascade.models.modeling_llama import LlamaDecoderLayer
-from cascade.models.qwen.modeling_qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
-from third_party.hyper_attn.models.attention.modeling_chatglm_fast_attention import FastCoreAttention
+from cascade.models.qwen.modeling_qwen2 import Qwen2DecoderLayer
 
 
 def get_injection_policy(model_id):
@@ -40,61 +31,20 @@ def get_injection_policy(model_id):
 
 
 def job_ppl_pg19_compile(args, model, tokenizer, device):
-    stride = 128
-    args.graph = False
-    if args.world_size == 1 and args.graph:
-        model.model.setup_caches(args.world_size)
-        model = model.to(args.infer_dtype).cuda()
-        # model = torch.compile(model, backend="cudagraphs")
+    stride = 512
 
-        # ==================================================================
-        inp = torch.randint(100, size=(args.batch_size, stride)).cuda()
+    model.model.setup_caches(args.world_size, verbose=False)
+    model = model.to(args.infer_dtype).cuda()
+    mdl = model.model
 
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.no_grad():
-            with torch.cuda.stream(s):
-                for i in range(3):
-                    output = model(
-                        inp,
-                        use_cache=False,
-                        reset=i == 0,
-                        output_attentions=False,
-                    )
-                    logits = output.logits
-
-        torch.cuda.current_stream().wait_stream(s)
-
-        # capture
-        g = torch.cuda.CUDAGraph()
-        # Sets grads to None before capture, so backward() will create
-        # .grad attributes with allocations from the graph's private pool
-        with torch.no_grad():
-            with torch.cuda.graph(g):
-                output = model(
-                    inp,
-                    use_cache=False,
-                    reset=False,
-                    output_attentions=False,
-                )
-                logits = output.logits
-
-        mdl = model.model
-        # ================================================================
-
-    else:
-        model.model.setup_caches(args.world_size)
-        model = model.to(args.infer_dtype).cuda()
-        mdl = model.model
-
-        # model = deepspeed.init_inference(
-        #     model,
-        #     tensor_parallel={"tp_size": args.world_size},
-        #     replace_with_kernel_inject=False,
-        #     dtype=args.infer_dtype,
-        #     injection_policy=get_injection_policy(args.model),
-        # )
-        # mdl = model.module.model
+    # model = deepspeed.init_inference(
+    #     model,
+    #     tensor_parallel={"tp_size": args.world_size},
+    #     replace_with_kernel_inject=False,
+    #     dtype=args.infer_dtype,
+    #     injection_policy=get_injection_policy(args.model),
+    # )
+    # mdl = model.module.model
 
     if args.local_rank == 0:
         run = Run(experiment=f"{args.method}-pg19"
@@ -170,17 +120,12 @@ def job_ppl_pg19_compile(args, model, tokenizer, device):
                     if i == 0:
                         mdl.clear_caches()
 
-                    if args.world_size == 1 and args.graph:
-                        inp.copy_(inputs)
-                        g.replay()
-
-                    else:
-                        inp = inputs
-                        output = model(inp,
-                                       use_cache=False,
-                                       reset=i == 0,
-                                       output_attentions=False)
-                        logits = output.logits
+                    inp = inputs
+                    output = model(inp,
+                                   use_cache=False,
+                                   reset=i == 0,
+                                   output_attentions=False)
+                    logits = output.logits
 
                     _nll = torch.nn.functional.cross_entropy(
                         logits.reshape(-1, logits.size(-1)).float(),
@@ -201,8 +146,7 @@ def job_ppl_pg19_compile(args, model, tokenizer, device):
                     step += stride
 
                     book_idx = l + torch.arange(args.batch_size)
-                    book_ppl = torch.exp(nll_individual[book_idx] /
-                                         count_individual[book_idx])
+                    book_ppl = torch.exp(nll_individual[book_idx] / count_individual[book_idx])
 
                     stats = {}
                     for k in range(args.batch_size):

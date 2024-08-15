@@ -1,7 +1,6 @@
 import argparse
 from dataclasses import dataclass
 from typing import Literal, Optional
-import deepspeed
 
 
 @dataclass

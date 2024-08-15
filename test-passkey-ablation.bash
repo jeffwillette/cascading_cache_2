@@ -9,14 +9,15 @@
 # MODEL=llama3.1-8b-instruct
 # CASCADE_FUNCS=("pow2" "pow2" "pow2" "pow2" "pow2-1" "pow2-1-4" "pow2-2-4" "pow2-3-4" "pow2" "pow2")
 #
-GPUS=0
-WINDOW=4096
+GPUS=2
+WINDOW=1024
 CASCADES=(8 8 8 8 8)
 SINKS=64
 BATCH_SIZE=1
 HEAD_REDUCTION=(mean mean mean median max)
 MODEL=llama3.1-8b-instruct
-CASCADE_FUNCS=("pow2-1-4" "pow2-2-4" "pow2-3-4" "pow2" "pow2")
+CASCADE_FUNCS=("pow2" "pow2" "pow2" "pow2" "pow2")
+# CASCADE_FUNCS=("pow2-1-4" "pow2-2-4" "pow2-3-4" "pow2" "pow2")
 
 for i in "${!CASCADES[@]}";
 do 

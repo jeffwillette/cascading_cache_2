@@ -1,13 +1,13 @@
 #!/bin/bash
 
-WINDOW=(16384)
-CASCADES=(8)
+WINDOW=(2048)
+CASCADES=(4)
 SINKS=(4)
 BATCH_SIZE=5
 HEAD_REDUCTION=mean
 # CASCADE_FUNC="pow2"
 CASCADE_FUNC="pow2"
-GPUS=(0)
+GPUS=(2)
 
 # MAIN PG19 experiment code
 for i in "${!WINDOW[@]}";
@@ -16,7 +16,7 @@ do
     # PYTHONPATH=. deepspeed --include localhost:6 --master_port 63190 cascade/main/llama_eval.py \
     # --model llama7b \
     PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
-        --model llama3.1-8b \
+        --model llama7b \
         --job ppl-pg19 \
         --method sink \
         --lora_r 0 \

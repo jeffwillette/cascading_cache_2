@@ -8,7 +8,6 @@ from tqdm import tqdm
 import argparse
 from transformers import TextStreamer
 
-import deepspeed
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
 from cascade.models.modeling_llama import LlamaForCausalLM, LlamaConfig
@@ -119,9 +118,6 @@ def load_model(args):
         'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
         'llama7b-chat': '/d1/dataset/llama/models/llama_v2/llama-2-7b-chat-hf',
         "llama2-7b-chat-32k": "togethercomputer/Llama-2-7B-32K-Instruct",
-        # 'qwen14b': 'Qwen/Qwen1.5-14B-Chat',
-        # 'qwen7b': 'Qwen/Qwen1.5-7B-Chat',
-        # 'qwen0.5b': 'Qwen/Qwen1.5-0.5B-Chat',
         'qwen14b': 'Qwen/Qwen1.5-14B',
         'qwen7b': 'Qwen/Qwen1.5-7B',
         'qwen7b-chat': 'Qwen/Qwen1.5-7B-Chat',
@@ -137,9 +133,6 @@ def load_model(args):
 
     assert args.model in MODELS, MODELS.keys()
     model_id = MODELS[args.model]
-
-    # config = LlamaConfig.from_pretrained(model_id,
-    #                                      max_position_embeddings=4096 * 2)
 
     args.local_rank = int(os.getenv('LOCAL_RANK', '0'))
     args.world_size = int(os.getenv('WORLD_SIZE', '1'))
@@ -160,7 +153,6 @@ def load_model(args):
     config.world_size = args.world_size
     config._cascade_func = args.cascade_func
     config._head_reduction = args.head_reduction
-    # config._hyper = args.method == "hyper"
     config._method = args.method
 
     if args.model == "llama13b_32k":

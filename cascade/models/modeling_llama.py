@@ -558,142 +558,6 @@ class LlamaCascadeAttention(LlamaAttention):
     def o(self, x):
         return self.o_proj(x)
 
-    def qkto_batch(
-        self,
-        q,
-        sink_k,
-        # sink_m,
-        sink_v,
-        k,
-        m,
-        v,
-        cache,
-        size,
-        output_attentions=False,
-    ):
-        scale = 1 / np.sqrt(q.size(-1))
-        sink_out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
-                                sink_k * np.sqrt(scale))
-
-        out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
-                           k * np.sqrt(scale))
-
-        if not hasattr(self, "causal_mask"):
-            # there is no causal mask stored, which means this must be the
-            # first iteration. This mask is a special case where we can create
-            # a normal causal mask which is concatted with the repeated mask from
-            # the cascading cache.
-            first_it = True
-            val = torch.finfo(q.dtype).min
-            cm = torch.full((q.size(2), q.size(2)),
-                            val,
-                            device=q.device,
-                            dtype=q.dtype).triu(1)
-            cm_rest = torch.full(
-                (q.size(2), (sink_k.size(2) + k.size(2)) - q.size(2)),
-                val,
-                device=q.device,
-                dtype=q.dtype)
-
-            self.causal_mask = torch.cat((cm, cm_rest), dim=-1)
-            self.causal_mask = self.causal_mask.view(
-                1, 1, q.size(2),
-                k.size(2) + sink_k.size(2))
-
-        else:
-            # causal mask exists which means this is at least the second iteration.
-            # in this case the starting index in the cache will be q_len - sink_tokens
-            # and so we have to build a causal mask wich is slightly
-            first_it = False
-
-            val = torch.finfo(q.dtype).min
-            cm = torch.full((q.size(2), q.size(2)),
-                            val,
-                            device=q.device,
-                            dtype=q.dtype).triu(1)
-
-            # the last 'n_sink' come first because of the separate
-            # sinks and circular buffers in the first iteration. Move around
-            # the mask so it is causal given the order.
-            cm[:-sink_k.size(2), -sink_k.size(2):] = 0
-            cm[-sink_k.size(2):, :-sink_k.size(2)] = val
-
-            # sinks should have a zero causal mask for all
-            cm_sink = torch.zeros(q.size(2),
-                                  sink_k.size(2),
-                                  device=q.device,
-                                  dtype=q.dtype)
-
-            m_zero = m[0, 0, q.size(2):] < 0
-            # if m_zero == k.size(2) - q.size(2):
-            #     # once the cache is fully populates, the causal mask will remain fixed
-            #     self.causal_mask_isdone = True
-
-            cm_rest = torch.full((q.size(2), k.size(2) - q.size(2)),
-                                 val,
-                                 device=q.device,
-                                 dtype=q.dtype)
-
-            cm_rest = cm_rest * m_zero
-
-            self.causal_mask = torch.cat((cm_sink, cm, cm_rest), dim=-1)
-
-            self.causal_mask = self.causal_mask.view(
-                1, 1, q.size(2),
-                sink_k.size(2) + k.size(2))
-
-        total_out = torch.cat((sink_out, out), dim=-1)
-        total_out += self.causal_mask
-        scores = total_out.softmax(dim=-1)
-
-        out_attn = None
-        if output_attentions:
-            og_pos = torch.cat(
-                (torch.arange(sink_out.size(-1),
-                              device=sink_out.device), cache.og_pos[0, 0]))
-
-            out_attn = torch.zeros(out.size(0),
-                                   out.size(1),
-                                   1,
-                                   max(og_pos.amax() + 1, og_pos.size(0)),
-                                   device=out.device,
-                                   dtype=out.dtype)
-
-            og_pos = og_pos.view(1, 1, 1, -1).repeat(out.size(0), out.size(1),
-                                                     1, 1)
-
-            # print(f"{og_pos.size()=} {scores.size()=} {out_attn.size()=}")
-            out_attn.scatter_(-1, og_pos, scores)
-            # print(f"out_attn: {out_attn[0, 0, 0]=}")
-
-        out = scores[:, :, :, :sink_k.size(-2)] @ sink_v
-        out += scores[:, :, :, sink_k.size(-2):] @ v
-
-        if torch.distributed.is_initialized():
-            lst = [
-                torch.zeros_like(scores) for _ in range(self.config.world_size)
-            ]
-            torch.distributed.all_gather(lst, scores)
-            if self.config._head_reduction == "mean":
-                scores = torch.cat(lst, dim=1).mean(dim=1, keepdim=True)
-            elif self.config._head_reduction == "max":
-                scores = torch.cat(lst, dim=1).amax(dim=1, keepdim=True)
-            elif self.config._head_reduction == "median":
-                scores = torch.cat(lst, dim=1).median(dim=1,
-                                                      keepdim=True).values
-            elif self.config._head_reduction in ["none", "independent"]:
-                pass
-            else:
-                raise ValueError(
-                    f"unknown head reduction: {self.config.head_reduction=}")
-
-        out = out.transpose(1, 2).contiguous()
-        out = out.view(*size)
-
-        out = self.o(out)
-
-        return out, out_attn
-
     # @torch.compile
     def qkto(
         self, q, sink_k, sink_m, sink_v,
@@ -912,14 +776,10 @@ class LlamaCascadeAttention(LlamaAttention):
                                  query_states * np.sqrt(scale),
                                  sink_key_states * np.sqrt(scale))
 
-            sattn = sattn + (self.sink_mask[None, None, :] *
-                             sk_masked[:, :, None, :])
+            sattn = sattn + (self.sink_mask[None, None, :] * sk_masked[:, :, None, :])
 
-            cattn = torch.einsum("bhqd,bhkd->bhqk",
-                                 query_states * np.sqrt(scale),
-                                 k_states * np.sqrt(scale))
-            cattn = cattn + (self.cache_mask[None, None, :] *
-                             k_masked[:, :, None, :])
+            cattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), k_states * np.sqrt(scale))
+            cattn = cattn + (self.cache_mask[None, None, :] * k_masked[:, :, None, :])
 
             attn = torch.cat((qattn, sattn, cattn), dim=-1)
             attn = attn.softmax(dim=-1)
@@ -1051,11 +911,10 @@ class LlamaCascadeAttention(LlamaAttention):
         if kwargs.get("reset", False):
             past_key_value.reset(verbose=False)
 
-        layer_idx = self.layer_idx if not hasattr(self,
-                                                  "past_key_value") else 0
+        # layer_idx = self.layer_idx if not hasattr(self, "past_key_value") else 0
 
         # sin and cos are specific to RoPE models; cache_position needed for the static cache
-        cache_kwargs = {"cache_position": cache_position}
+        # cache_kwargs = {"cache_position": cache_position}
         sink_key_states, sink_value_states, sink_pos, sink_mask, key_states, value_states, key_pos, mask, og_pos =\
             past_key_value.update(key_states, value_states)
 
@@ -1115,11 +974,8 @@ class LlamaCascadeAttention(LlamaAttention):
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads *
-                                 self.head_dim) // self.config.pretraining_tp
-            query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp,
-                dim=0)
+            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
+            query_slices = self.q_proj.weight.split((self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0)
             key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
             value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
 
@@ -1177,9 +1033,7 @@ class LlamaCascadeAttention(LlamaAttention):
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size //
-                                            self.config.pretraining_tp,
-                                            dim=2)
+            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(
                 self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([
@@ -1206,8 +1060,7 @@ class LlamaCascadeAttention(LlamaAttention):
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads *
-                                 self.head_dim) // self.config.pretraining_tp
+            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
                 (self.num_heads * self.head_dim) // self.config.pretraining_tp,
                 dim=0)
@@ -1286,9 +1139,7 @@ class LlamaCascadeAttention(LlamaAttention):
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size //
-                                            self.config.pretraining_tp,
-                                            dim=2)
+            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(
                 self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([
@@ -1792,6 +1643,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 device=self.embed_tokens.weight.device,
                 cascade_func=self.config._cascade_func,
                 head_reduction=self.config._head_reduction,
+                layer_idx=i,
             )
 
             decoder_layer.self_attn.past_key_value = cache
@@ -2017,9 +1869,9 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
         if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type == "cuda"
+            self.config._attn_implementation == "sdpa" \
+            and attention_mask is not None \
+            and attention_mask.device.type == "cuda" \
             and not output_attentions
         ):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
