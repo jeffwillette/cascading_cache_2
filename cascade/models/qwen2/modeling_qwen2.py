@@ -24,13 +24,10 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
-import numpy as np
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from torch.nn import functional as F
 
 from transformers.activations import ACT2FN
-from cascade.models.flash_attention import attention
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import (
@@ -49,8 +46,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-from cascade.models.sink_cache_cascade import CascadingSinkCacheTriton as CascadingSinkCache, SinkCache
-from third_party.hyper_attn.models.attention.hyper_attn import HyperAttention
+from cascade.models.cascade_attention import Qwen2CascadeAttention
 
 
 if is_flash_attn_2_available():
@@ -228,18 +224,6 @@ class Qwen2MLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
-def repeat_mask(mask: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen = mask.shape
-    if n_rep == 1:
-        return mask
-    mask = mask[:, :, None, :].expand(batch, num_key_value_heads, n_rep, slen)
-    return mask.reshape(batch, num_key_value_heads * n_rep, slen)
-
-
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -370,837 +354,6 @@ class Qwen2Attention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-def apply_rotary_pos_emb_one(x, cos, sin, position_ids=None, unsqueeze_dim=1):
-    # print(f"in apply one: {x.size()=} {cos.size()=} {sin.size()=}")
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    x_embed = (x * cos) + (rotate_half(x) * sin)
-    return x_embed
-
-
-class QwenCascadeAttention(Qwen2Attention):
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-               Optional[Tuple[torch.Tensor]]]:
-
-        static_cascade = hasattr(self, "past_key_value") and isinstance(
-            getattr(self, "past_key_value"), CascadingSinkCache)
-        cascade = isinstance(past_key_value, CascadingSinkCache)
-        if static_cascade or cascade:
-            if hidden_states.size(1) == 1:
-                return self.forward_cascade(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    **kwargs,
-                )
-
-            # we are in a batch processing scenario.
-            return self.forward_cascade_batch(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
-            )
-
-        elif hasattr(self, "hyper_attn"):
-            return self.forward_hyper_attention(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
-            )
-        return self.forward_original(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-    # @torch.compile
-    def qkv(self, x, size, kv_size):
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        q = q.view(*size).transpose(1, 2)
-        k = k.view(*kv_size).transpose(1, 2)
-        v = v.view(*kv_size).transpose(1, 2)
-        return q, k, v
-
-    # @torch.compile
-    def o(self, x):
-        return self.o_proj(x)
-
-    def qkto_batch(
-        self,
-        q,
-        sink_k,
-        # sink_m,
-        sink_v,
-        k,
-        m,
-        v,
-        cache,
-        size,
-        output_attentions=False,
-    ):
-        scale = 1 / np.sqrt(q.size(-1))
-        sink_out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
-                                sink_k * np.sqrt(scale))
-
-        out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
-                           k * np.sqrt(scale))
-
-        if not hasattr(self, "causal_mask"):
-            # there is no causal mask stored, which means this must be the
-            # first iteration. This mask is a special case where we can create
-            # a normal causal mask which is concatted with the repeated mask from
-            # the cascading cache.
-            first_it = True
-            val = torch.finfo(q.dtype).min
-            cm = torch.full((q.size(2), q.size(2)),
-                            val,
-                            device=q.device,
-                            dtype=q.dtype).triu(1)
-            cm_rest = torch.full(
-                (q.size(2), (sink_k.size(2) + k.size(2)) - q.size(2)),
-                val,
-                device=q.device,
-                dtype=q.dtype)
-
-            self.causal_mask = torch.cat((cm, cm_rest), dim=-1)
-            self.causal_mask = self.causal_mask.view(
-                1, 1, q.size(2),
-                k.size(2) + sink_k.size(2))
-
-        else:
-            # causal mask exists which means this is at least the second iteration.
-            # in this case the starting index in the cache will be q_len - sink_tokens
-            # and so we have to build a causal mask wich is slightly
-            first_it = False
-
-            val = torch.finfo(q.dtype).min
-            cm = torch.full((q.size(2), q.size(2)),
-                            val,
-                            device=q.device,
-                            dtype=q.dtype).triu(1)
-
-            # the last 'n_sink' come first because of the separate
-            # sinks and circular buffers in the first iteration. Move around
-            # the mask so it is causal given the order.
-            cm[:-sink_k.size(2), -sink_k.size(2):] = 0
-            cm[-sink_k.size(2):, :-sink_k.size(2)] = val
-
-            # sinks should have a zero causal mask for all
-            cm_sink = torch.zeros(q.size(2),
-                                  sink_k.size(2),
-                                  device=q.device,
-                                  dtype=q.dtype)
-
-            m_zero = m[0, 0, q.size(2):] < 0
-            # if m_zero == k.size(2) - q.size(2):
-            #     # once the cache is fully populates, the causal mask will remain fixed
-            #     self.causal_mask_isdone = True
-
-            cm_rest = torch.full((q.size(2), k.size(2) - q.size(2)),
-                                 val,
-                                 device=q.device,
-                                 dtype=q.dtype)
-
-            cm_rest = cm_rest * m_zero
-
-            self.causal_mask = torch.cat((cm_sink, cm, cm_rest), dim=-1)
-
-            self.causal_mask = self.causal_mask.view(
-                1, 1, q.size(2),
-                sink_k.size(2) + k.size(2))
-
-        total_out = torch.cat((sink_out, out), dim=-1)
-        total_out += self.causal_mask
-        scores = total_out.softmax(dim=-1)
-
-        out_attn = None
-        if output_attentions:
-            og_pos = torch.cat(
-                (torch.arange(sink_out.size(-1),
-                              device=sink_out.device), cache.og_pos[0, 0]))
-
-            out_attn = torch.zeros(out.size(0),
-                                   out.size(1),
-                                   1,
-                                   max(og_pos.amax() + 1, og_pos.size(0)),
-                                   device=out.device,
-                                   dtype=out.dtype)
-
-            og_pos = og_pos.view(1, 1, 1, -1).repeat(out.size(0), out.size(1),
-                                                     1, 1)
-
-            # print(f"{og_pos.size()=} {scores.size()=} {out_attn.size()=}")
-            out_attn.scatter_(-1, og_pos, scores)
-            # print(f"out_attn: {out_attn[0, 0, 0]=}")
-
-        out = scores[:, :, :, :sink_k.size(-2)] @ sink_v
-        out += scores[:, :, :, sink_k.size(-2):] @ v
-
-        if torch.distributed.is_initialized():
-            lst = [
-                torch.zeros_like(scores) for _ in range(self.config.world_size)
-            ]
-            torch.distributed.all_gather(lst, scores)
-            if self.config._head_reduction == "mean":
-                scores = torch.cat(lst, dim=1).mean(dim=1, keepdim=True)
-            elif self.config._head_reduction == "max":
-                scores = torch.cat(lst, dim=1).amax(dim=1, keepdim=True)
-            elif self.config._head_reduction == "median":
-                scores = torch.cat(lst, dim=1).median(dim=1,
-                                                      keepdim=True).values
-            elif self.config._head_reduction in ["none", "independent"]:
-                pass
-            else:
-                raise ValueError(
-                    f"unknown head reduction: {self.config.head_reduction=}")
-
-        out = out.transpose(1, 2).contiguous()
-        out = out.view(*size)
-
-        out = self.o(out)
-
-        return out, out_attn
-
-    # @torch.compile
-    def qkto(
-        self, q, sink_k, sink_m, sink_v,
-        k, m, v, cache, size,
-        output_attentions=False, include_o=True,
-    ):
-        scale = 1 / np.sqrt(q.size(-1))
-        sink_out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
-                                sink_k * np.sqrt(scale))
-
-        sink_out += sink_m.unsqueeze(2)
-
-        out = torch.einsum("bhqd,bhkd->bhqk", q * np.sqrt(scale),
-                           k * np.sqrt(scale))
-
-        out += m.unsqueeze(2)
-
-        total_out = torch.cat((sink_out, out), dim=-1)
-        scores = total_out.softmax(dim=-1)
-
-        out_attn = None
-        if output_attentions:
-            og_pos = torch.cat(
-                (torch.arange(sink_out.size(-1),
-                              device=sink_out.device), cache.og_pos[0, 0]))
-
-            out_attn = torch.zeros(out.size(0),
-                                   out.size(1),
-                                   1,
-                                   max(og_pos.amax() + 1, og_pos.size(0)),
-                                   device=out.device,
-                                   dtype=out.dtype)
-
-            og_pos = og_pos.view(1, 1, 1, -1).repeat(out.size(0), out.size(1),
-                                                     1, 1)
-
-            # print(f"{og_pos.size()=} {scores.size()=} {out_attn.size()=}")
-            out_attn.scatter_(-1, og_pos, scores)
-            # print(f"out_attn: {out_attn[0, 0, 0]=}")
-
-        out = scores[:, :, :, :sink_k.size(-2)] @ sink_v
-        out += scores[:, :, :, sink_k.size(-2):] @ v
-
-        if torch.distributed.is_initialized():
-            lst = [
-                torch.zeros_like(scores) for _ in range(self.config.world_size)
-            ]
-            torch.distributed.all_gather(lst, scores)
-            if self.config._head_reduction == "mean":
-                scores = torch.cat(lst, dim=1).mean(dim=1, keepdim=True)
-            elif self.config._head_reduction == "max":
-                scores = torch.cat(lst, dim=1).amax(dim=1, keepdim=True)
-            elif self.config._head_reduction == "median":
-                scores = torch.cat(lst, dim=1).median(dim=1,
-                                                      keepdim=True).values
-            elif self.config._head_reduction in ["none", "independent"]:
-                pass
-            else:
-                raise ValueError(
-                    f"unknown head reduction: {self.config.head_reduction=}")
-
-        cache.update_attention_scores(scores[:, :, :, sink_k.size(-2):], 0)
-
-        out = out.transpose(1, 2).contiguous()
-        out = out.view(*size)
-
-        if include_o:
-            out = self.o(out)
-
-        return out, out_attn
-
-    def rope(self, x, pos):
-        # necessary because Qwen expects a max index and our index could be larger than the size
-        # since we do not have the sink token positions in the cascade part of the kv cache
-        cos, sin = self.rotary_emb(x, 32768)
-
-        cos = cos[pos.view(-1)].reshape(1, pos.size(1), cos.size(-1))
-        sin = sin[pos.view(-1)].reshape(1, pos.size(1), sin.size(-1))
-
-        out = apply_rotary_pos_emb_one(x, cos, sin)
-        return out
-
-    def forward_cascade_batch(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        use_flash: bool = True,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-               Optional[Tuple[torch.Tensor]]]:
-
-        bsz, q_len, _ = hidden_states.size()
-
-        # project qkv first for this layer
-        query_states, key_states, value_states = self.qkv(
-            hidden_states, (bsz, q_len, self.num_heads, self.head_dim),
-            (bsz, q_len, self.num_key_value_heads, self.head_dim))
-
-        # In case static cache is used, it is an instance attribute.
-        past_key_value = getattr(self, "past_key_value", past_key_value)
-        if kwargs.get("reset", False):
-            past_key_value.reset(verbose=False)
-            if hasattr(self, "causal_mask"):
-                delattr(self, "causal_mask")
-            if hasattr(self, "query_pos"):
-                delattr(self, "query_pos")
-
-        first_it = past_key_value._seen_tokens == 0
-        sink_key_states, sink_value_states, sink_pos, sink_mask, k_states, v_states, key_pos, mask, og_pos =\
-            past_key_value.get_vals()
-
-        sk_masked = sink_mask < 0
-        k_masked = mask < 0
-
-        use_selfextend = False
-        max_pos = 0  # may be reset later
-        if not hasattr(self, "query_pos"):
-            self.query_pos = torch.arange(0,
-                                          query_states.size(2),
-                                          device=query_states.device,
-                                          dtype=torch.long).view(1, -1)
-
-        # not homogeneous + og_pos = independent head
-        # homogeneous + not og_pos = original
-        # homogeneous + og_pos = streaming llm with original pos
-        # not homogeneous + not og_pos = naive
-        homogeneous_heads = True
-        do_og_pos = False
-
-        if not first_it:
-            if use_selfextend:
-                og_pos = og_pos[:, 0, :]
-                n_pos = og_pos[:, :past_key_value.window_length]
-                g_pos = og_pos[:, past_key_value.window_length:]
-
-                g_pos = g_pos // 3 + past_key_value.num_sink_tokens
-                n_pos = n_pos - n_pos.amin(dim=-1, keepdim=True) + g_pos.amax(
-                    dim=-1, keepdim=True) + 1
-                og_pos = torch.cat((n_pos, g_pos), dim=-1)
-                max_pos = torch.cat(
-                    (sink_pos.amax().view(1), og_pos.amax().view(1)),
-                    dim=-1).amax() + 1
-                key_pos = og_pos
-            else:
-                if do_og_pos:
-                    max_pos = torch.cat(
-                        (sink_pos.amax().view(1), og_pos.amax().view(1)),
-                        dim=-1).amax() + 1
-                else:
-                    max_pos = torch.cat(
-                        (sink_pos.amax().view(1), key_pos.amax().view(1)),
-                        dim=-1).amax() + 1
-
-        query_pos = self.query_pos[:, :query_states.size(-2)] + max_pos
-
-        query_states = self.rope(query_states, query_pos)
-        key_states_pos = self.rope(key_states, query_pos)
-        sink_key_states = self.rope(sink_key_states, sink_pos)
-
-        if do_og_pos:
-            b, h, s, d = k_states.size()
-            k_states = self.rope(k_states.view(b * h, 1, s, d), og_pos.view(b * h, -1))
-            k_states = k_states.view(b, h, s, d)
-        else:
-            k_states = self.rope(k_states, key_pos)
-
-        key_states_pos = repeat_kv(key_states_pos, self.num_key_value_groups)
-        sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
-        sink_value_states = repeat_kv(sink_value_states, self.num_key_value_groups)
-        k_states = repeat_kv(k_states, self.num_key_value_groups)
-        v_states = repeat_kv(v_states, self.num_key_value_groups)
-        value_states_repeat = repeat_kv(value_states, self.num_key_value_groups)
-        scale = 1 / math.sqrt(query_states.size(-1))
-
-        if not hasattr(self, "ema_mask"):
-            out = []
-            for i in range(q_len):
-                beta = past_key_value.beta
-                exps = (1 - beta) * beta**torch.arange(
-                    q_len - i,
-                    device=query_states.device,
-                    dtype=query_states.dtype)
-                out.append(
-                    torch.cat((torch.zeros(i,
-                                           device=query_states.device,
-                                           dtype=query_states.dtype), exps)))
-
-            self.ema_mask = torch.stack(out).T
-
-        if not use_flash:
-            val = torch.finfo(query_states.dtype).min
-            if not hasattr(self, "causal_mask"):
-                self.causal_mask = torch.full(
-                    (query_states.size(2), query_states.size(2)),
-                    val,
-                    device=query_states.device,
-                    dtype=query_states.dtype).triu(1)
-
-                self.sink_mask = torch.full(
-                    (query_states.size(2), sink_key_states.size(2)),
-                    val,
-                    device=query_states.device,
-                    dtype=query_states.dtype)
-
-                self.cache_mask = torch.full(
-                    (query_states.size(2), k_states.size(2)),
-                    val,
-                    device=query_states.device,
-                    dtype=query_states.dtype)
-
-            qattn = torch.einsum("bhqd,bhkd->bhqk",
-                                 query_states * np.sqrt(scale),
-                                 key_states_pos * np.sqrt(scale))
-            qattn = qattn + self.causal_mask
-            sattn = torch.einsum("bhqd,bhkd->bhqk",
-                                 query_states * np.sqrt(scale),
-                                 sink_key_states * np.sqrt(scale))
-
-            sattn = sattn + (self.sink_mask[None, None, :] *
-                             sk_masked[:, :, None, :])
-
-            cattn = torch.einsum("bhqd,bhkd->bhqk",
-                                 query_states * np.sqrt(scale),
-                                 k_states * np.sqrt(scale))
-            cattn = cattn + (self.cache_mask[None, None, :] *
-                             k_masked[:, :, None, :])
-
-            attn = torch.cat((qattn, sattn, cattn), dim=-1)
-            attn = attn.softmax(dim=-1)
-
-            out = attn[:, :, :, :q_len] @ value_states_repeat + \
-                attn[:, :, :, q_len: q_len + sink_key_states.size(2)] @ sink_value_states + \
-                attn[:, :, :, -v_states.size(2):] @ v_states
-
-            scores = attn
-
-            beta = past_key_value.beta
-            exps = (1 - beta) * beta**torch.arange(
-                scores.size(2), device=scores.device).flip(dims=(0, ))
-
-            ema_scores = (
-                scores[:, :, :, q_len + sink_key_states.size(2):].mean(
-                    dim=1, keepdim=True) * exps[None, None, :, None]).sum(dim=2)
-
-            past_key_value.score_cache = beta**scores.size(
-                2) * past_key_value.score_cache + ema_scores
-
-            score_states = scores[:, :, :, :q_len] * self.ema_mask[None,
-                                                                   None, :]
-
-            score_states = score_states.mean(dim=1, keepdim=True).sum(dim=2)
-            score_states = score_states.repeat(1, query_states.size(1), 1)
-
-            _ = past_key_value.update_batch(
-                key_states,
-                value_states,
-                score_states=score_states,
-            )
-
-        else:
-            if not hasattr(self, "causal_mask"):
-                causal_mask = torch.full(
-                    (query_states.size(2), query_states.size(2)),
-                    1,
-                    device=query_states.device,
-                    dtype=torch.bool).triu(1)
-
-                sink_mask = torch.full(
-                    (query_states.size(2), sink_key_states.size(2)),
-                    1,
-                    device=query_states.device,
-                    dtype=torch.bool)
-
-                cache_mask = torch.full(
-                    (query_states.size(2), k_states.size(2)),
-                    1,
-                    device=query_states.device,
-                    dtype=torch.bool)
-
-                self.causal_mask = torch.cat(
-                    (sink_mask, cache_mask, causal_mask), dim=-1)
-
-            n_sink = sink_key_states.size(2)
-            self.causal_mask[:, :n_sink] =\
-                self.causal_mask[:, :n_sink] * sk_masked[0, 0]
-
-            self.causal_mask[:, n_sink:n_sink + k_states.size(2)] =\
-                self.causal_mask[:, n_sink:n_sink + k_states.size(2)] * k_masked[0, 0]
-
-            out, scores = attention(
-                query_states,
-                torch.cat((sink_key_states, k_states, key_states_pos), dim=2),
-                torch.cat((sink_value_states, v_states, value_states_repeat), dim=2),
-                True,
-                scale,
-                self.causal_mask,
-                past_key_value.beta,
-            )
-
-            beta = past_key_value.beta
-
-            kvh = self.num_key_value_heads
-            if homogeneous_heads:
-                ema_scores = scores[:, :, n_sink:n_sink + k_states.size(2)].mean(dim=1, keepdim=True)
-                scores = scores[:, :, -q_len:].mean(dim=1, keepdim=True).repeat(1, kvh, 1)
-            else:
-                b, h, s = scores.size()
-                ema_scores = scores[:, :, n_sink:n_sink + k_states.size(2)].view(b, kvh, h // kvh, -1).mean(dim=2)
-                scores = scores[:, :, -q_len:].view(b, kvh, h // kvh, -1).mean(dim=2)
-
-            past_key_value.score_cache = beta**out.size(
-                2) * past_key_value.score_cache + ema_scores
-
-            _ = past_key_value.update_batch(key_states, value_states, score_states=scores)
-
-        out = out.transpose(1, 2).contiguous()
-        out = out.view(bsz, q_len, -1)
-
-        out = self.o(out)
-
-        return out, None, past_key_value
-
-    def forward_cascade(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-               Optional[Tuple[torch.Tensor]]]:
-
-        bsz, q_len, _ = hidden_states.size()
-
-        # query_states = self.q_proj(hidden_states)
-        # key_states = self.k_proj(hidden_states)
-        # value_states = self.v_proj(hidden_states)
-
-        query_states, key_states, value_states = self.qkv(
-            hidden_states, (bsz, q_len, self.num_heads, self.head_dim),
-            (bsz, q_len, self.num_key_value_heads, self.head_dim))
-
-        # In case static cache is used, it is an instance attribute.
-        past_key_value = getattr(self, "past_key_value", past_key_value)
-        if kwargs.get("reset", False):
-            past_key_value.reset(verbose=False)
-
-        layer_idx = self.layer_idx if not hasattr(self,
-                                                  "past_key_value") else 0
-
-        # sin and cos are specific to RoPE models; cache_position needed for the static cache
-        cache_kwargs = {"cache_position": cache_position}
-        sink_key_states, sink_value_states, sink_pos, sink_mask, key_states, value_states, key_pos, mask, og_pos =\
-            past_key_value.update(key_states, value_states)
-
-        # key_pos = past_key_value.compress_original_pos()
-
-        sink_key_states = self.rope(sink_key_states, sink_pos)
-
-        sink_mask = repeat_mask(sink_mask, self.num_key_value_groups)
-        sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
-        sink_value_states = repeat_kv(sink_value_states,
-                                      self.num_key_value_groups)
-
-        query_pos = torch.amax(torch.cat((sink_pos, key_pos), dim=-1),
-                               dim=-1,
-                               keepdim=True)
-
-        key_states = self.rope(key_states, key_pos)
-
-        mask = repeat_mask(mask, self.num_key_value_groups)
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        query_states = self.rope(query_states, query_pos)
-
-        # print(
-        #     f"{query_states.size()=} {sink_key_states.size()=} {sink_value_states.size()=}"
-        # )
-
-        out, attentions = self.qkto(
-            query_states,
-            sink_key_states,
-            sink_mask,
-            sink_value_states,
-            key_states,
-            mask,
-            value_states,
-            past_key_value,
-            (bsz, q_len,
-             -1),  # needs to be -1 instead of hidden size for deepspeed
-            output_attentions,
-        )
-
-        return out, attentions, past_key_value
-
-    def forward_hyper_attention(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-               Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads *
-                                 self.head_dim) // self.config.pretraining_tp
-            query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp,
-                dim=0)
-            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
-
-            query_states = [
-                F.linear(hidden_states, query_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            query_states = torch.cat(query_states, dim=-1)
-
-            key_states = [
-                F.linear(hidden_states, key_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [
-                F.linear(hidden_states, value_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            value_states = torch.cat(value_states, dim=-1)
-
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads,
-                                         self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
-                                     self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
-                                         self.head_dim).transpose(1, 2)
-
-        past_key_value = getattr(self, "past_key_value", past_key_value)
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
-            key_states, value_states = past_key_value.update(
-                key_states, value_states)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        attn_output = self.hyper_attn(query_states,
-                                      key_states,
-                                      value_states,
-                                      causal=True)
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size //
-                                            self.config.pretraining_tp,
-                                            dim=2)
-            o_proj_slices = self.o_proj.weight.split(
-                self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([
-                F.linear(attn_output[i], o_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ])
-        else:
-            attn_output = self.o_proj(attn_output)
-
-        return attn_output, None, past_key_value
-
-    def forward_original(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-               Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads *
-                                 self.head_dim) // self.config.pretraining_tp
-            query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp,
-                dim=0)
-            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
-
-            query_states = [
-                F.linear(hidden_states, query_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            query_states = torch.cat(query_states, dim=-1)
-
-            key_states = [
-                F.linear(hidden_states, key_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [
-                F.linear(hidden_states, value_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            value_states = torch.cat(value_states, dim=-1)
-
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads,
-                                         self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
-                                     self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
-                                         self.head_dim).transpose(1, 2)
-
-        past_key_value = getattr(self, "past_key_value", past_key_value)
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
-            key_states, value_states = past_key_value.update(
-                key_states, value_states)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(
-            2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights,
-                                             dim=-1,
-                                             dtype=torch.float32).to(
-                                                 query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights,
-                                             p=self.attention_dropout,
-                                             training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}")
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size //
-                                            self.config.pretraining_tp,
-                                            dim=2)
-            o_proj_slices = self.o_proj.weight.split(
-                self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([
-                F.linear(attn_output[i], o_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ])
-        else:
-            attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-
 class Qwen2FlashAttention2(Qwen2Attention):
     """
     Qwen2 flash attention module, following Qwen2 attention module. This module inherits from `Qwen2Attention`
@@ -1262,8 +415,8 @@ class Qwen2FlashAttention2(Qwen2Attention):
             # Activate slicing cache only if the config has a value `sliding_windows` attribute
             cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
             if (
-                getattr(self.config, "sliding_window", None) is not None
-                and kv_seq_len > self.config.sliding_window
+                getattr(self.config, "sliding_window", None) is not None \
+                and kv_seq_len > self.config.sliding_window \
                 and cache_has_contents
             ):
                 slicing_tokens = 1 - self.config.sliding_window
@@ -1321,8 +474,8 @@ class Qwen2FlashAttention2(Qwen2Attention):
         value_states = value_states.transpose(1, 2)
 
         if (
-            self.config.use_sliding_window
-            and getattr(self.config, "sliding_window", None) is not None
+            self.config.use_sliding_window \
+            and getattr(self.config, "sliding_window", None) is not None \
             and self.layer_idx >= self.config.max_window_layers
         ):
             sliding_window = self.config.sliding_window
@@ -1446,7 +599,6 @@ QWEN2_ATTENTION_CLASSES = {
     "eager": Qwen2Attention,
     "flash_attention_2": Qwen2FlashAttention2,
     "sdpa": Qwen2SdpaAttention,
-    "cascade": QwenCascadeAttention,
 }
 
 
@@ -1463,7 +615,7 @@ class Qwen2DecoderLayer(nn.Module):
 
         _attn = QWEN2_ATTENTION_CLASSES[config._attn_implementation]
         if config._method == "sink":
-            _attn = QWEN2_ATTENTION_CLASSES["cascade"]
+            _attn = Qwen2CascadeAttention
         self.self_attn = _attn(config, layer_idx)
 
         self.mlp = Qwen2MLP(config)
@@ -1513,7 +665,6 @@ class Qwen2DecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
-            **kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -1685,53 +836,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    def clear_caches(self):
-        for i, decoder_layer in enumerate(self.layers):
-            decoder_layer.self_attn.past_key_value.reset(verbose=False)
-
-    def setup_caches(self, world_size=1, verbose=True):
-        # adjust the window length of each cascade. The input window length is the max
-        window = self.config._window // self.config._cascades
-        max_seq_len = self.config._window
-
-        for i, decoder_layer in enumerate(self.layers):
-            if verbose:
-                print(
-                    f"init cache for layer {i=} {world_size=} {self.config=} {self.config._cascade_func=}"
-                )
-            cache = CascadingSinkCache(
-                window,
-                num_sink_tokens=self.config._sinks,
-                max_batch_size=self.config._batch_size,
-                heads=self.config.num_key_value_heads // world_size,
-                dim=self.config.hidden_size // self.config.num_attention_heads,
-                max_seq_len=max_seq_len,
-                dtype=torch.float16,
-                device=self.embed_tokens.weight.device,
-                cascade_func=self.config._cascade_func,
-                head_reduction=self.config._head_reduction,
-            )
-
-            decoder_layer.self_attn.past_key_value = cache
-
-    def setup_hyper_attention(self):
-        # adjust the window length of each cascade. The input window length is the max
-        for i, decoder_layer in enumerate(self.layers):
-            # print(f"init hyper attention for layer {i=} {self.config=}")
-
-            min_seq_len = 4096
-            if i < 8:
-                min_seq_len = 32768
-
-            decoder_layer.self_attn.hyper_attn = HyperAttention(
-                input_dim=128,
-                lsh_num_projs=7,
-                block_size=64,
-                sample_size=1024,
-                min_seq_len=min_seq_len,
-                cuda=True,
-            )
-
     @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
     def forward(
         self,
@@ -1745,7 +849,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1812,7 +915,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     output_attentions,
                     use_cache,
                     cache_position,
-                    **kwargs,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1823,7 +925,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
-                    **kwargs,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1913,9 +1014,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         )
 
         if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type == "cuda"
+            self.config._attn_implementation == "sdpa" \
+            and attention_mask is not None \
+            and attention_mask.device.type == "cuda" \
             and not output_attentions
         ):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
@@ -1971,7 +1072,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -2017,7 +1117,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            **kwargs,
         )
 
         hidden_states = outputs[0]
@@ -2082,17 +1181,18 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and cache_position[0] == 0:
-            model_inputs = {"inputs_embeds": inputs_embeds}
+            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
         else:
-            model_inputs = {"input_ids": input_ids}
+            # The clone here is for the same reason as for `position_ids`.
+            model_inputs = {"input_ids": input_ids.clone(memory_format=torch.contiguous_format), "inputs_embeds": None}
 
         if isinstance(past_key_values, StaticCache) and attention_mask.ndim == 2:
-            if inputs_embeds is not None:
-                batch_size, sequence_length = inputs_embeds.shape
-                device = inputs_embeds.device
+            if model_inputs["inputs_embeds"] is not None:
+                batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
+                device = model_inputs["inputs_embeds"].device
             else:
-                batch_size, sequence_length = input_ids.shape
-                device = input_ids.device
+                batch_size, sequence_length = model_inputs["input_ids"].shape
+                device = model_inputs["input_ids"].device
 
             dtype = self.lm_head.weight.dtype
             min_dtype = torch.finfo(dtype).min

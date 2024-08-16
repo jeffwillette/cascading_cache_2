@@ -1,26 +1,23 @@
-import os
 import torch
-from tqdm import tqdm
-import json
 import time
-import deepspeed
-from cascade.main.jobs.pg19 import get_injection_policy
+# import deepspeed
+# from cascade.main.jobs.pg19 import get_injection_policy
 
 
 def job_latency(args, model, tokenizer, device):
     if args.method != "vanilla":
         model.model.setup_caches(args.world_size, verbose=False)
 
-    if args.world_size > 1:
-        model = deepspeed.init_inference(
-            model,
-            tensor_parallel={"tp_size": args.world_size},
-            replace_with_kernel_inject=False,
-            dtype=args.infer_dtype,
+    # if args.world_size > 1:
+    #     model = deepspeed.init_inference(
+    #         model,
+    #         tensor_parallel={"tp_size": args.world_size},
+    #         replace_with_kernel_inject=False,
+    #         dtype=args.infer_dtype,
 
-            injection_policy=get_injection_policy(args.model),
-        )
-        m = model.module.model
+    #         injection_policy=get_injection_policy(args.model),
+    #     )
+    #     m = model.module.model
     else:
         model = model.to(args.infer_dtype).cuda()
         # model = torch.compile(model, mode="max-autotune", fullgraph=False)

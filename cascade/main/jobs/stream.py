@@ -2,18 +2,11 @@ import os
 import time
 import traceback
 import torch
-import transformers
-from datasets import load_dataset
-from tqdm import tqdm
-import argparse
 from transformers import TextStreamer
 
 from vllm import LLM, SamplingParams
-from peft import LoraConfig, TaskType
-from peft import get_peft_model, prepare_model_for_kbit_training
 from transformers.models.auto import AutoTokenizer
-from cascade.models.modeling_llama import LlamaForCausalLM, LlamaConfig
-from cascade.utils import seed, get_bench
+from cascade.utils import get_bench
 
 from vllm.transformers_utils import config as vllm_transformers_config
 
@@ -58,9 +51,7 @@ def job_stream(args, model, tokenizer, device):
             with open(input_text, 'r', encoding='utf8') as f:
                 input_text = f.read()
 
-        inputs = tokenizer([
-            input_text,
-        ] * args.batch_size,
+        inputs = tokenizer([input_text, ] * args.batch_size,
                            return_tensors='pt').to(device)
         print('input_ids', len(input_text), inputs.input_ids.shape)
 
@@ -95,14 +86,10 @@ def job_stream(args, model, tokenizer, device):
                     n_tokens = len(tokenizer([generated_text]).input_ids[0])
                     n_generated += n_tokens
                     if len(outputs) > 1:
-                        print(
-                            generated_text.replace('\n', '\\n')[:150] +
-                            ' [...]', n_tokens)
+                        print(generated_text.replace('\n', '\\n')[:150] + ' [...]', n_tokens)
                     else:
                         print(generated_text, n_tokens)
-                print(
-                    f'{n_generated} token generated, {n_generated/elapsed:.2f} tok/sec'
-                )
+                print(f'{n_generated} token generated, {n_generated/elapsed:.2f} tok/sec')
             else:
                 streamer = BatchedStreamer(tokenizer, skip_prompt=True)
 

@@ -1,23 +1,15 @@
 import os
-import time
-import traceback
 import torch
-import transformers
-from datasets import load_dataset
 from cascade.dataset.pg19 import PG19Streaming
 from tqdm import tqdm
-import argparse
 import json
-from transformers import TextStreamer
-# from aim import Run
+from aim import Run
 
-from peft import LoraConfig, TaskType
-from peft import get_peft_model, prepare_model_for_kbit_training
-from cascade.utils import seed, get_bench, MockRun
-import deepspeed
-from cascade.models.modeling_llama import LlamaDecoderLayer
-from cascade.models.qwen.modeling_qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
-from third_party.hyper_attn.models.attention.modeling_chatglm_fast_attention import FastCoreAttention
+from cascade.utils import MockRun
+# import deepspeed
+from cascade.models.llama.modeling_llama import LlamaDecoderLayer
+from cascade.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+from cascade.models.cascading_cache import CascadingKVCache
 
 
 def get_injection_policy(model_id):
@@ -40,48 +32,22 @@ def get_injection_policy(model_id):
 
 
 def job_ppl_pg19(args, model, tokenizer, device):
-    output_attentions = False
-    if "attention-matrix-plot" in args.comment:
-        model.model.setup_caches(args.world_size)
-        model = model.to(args.infer_dtype).cuda()
-        output_attentions = True
-    elif args.method == "hyper":
-        model.model.setup_hyper_attention()
+    stride, world_size = 1024, 1
+    mdl = model.model
 
-        # model = model.to(args.infer_dtype).cuda()
+    # model = deepspeed.init_inference(
+    #     model,
+    #     tensor_parallel={"tp_size": args.world_size},
+    #     replace_with_kernel_inject=False,
+    #     dtype=args.infer_dtype,
+    #     injection_policy=get_injection_policy(args.model),
+    # )
+    # mdl = model.module.model
 
-        # only for Llama7B 3/4 layers which had precision errors with float16
-        model = model.to(torch.bfloat16).cuda()
-
-        # model = deepspeed.init_inference(
-        #     model,
-        #     tensor_parallel={"tp_size": args.world_size},
-        #     replace_with_kernel_inject=False,
-        #     dtype=args.infer_dtype,
-        #     injection_policy=get_injection_policy(args.model),
-        # )
-
-    elif args.world_size == 1:
-        model.model.setup_caches(args.world_size)
-        model = model.to(args.infer_dtype).cuda()
-        model = torch.compile(model, backend="cudagraphs")
-    else:
-        model.model.setup_caches(args.world_size)
-        model = deepspeed.init_inference(
-            model,
-            tensor_parallel={"tp_size": args.world_size},
-            replace_with_kernel_inject=False,
-            dtype=args.infer_dtype,
-            injection_policy=get_injection_policy(args.model),
-            enable_cuda_graph=True,
-        )
-
-    run = MockRun()
     if args.local_rank == 0:
-        # run = Run(experiment=f"{args.method}-pg19"
-        #           ) if not args.dev_run else MockRun()
+        run = Run(experiment=f"{args.method}-pg19"
+                  ) if not args.dev_run else MockRun()
 
-        run = MockRun()
         dataset = "pg19"
         run["hparams"] = {
             "job": "ppl",
@@ -104,133 +70,111 @@ def job_ppl_pg19(args, model, tokenizer, device):
     count_individual = torch.zeros(100)
     step = 0
 
-    dataset = PG19Streaming(tokenizer, batch_size=args.batch_size)
+    dataset = PG19Streaming(tokenizer)
+    past_key_values = None
+    use_cache = False
+    if args.method == "sink":
+        use_cache = True
 
+        window = mdl.config._window // mdl.config._cascades
+        max_seq_len = mdl.config._window
+
+        past_key_values = CascadingKVCache(
+            window,
+            num_sink_tokens=mdl.config._sinks,
+            max_batch_size=mdl.config._batch_size,
+            heads=mdl.config.num_key_value_heads // world_size,
+            dim=mdl.config.hidden_size // mdl.config.num_attention_heads,
+            max_seq_len=max_seq_len,
+            dtype=torch.float16,
+            device=mdl.embed_tokens.weight.device,
+            cascade_func=mdl.config._cascade_func,
+            head_reduction=mdl.config._head_reduction,
+            layers=len(mdl.layers),
+        )
+
+    nll_total, count_total = 0, 0
     for j, (x, y) in enumerate(dataset):
+        # print(f"\n\n\nwarning: truncating sequence for homogeneous heads rebuttal experiment\n\n\n")
+        # x = x[:, :mdl.config.max_position_embeddings]
+        # y = y[:, :mdl.config.max_position_embeddings]
         input_ids = x.cuda()
         target_ids = y.cuda()
 
-        ############################ TEMPORARY HACK TO MATCH THE SUBSETS OF QWEN AND LLAMA
-        # if j < 24:
-        #     print(f"skipping book {j}")
-        #     continue
-        ############################ END HACK, COMMENT OUT WHEN DONE
+        if past_key_values is not None:
+            past_key_values.reset()
 
-        if args.method == "sink":
-            print(
-                f"starting batch of books: {input_ids.size()=} {target_ids.size()=}"
-            )
+        print(
+            f"starting batch of books: {input_ids.size()=} {target_ids.size()=}"
+        )
+        with tqdm(range(0, x.size(1) - 1, stride), ncols=150) as pbar:
+            for i in pbar:
+                with torch.no_grad():
+                    # inp = input_ids[:, i:i + 1]
+                    # use cache false means to use static cascading cache inside the model
 
-            ATTN_ROWS_LIMIT = 8192
-            attn_rows = []
-            stride = 512
-            with tqdm(range(0, x.size(1) - 1, stride), ncols=150) as pbar:
-                for i in pbar:
-                    with torch.no_grad():
-                        inp = input_ids[:, i:i + stride]
-                        # use cache false means to use static cascading cache inside the model
-                        output = model(inp,
-                                       use_cache=False,
-                                       reset=i == 0,
-                                       output_attentions=output_attentions)
+                    inputs = input_ids[:, i:i + stride]
+                    targets = target_ids[:, i + 1:i + stride + 1]
+                    if inputs.size(1) < stride:
+                        pad = torch.zeros(inputs.size(0),
+                                          stride - inputs.size(1),
+                                          device=inputs.device,
+                                          dtype=inputs.dtype)
 
-                        if output_attentions:
-                            attn_rows.append([
-                                a.cpu().amax(dim=1).to(torch.float8_e4m3fn)
-                                for a in output.attentions
-                            ])
-                            print(f"{len(attn_rows)=}")
-                            if i == ATTN_ROWS_LIMIT - 1:
-                                torch.save(
-                                    attn_rows,
-                                    f"./attention_visualization/book-{j}-window-{args.window}-cascades-{args.cascades}.pt"
-                                )
-                                break
+                        target_pad = torch.full(
+                            (inputs.size(0), stride - inputs.size(1) + 1),
+                            -100,
+                            device=inputs.device,
+                            dtype=inputs.dtype)
 
-                        logits = output.logits[:, -1:]
-                        targets = target_ids[:, i + 1:i + 2]
-                        _nll = torch.nn.functional.cross_entropy(
-                            logits.reshape(-1, logits.size(-1)),
-                            targets.reshape(-1),
-                            ignore_index=-100,
-                            reduction="none",
-                        )
+                        inputs = torch.cat((inputs, pad), dim=-1)
+                        targets = torch.cat((targets, target_pad), dim=-1)
 
-                        nll_total += _nll.sum()
-                        count_total += (targets >= 0).sum().item()
-                        print(f"nll: {nll_total / count_total}")
+                    # I don't think this should happen because the dataset
+                    # already pads these to be the same size for the batch.
+                    # delete if this doesn't cause a problem
+                    # elif targets.size(1) < inputs.size(1):
+                    #     target_pad = torch.full(
+                    #         (inputs.size(0), inputs.size(1) - targets.size(1)),
+                    #         -100,
+                    #         device=inputs.device,
+                    #         dtype=inputs.dtype)
 
-                        l, u = j * args.batch_size, (j + 1) * args.batch_size
-                        nll_individual[l:u] += _nll.cpu()
-                        count_individual[l:u] += (targets
-                                                  >= 0).sum(dim=-1).cpu()
-                        step += 1
+                    #     targets = torch.cat((targets, target_pad), dim=-1)
+                    output = model(inputs, use_cache=use_cache, past_key_values=past_key_values)
+                    past_key_values = output.past_key_values
+                    logits = output.logits
 
-                        if step % 100 == 0:
-                            # ppl = torch.exp(nll_total / count_total).item()
-                            # run.track(ppl,
-                            #           name="ppl-pg19",
-                            #           step=step,
-                            #           context={"subset": "test"})
-                            # pbar.set_description(f"{ppl=:.6f}")
+                    _nll = torch.nn.functional.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)).float(),
+                        targets.reshape(-1),
+                        ignore_index=-100,
+                        reduction="none",
+                    )
 
-                            book_idx = l + torch.arange(args.batch_size)
-                            book_ppl = torch.exp(nll_individual[book_idx] /
-                                                 count_individual[book_idx])
+                    nll_total += _nll.sum()
+                    count_total += (targets >= 0).sum().item()
+                    pbar.set_description(
+                        f"ppl: {(nll_total / count_total).exp()}")
 
-                            stats = {}
-                            for k in range(args.batch_size):
-                                key = f"ppl-pg19-book-{l + k}"
-                                val = book_ppl[k].item()
-                                # only track items which have not reached EOS
-                                if targets.view(-1)[k] >= 0:
-                                    stats[key] = val
+                    l, u = j * args.batch_size, (j + 1) * args.batch_size
+                    _nll = _nll.reshape(args.batch_size, -1)
+                    nll_individual[l:u] += _nll.cpu().sum(dim=-1)
+                    count_individual[l:u] += (targets >= 0).sum(dim=-1).cpu()
+                    step += stride
 
-                            run.track(stats,
-                                      step=i,
-                                      context={"subset": "test"})
-        elif args.method == "hyper":
-            with torch.no_grad():
-                max_len = 32768
-                input_ids = input_ids[:, :model.config.max_position_embeddings]
-                target_ids = target_ids[:, 1:model.config.
-                                        max_position_embeddings + 1]
+                    book_idx = l + torch.arange(args.batch_size)
+                    book_ppl = torch.exp(nll_individual[book_idx] / count_individual[book_idx])
 
-                print(input_ids.size())
-                print(target_ids.size())
-                if target_ids.size(-1) + 1 == input_ids.size(-1):
-                    input_ids = input_ids[:, :-1]
+                    stats = {}
+                    for k in range(args.batch_size):
+                        key = f"ppl-pg19-book-{l + k}"
+                        val = book_ppl[k].item()
+                        # only track items which have not reached EOS
+                        if targets.reshape(-1)[k] >= 0:
+                            stats[key] = val
 
-                # input_ids = input_ids[:, :4096]
-                # target_ids = target_ids[:, 1:4096 + 1]
-                # print(f"{input_ids=} {target_ids=}")
-
-                attn_out = model(input_ids, use_cache=False)
-
-                logits = attn_out.logits
-                print(f"{logits.size()=}")
-
-                logit_lst = logits.split(100, dim=1)
-                target_lst = target_ids.split(100, dim=1)
-
-                nll_cum = 0
-                count = 0
-                for l, t in zip(logit_lst, target_lst):
-                    nll = torch.nn.functional.cross_entropy(l.reshape(
-                        -1, l.size(-1)).float(),
-                                                            t.reshape(-1),
-                                                            ignore_index=-100,
-                                                            reduction="sum")
-                    nll_cum += nll
-                    count += t.size(1)
-
-                nll = nll_cum / count
-
-                all_nll.append(nll.item())
-                print(f"{all_nll=}")
-                count_total += 1
-                nll_total += nll
-                print(f"book: {j=} perplexity: {torch.exp(nll).item()=}")
+                    run.track(stats, step=i, context={"subset": "test"})
 
     ppl = torch.exp(nll_total / count_total).item()
 

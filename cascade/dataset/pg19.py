@@ -38,21 +38,7 @@ def cache_tokenized(dataset, tokenizer):
         return cache_tokenized(dataset, tokenizer)
 
 
-# def cache_tokenized(dataset, tokenizer):
-#     print(tokenizer, vars(tokenizer))
-#     os.makedirs('./cache/pg19', exist_ok=True)
-#
-#     name = tokenizer.name_or_path.replace("/", "-")
-#     cache_path = f'./cache/pg19/{name}-tokenized.pth'
-#
-#     text = []
-#     for i in range(len(dataset)):
-#         entry = dataset[i]
-#         print(f"{i} {entry['short_book_title']}")
-#         # text.append(entry['text'])
-
-
-class PG19Streaming(Dataset):
+class PG19StreamingSingleBooks(Dataset):
 
     def __init__(self, tokenizer, batch_size=24):
         self.tokenizer = tokenizer
@@ -108,6 +94,28 @@ class PG19Streaming(Dataset):
                           dim=-1))
 
         return torch.cat(out_inputs, dim=0), torch.cat(out_labels, dim=0)
+
+
+class PG19Streaming(Dataset):
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.dataset = datasets.load_dataset('emozilla/pg19-test')['test']
+
+        self.inputs = cache_tokenized(self.dataset, self.tokenizer)
+
+        self.inputs = torch.cat(self.inputs, dim=1)
+        print(f"total tokens: {self.inputs.size()=}")
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx) -> int:
+        if idx >= len(self):
+            raise IndexError("Index out of range")
+
+        inputs = self.inputs[idx:idx+1]
+        return inputs, inputs
 
 
 if __name__ == '__main__':

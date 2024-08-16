@@ -1,27 +1,19 @@
 import os
-import time
-import traceback
 import torch
 import transformers
-from datasets import load_dataset
-from tqdm import tqdm
-import argparse
-from transformers import TextStreamer
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
-from cascade.models.modeling_llama import LlamaForCausalLM, LlamaConfig
-from cascade.models.qwen.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config
-from cascade.utils import seed, get_bench
+from cascade.models.llama.modeling_llama import LlamaForCausalLM, LlamaConfig
+from cascade.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config
+from cascade.utils import seed
 
 # from cascade.main.jobs.bench_single_layer import job_bench_single_layer
-from cascade.main.jobs.ppl import job_ppl
 from cascade.main.jobs.passkey import job_passkey
 from cascade.main.jobs.latency import job_latency
 from cascade.main.jobs.ppl_memory import job_ppl_memory
-from cascade.main.jobs.pg19 import job_ppl_pg19
 from cascade.main.jobs.profile import job_profile
-from cascade.main.jobs.pg19_compile import job_ppl_pg19_compile
+from cascade.main.jobs.pg19 import job_ppl_pg19
 # from cascade.main.jobs.stream import job_stream
 from cascade.main.jobs.mmlu import job_mmlu
 from cascade.main.eval_args import eval_args, ArgsType
@@ -164,8 +156,8 @@ def load_model(args):
         args.infer_dtype = get_dtype(model_id)
         from_pretrained_kwargs = dict(
             config=config,
-            # device_map={"": device},
-            device_map=None,
+            device_map={"": device},
+            # device_map=None,
             # quantization_config=transformers.BitsAndBytesConfig(
             #     load_in_4bit=True,
             #     bnb_4bit_compute_dtype=infer_dtype,
@@ -197,15 +189,10 @@ def load_model(args):
             trust_remote_code=True,
         )
 
-    if args.method == "vanilla":
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            model_id, **from_pretrained_kwargs)
-    elif args.method == "sink":
-        model = get_model(model_id, **from_pretrained_kwargs)
-    elif args.method == "hyper":
-        model = get_model(model_id, **from_pretrained_kwargs)
-    else:
-        raise ValueError("unsupported method")
+    model = get_model(model_id, **from_pretrained_kwargs)
+    if args.method == "hyper":
+        raise NotImplementedError("need to figure out how to run hyper again with new workflow")
+        # model = get_model(model_id, **from_pretrained_kwargs)
 
     for m in model.modules():
         if hasattr(m, 'attention_method'):
@@ -277,8 +264,7 @@ def main():
     elif args.job == 'passkey':
         job_passkey(args, model, tokenizer, device)
     elif args.job == 'ppl-pg19':
-        # job_ppl_pg19(args, model, tokenizer, device)
-        job_ppl_pg19_compile(args, model, tokenizer, device)
+        job_ppl_pg19(args, model, tokenizer, device)
     elif args.job == 'profile':
         job_profile(args, model, tokenizer, device)
     elif args.job == 'stream':

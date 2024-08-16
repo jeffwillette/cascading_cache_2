@@ -69,7 +69,7 @@ def gen_text(tokenizer):
     # insert_locs = [0.2, 0.4, 0.6, 0.8, 1.0]
 
     # rebuttal discussion phase response
-    prompt_lens = [8192, 16384, 32768]
+    prompt_lens = [2048, 4096, 8192, 16384, 32768]
     insert_locs = [0.2]
 
     for l in prompt_lens:

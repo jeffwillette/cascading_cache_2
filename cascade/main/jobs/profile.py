@@ -1,25 +1,8 @@
-import os
-import time
-import traceback
 import torch
-import transformers
-from datasets import load_dataset
 from cascade.dataset.pg19 import PG19Streaming
 from tqdm import tqdm
-import argparse
-import json
-from transformers import TextStreamer
-from aim import Run
 
-from peft import LoraConfig, TaskType
-from peft import get_peft_model, prepare_model_for_kbit_training
-from cascade.utils import seed, get_bench, MockRun
-import deepspeed
-from cascade.models.modeling_llama import LlamaDecoderLayer
-from cascade.models.qwen.modeling_qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
-from third_party.hyper_attn.models.attention.modeling_chatglm_fast_attention import FastCoreAttention
-
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, ProfilerActivity
 
 
 def job_profile(args, model, tokenizer, device):
@@ -83,7 +66,7 @@ def job_profile(args, model, tokenizer, device):
                     step += stride
 
                     book_idx = l + torch.arange(args.batch_size)
-                    book_ppl = torch.exp(nll_individual[book_idx] /
+                    book_ppl = torch.exp(nll_individual[book_idx] / \
                                          count_individual[book_idx])
 
                     stats = {}

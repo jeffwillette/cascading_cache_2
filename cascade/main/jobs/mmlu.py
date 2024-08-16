@@ -7,10 +7,10 @@ import transformers
 from datasets import load_dataset
 import tqdm
 import numpy as np
-import deepspeed
+# import deepspeed
 
-from cascade.utils import seed, get_bench
-from cascade.main.jobs.pg19 import get_injection_policy
+from cascade.utils import seed
+# from cascade.main.jobs.pg19 import get_injection_policy
 
 MMLU_FORMAT = """> The following are multiple choice questions (with answers) about {subject_name}.
 
@@ -449,13 +449,14 @@ def job_mmlu(args, model, tokenizer, device):
         model.model.setup_caches(args.world_size)
 
         if args.world_size > 1:
-            model = deepspeed.init_inference(
-                model,
-                tensor_parallel={"tp_size": args.world_size},
-                replace_with_kernel_inject=False,
-                dtype=args.infer_dtype,
-                injection_policy=get_injection_policy(args.model),
-            )
+            pass
+            # model = deepspeed.init_inference(
+            #     model,
+            #     tensor_parallel={"tp_size": args.world_size},
+            #     replace_with_kernel_inject=False,
+            #     dtype=args.infer_dtype,
+            #     injection_policy=get_injection_policy(args.model),
+            # )
         else:
             model = model.cuda()
 
