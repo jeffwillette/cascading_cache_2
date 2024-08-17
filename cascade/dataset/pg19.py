@@ -104,8 +104,10 @@ class PG19Streaming(Dataset):
 
         self.inputs = cache_tokenized(self.dataset, self.tokenizer)
 
-        self.inputs = torch.cat(self.inputs, dim=1)
-        print(f"total tokens: {self.inputs.size()=}")
+        # self.inputs = torch.cat(self.inputs, dim=1)
+        # print(f"total tokens: {self.inputs.size()=}")
+
+        print(f"total tokens: {[v.size(1) for v in self.inputs]=}")
 
     def __len__(self):
         return len(self.inputs)
@@ -114,7 +116,8 @@ class PG19Streaming(Dataset):
         if idx >= len(self):
             raise IndexError("Index out of range")
 
-        inputs = self.inputs[idx:idx+1]
+        # inputs = self.inputs[idx:idx + 1]
+        inputs = self.inputs[idx]
         return inputs, inputs
 
 

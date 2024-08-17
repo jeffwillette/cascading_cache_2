@@ -5,29 +5,28 @@ CASCADES=(4)
 SINKS=(4)
 BATCH_SIZE=1
 HEAD_REDUCTION=mean
-# CASCADE_FUNC="pow2"
 CASCADE_FUNC="pow2"
-GPUS=(0)
+GPUS=(5)
+MODEL=llama3.1-8b
+METHOD=sink
+COMMENT="llama3.1"
+CASCADE_STRIDE=10112
 
 # MAIN PG19 experiment code
 for i in "${!WINDOW[@]}";
 do 
-    # PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,3 python cascade/main/llama_eval.py \
-    # PYTHONPATH=. deepspeed --include localhost:6 --master_port 63190 cascade/main/llama_eval.py \
-    # --model llama7b \
     PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
-        --model llama3.1-8b \
+        --model $MODEL \
         --job ppl-pg19 \
-        --method sink \
-        --lora_r 0 \
+        --method $METHOD \
         --window ${WINDOW[$i]} \
         --sinks ${SINKS[$i]} \
         --cascades ${CASCADES[$i]} \
         --cascade_func $CASCADE_FUNC \
+        --cascade_stride $CASCADE_STRIDE \
         --head_reduction $HEAD_REDUCTION \
-        --comment llama3.1 \
-        --batch_size $BATCH_SIZE \
-        --dev_run
+        --comment $COMMENT \
+        --batch_size $BATCH_SIZE
         sleep 1
 done
 
@@ -73,36 +72,5 @@ done
 #         --comment qwen14b-quadratic \
 #         --batch_size $BATCH_SIZE \
 #         --dev_run 
-#         sleep 1
-# done
-
-
-# ATTN MATRIC PLOTTING ========================================================
-# WINDOW=(2048)
-# CASCADES=(1)
-# SINKS=(4)
-# BATCH_SIZE=1
-# HEAD_REDUCTION=mean
-# # CASCADE_FUNC="pow2"
-# CASCADE_FUNC="pow2"
-# GPUS=(1)
-# 
-# for i in "${!WINDOW[@]}";
-# do 
-#     # PYTHONPATH=. deepspeed --include localhost:0,3 --master_port 63290 cascade/main/llama_eval.py \
-#     # PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
-#     PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 python cascade/main/llama_eval.py \
-#         --model llama7b \
-#         --job ppl-pg19 \
-#         --method sink \
-#         --lora_r 0 \
-#         --window ${WINDOW[$i]} \
-#         --sinks ${SINKS[$i]} \
-#         --cascades ${CASCADES[$i]} \
-#         --cascade_func $CASCADE_FUNC \
-#         --head_reduction $HEAD_REDUCTION \
-#         --comment llama7b-attention-matrix-plot \
-#         --batch_size $BATCH_SIZE \
-#         --dev_run
 #         sleep 1
 # done

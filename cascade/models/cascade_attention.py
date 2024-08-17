@@ -19,18 +19,6 @@ from cascade.models.cascading_cache import CascadingKVCache
 logger = logging.get_logger(__name__)
 
 
-def repeat_mask(mask: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen = mask.shape
-    if n_rep == 1:
-        return mask
-    mask = mask[:, :, None, :].expand(batch, num_key_value_heads, n_rep, slen)
-    return mask.reshape(batch, num_key_value_heads * n_rep, slen)
-
-
 def apply_rotary_pos_emb_one(x, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -99,7 +87,7 @@ class CascadeAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         use_flash: bool = True,
-        homogeneous_heads: bool = True,
+        homogeneous_heads: bool = False,
         do_og_pos: bool = False,
         use_selfextend: bool = False,
         position_embeddings: Optional[torch.Tensor] = None,
@@ -292,17 +280,14 @@ class CascadeAttention(nn.Module):
 
             self.ema_mask = torch.stack(out).T
 
-        qattn = torch.einsum("bhqd,bhkd->bhqk",
-                             query_states * np.sqrt(scale), key_states_pos * np.sqrt(scale))
+        qattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), key_states_pos * np.sqrt(scale))
         qattn = qattn + (self.causal_mask * val).half()
 
-        sattn = torch.einsum("bhqd,bhkd->bhqk",
-                             query_states * np.sqrt(scale), sink_key_states * np.sqrt(scale))
-        sattn = sattn + (val * sink_mask[:, :, None, :]).half()
+        sattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), sink_key_states * np.sqrt(scale))
+        sattn = sattn + (val * sink_mask[:1, :1, None, :]).half()
 
-        cattn = torch.einsum("bhqd,bhkd->bhqk",
-                             query_states * np.sqrt(scale), k_states * np.sqrt(scale))
-        cattn = cattn + (val * key_mask[:, :, None, :]).half()
+        cattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), k_states * np.sqrt(scale))
+        cattn = cattn + (val * key_mask[:1, :1, None, :]).half()
 
         attn = torch.cat((sattn, cattn, qattn), dim=-1)
         attn = attn.softmax(dim=-1)

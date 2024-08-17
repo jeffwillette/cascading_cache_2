@@ -63,11 +63,7 @@ def _update_sink_cache(
 
     idx_n = tl.program_id(0).to(IDTYPE)
     idx_h = tl.program_id(1).to(IDTYPE)
-
-    if batch_iter == -1:
-        idx_t = tl.program_id(2).to(IDTYPE)
-    else:
-        idx_t = batch_iter.to(IDTYPE)
+    idx_t = batch_iter.to(IDTYPE)
 
     kv_shift = idx_n.to(IDTYPE) * stride_k_n + \
         idx_h.to(IDTYPE) * stride_k_h + \
@@ -128,30 +124,22 @@ def _update_positional_idx(
     stored_tokens_i,
     start_idx_i,
     WINDOW_SIZE_CONST,
-    batch_iter,
-    K,
-    CASCADES,
 ):
 
-    if batch_iter < K - 1 and CASCADES == 1:
-        # if there is one cascade we can safely skip this operation until the last iteration
-        # which saves a lot of time
-        pass
-    elif idx_h == 0:
-        u = min(u, l + stored_tokens_i)
-        segment_len = min(segment_len, stored_tokens_i)
+    u = min(u, l + stored_tokens_i)
+    segment_len = min(segment_len, stored_tokens_i)
 
-        pos = (tl.arange(0, WINDOW_SIZE_CONST) + (segment_len - start_idx_i)) % segment_len
-        pos = pos + pos_ub - segment_len
+    pos = (tl.arange(0, WINDOW_SIZE_CONST) + (segment_len - start_idx_i)) % segment_len
+    pos = pos + pos_ub - segment_len
 
-        pos_idx = tl.arange(0, WINDOW_SIZE_CONST).to(IDTYPE)
-        tl.store(
-            POS + \
-                idx_n.to(IDTYPE) * stride_p_n + \
-                idx_h.to(IDTYPE) * stride_p_h + \
-                (l + pos_idx).to(IDTYPE) * stride_p_t,
-            value=pos
-        )
+    pos_idx = tl.arange(0, WINDOW_SIZE_CONST).to(IDTYPE)
+    tl.store(
+        POS + \
+            idx_n.to(IDTYPE) * stride_p_n + \
+            idx_h.to(IDTYPE) * stride_p_h + \
+            (l + pos_idx).to(IDTYPE) * stride_p_t,
+        value=pos
+    )
 
 
 @triton.jit
@@ -389,7 +377,6 @@ def _update_kv_cache_inner(
 
     idx_n = tl.program_id(0).to(IDTYPE)
     idx_h = tl.program_id(1).to(IDTYPE)
-
     idx_t = batch_iter.to(IDTYPE)
     # set real token idx for this iter. We need two of these variables
     # because (rti) will be used to update do_cache settings, and real_token_idx
@@ -445,15 +432,6 @@ def _update_kv_cache_inner(
 
         cascades_idx = tl.arange(0, CASCADES).to(IDTYPE)
 
-        stored = tl.load(
-            STORED_TOKENS + \
-                idx_n.to(tl.int64) * stride_st_n + \
-                idx_h.to(tl.int64) * stride_st_h + \
-                cascades_idx,
-        )
-
-        pos_ub = tl.sum(stored, axis=0)
-
         # only selectively add to the cache when it is already full.
         tmp = tl.full((CASCADES, ), value=rti, dtype=tl.int64)
         if rti - 1 > max_seq_len:
@@ -463,16 +441,6 @@ def _update_kv_cache_inner(
             do_cache = do_cache.to(tl.int64)
         else:
             do_cache = (tmp >= -1).to(tl.int64)  # always true
-
-        # sanity check
-        # tl.store(DO_CACHE + cascades_idx, value=do_cache.to(tl.int1))
-        # if idx_n == 0 and idx_h == 0:
-        #     print(f"do cache: ", do_cache.to(tl.int1))
-
-        add_to_cache = tl.sum(do_cache) * WINDOW_SIZE > pos_ub
-        eager_add = tl.sum(do_cache) * WINDOW_SIZE == pos_ub
-        if add_to_cache or eager_add:
-            pos_ub = pos_ub + 1
 
         # LOAD KEY VALUE AND SCORE STATES
         kv_shift = idx_n.to(IDTYPE) * stride_k_n + \
@@ -498,18 +466,14 @@ def _update_kv_cache_inner(
             u = ((i + 1) * WINDOW_SIZE).to(IDTYPE)
             segment_len = WINDOW_SIZE.to(IDTYPE)
 
-            # all N will be the same here, so there is no n dimension included
-            if batch_iter == -1:
-                do_cache_i = tl.load(DO_CACHE + i.to(IDTYPE)).to(tl.int1)
+            if rti - 1 > max_seq_len:
+                do_cache_every_n_i = tl.load(DO_CACHE_EVERY_N + i.to(IDTYPE))
+                # not minus 1 because seen tokens is not incremented before the loop in
+                # the batched version.
+                do_cache_i = (((rti - 1 - NUM_SINK) %
+                               do_cache_every_n_i) == 0).to(tl.int1)
             else:
-                if rti - 1 > max_seq_len:
-                    do_cache_every_n_i = tl.load(DO_CACHE_EVERY_N + i.to(IDTYPE))
-                    # not minus 1 because seen tokens is not incremented before the loop in
-                    # the batched version.
-                    do_cache_i = (((rti - 1 - NUM_SINK) %
-                                   do_cache_every_n_i) == 0).to(tl.int1)
-                else:
-                    do_cache_i = True
+                do_cache_i = True
 
             # if idx_n == 0:
             #     print(f"do cache i: ", do_cache_i)
@@ -570,26 +534,6 @@ def _update_kv_cache_inner(
                     # increment the stored tokens for this cascade
                     tl.store(STORED_TOKENS + stored_shift,
                              value=(stored_tokens_i + 1).to(IDTYPE))
-
-                    # print(f"pos ub before calling pos func:", pos_ub)
-                    _update_positional_idx(
-                        POS,
-                        stride_p_n,
-                        stride_p_h,
-                        stride_p_t,
-                        idx_n,
-                        idx_h,
-                        u,
-                        l,
-                        segment_len,
-                        pos_ub,
-                        stored_tokens_i + 1,
-                        start_idx_i,
-                        WINDOW_SIZE_CONST,
-                        batch_iter,
-                        K,
-                        CASCADES,
-                    )
 
                     do_break = True
 
@@ -655,26 +599,6 @@ def _update_kv_cache_inner(
                          value=((start_idx_i + 1) % segment_len).to(IDTYPE)
                     )
 
-                    _update_positional_idx(
-                        POS,
-                        stride_p_n,
-                        stride_p_h,
-                        stride_p_t,
-                        idx_n,
-                        idx_h,
-                        u,
-                        l,
-                        segment_len,
-                        pos_ub,
-                        stored_tokens_i,
-                        (start_idx_i + 1) % segment_len,
-                        WINDOW_SIZE_CONST,
-                        batch_iter,
-                        K,
-                        CASCADES,
-                    )
-                    pos_ub = pos_ub - segment_len
-
                     i += 1
             else:
                 if stored_tokens_i == 0:
@@ -736,25 +660,6 @@ def _update_kv_cache_inner(
                         value=(stored_tokens_i + 1).to(IDTYPE)
                     )
 
-                    _update_positional_idx(
-                        POS,
-                        stride_p_n,
-                        stride_p_h,
-                        stride_p_t,
-                        idx_n,
-                        idx_h,
-                        u,
-                        l,
-                        segment_len,
-                        pos_ub,
-                        stored_tokens_i + 1,
-                        start_idx_i,
-                        WINDOW_SIZE_CONST,
-                        batch_iter,
-                        K,
-                        CASCADES,
-                    )
-
                     do_break = True
 
                 else:
@@ -807,26 +712,55 @@ def _update_kv_cache_inner(
 
                         tl.store(CACHE_S + cs_shift, value=score)
 
-                        _update_positional_idx(
-                            POS,
-                            stride_p_n,
-                            stride_p_h,
-                            stride_p_t,
-                            idx_n,
-                            idx_h,
-                            u,
-                            l,
-                            segment_len,
-                            pos_ub,
-                            stored_tokens_i,
-                            start_idx_i,
-                            WINDOW_SIZE_CONST,
-                            batch_iter,
-                            K,
-                            CASCADES,
-                        )
-
                     do_break = True  # keep at this indent level
+
+        # SECONDARY LOOP =====================================
+        if batch_iter == K - 1:
+            cascades_idx = tl.arange(0, CASCADES).to(IDTYPE)
+            stored = tl.load(
+                STORED_TOKENS + \
+                    idx_n.to(tl.int64) * stride_st_n + \
+                    idx_h.to(tl.int64) * stride_st_h + \
+                    cascades_idx,
+            )
+
+            pos_ub = tl.sum(stored, axis=0)
+
+            do_break = False
+            i = 0
+            while i < CASCADES and not do_break:
+                l = (i * WINDOW_SIZE).to(IDTYPE)
+                u = ((i + 1) * WINDOW_SIZE).to(IDTYPE)
+                segment_len = WINDOW_SIZE.to(IDTYPE)
+
+                stored_shift = idx_n.to(tl.int64) * stride_st_n + \
+                    idx_h.to(tl.int64) * stride_st_h + \
+                    i.to(tl.int64) * stride_st_c
+
+                stored_tokens_i = tl.load(STORED_TOKENS + stored_shift)
+                start_idx_i = tl.load(START_INDICES + stored_shift)
+
+                # print(f"pos ub before calling pos func:", pos_ub)
+                _update_positional_idx(
+                    POS,
+                    stride_p_n,
+                    stride_p_h,
+                    stride_p_t,
+                    idx_n,
+                    idx_h,
+                    u,
+                    l,
+                    segment_len,
+                    pos_ub,
+                    stored_tokens_i,
+                    start_idx_i,
+                    WINDOW_SIZE_CONST,
+                )
+                pos_ub = pos_ub - segment_len
+                if pos_ub <= 0:
+                    do_break = True
+
+                i += 1
 
 
 class SinkCacheFunc(Function):
