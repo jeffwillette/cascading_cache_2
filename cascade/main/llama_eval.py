@@ -146,6 +146,7 @@ def load_model(args):
     config._cascade_func = args.cascade_func
     config._head_reduction = args.head_reduction
     config._method = args.method
+    config._cascade_stride = args.cascade_stride
 
     if args.model == "llama13b_32k":
         config.max_position_embeddings = 32768
