@@ -217,6 +217,7 @@ def _update_kv_cache(
     WINDOW_SIZE_CONST: tl.constexpr,
     CASCADES: tl.constexpr,
     BLOCK_HID: tl.constexpr,
+    eager_fill,
 ):
 
     for i in range(K):
@@ -294,6 +295,7 @@ def _update_kv_cache(
             CASCADES,
             BLOCK_HID,
             batch_iter=i,
+            eager_fill=eager_fill,
         )
 
 
@@ -373,9 +375,9 @@ def _update_kv_cache_inner(
     CASCADES: tl.constexpr,
     BLOCK_HID: tl.constexpr,
     batch_iter: tl.constexpr = -1,
+    eager_fill=True,
 ):
 
-    eager_fill = False
     idx_n = tl.program_id(0).to(IDTYPE)
     idx_h = tl.program_id(1).to(IDTYPE)
     idx_t = batch_iter.to(IDTYPE)
@@ -790,6 +792,7 @@ class SinkCacheFunc(Function):
         window_size: int,
         real_token_idx: Tensor,
         max_seq_len: int,
+        eager_fill: bool,
     ):
         assert k.ndim == 4
         assert v.ndim == 4
@@ -873,6 +876,7 @@ class SinkCacheFunc(Function):
                 window_size,
                 CASCADES,
                 BLOCK_HID,
+                eager_fill,
                 num_warps=1,
                 num_stages=1,
             )
@@ -915,6 +919,7 @@ def _sink_cache(
     window_size,
     real_token_idx,
     max_seq_len,
+    eager_fill,
 ):
     N, H, K, HID = k.shape
 
@@ -941,6 +946,7 @@ def _sink_cache(
         window_size,
         real_token_idx,
         max_seq_len,
+        eager_fill,
     )
 
 
@@ -967,6 +973,7 @@ def sink_cache(
     window_size,
     real_token_idx,
     max_seq_len,
+    eager_fill,
     BENCHMARK: bool = False,
 ):
     if BENCHMARK:
@@ -997,6 +1004,7 @@ def sink_cache(
         window_size=window_size,
         real_token_idx=real_token_idx,
         max_seq_len=max_seq_len,
+        eager_fill=eager_fill,
     )
 
     if BENCHMARK:
@@ -1025,6 +1033,7 @@ class CascadingKVCache(Cache):
         cascade_func: str = "pow2",
         head_reduction: str = "mean",
         layers: int = 32,
+        eager_fill: bool = True,
     ) -> None:
         super().__init__()
         self.max_seq_len = max_seq_len
@@ -1038,6 +1047,7 @@ class CascadingKVCache(Cache):
         self.cascade_func = cascade_func
         self.head_reduction = head_reduction
         self.layers = layers
+        self.eager_fill = eager_fill
 
         self.key_cache: List[torch.Tensor]
         self.value_cache: List[torch.Tensor]
@@ -1269,6 +1279,7 @@ class CascadingKVCache(Cache):
             self.window_length,
             self.seen_tokens_by_layer[layer_idx],
             self.max_seq_len,
+            self.eager_fill,
         )
 
         # place this after the kernel in this method because the batch kernel will iterate

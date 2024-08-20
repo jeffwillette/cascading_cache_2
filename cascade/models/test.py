@@ -24,6 +24,7 @@ def get_cache(model):
         cascade_func=mdl.config._cascade_func,
         head_reduction=mdl.config._head_reduction,
         layers=len(mdl.layers),
+        eager_fill=False,
     )
 
 
@@ -123,6 +124,7 @@ class TestCascadingKVCache(unittest.TestCase):
                     device=DEVICE,
                     dtype=DTYPE,
                     layers=1,
+                    eager_fill=False,
                 )
 
                 slow_times, fast_times = [], []
@@ -272,6 +274,7 @@ class TestCascadingKVCache(unittest.TestCase):
                     device=DEVICE,
                     dtype=DTYPE,
                     layers=1,
+                    eager_fill=False,
                 )
 
                 slow_times, fast_times = [], []
@@ -407,6 +410,7 @@ class TestCascadingKVCache(unittest.TestCase):
             device=dev,
             dtype=torch.float32,
             layers=1,
+            eager_fill=False,
         )
 
         naive_times, fast_times, cascade_times = [], [], []
@@ -489,6 +493,7 @@ if __name__ == "__main__":
         device=DEVICE,
         dtype=DTYPE,
         layers=1,
+        eager_fill=False,
     )
 
     ITS = 16384
