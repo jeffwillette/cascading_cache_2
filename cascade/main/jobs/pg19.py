@@ -21,8 +21,12 @@ def job_ppl_pg19(args, model, tokenizer, device):
     if args.method == "sink":
         use_cache = True
 
-        window = mdl.config._window // mdl.config._cascades
-        max_seq_len = mdl.config._window
+        # max_seq_len = [65536] * 4 + [8192] * 28
+        max_seq_len = [131072] * 2 + [8192] * 30
+        window = [m // args.cascades for m in max_seq_len]
+
+        # window = mdl.config._window // mdl.config._cascades
+        # max_seq_len = mdl.config._window
 
         past_key_values = CascadingKVCache(
             window,
@@ -80,7 +84,8 @@ def job_ppl_pg19(args, model, tokenizer, device):
     print(f"final ppl: {np.exp(stats['nll-total'] / stats['count-total'])}")
     os.makedirs('./cache/llama_eval/pg19/', exist_ok=True)
     f = f'./cache/llama_eval/pg19/{args.method}-{args.model}-{args.comment}-window-{args.window}-' + \
-        f'cascades-{args.cascades}-head-reduction-{args.head_reduction}-cascade-func-{args.cascade_func}.json'
+        f'cascades-{args.cascades}-head-reduction-{args.head_reduction}-cascade-func-{args.cascade_func}- ' + \
+        f'cascade-stride-{args.cascade_stride}-comment-{args.comment}.json'
 
     with open(f, 'w') as f:
         json.dump(stats, f)

@@ -1,15 +1,16 @@
 #!/bin/bash
 
-WINDOW=(32768)
-CASCADES=(1)
+WINDOW=(16384)
+CASCADES=(4)
 SINKS=(4)
 BATCH_SIZE=1
 HEAD_REDUCTION=mean
 CASCADE_FUNC="pow2"
-GPUS=(4)
+GPUS=(5)
 MODEL=llama3.1-8b
 METHOD=sink
-COMMENT="llama3.1"
+# COMMENT="different-cache-sizes-65k-4-8k-28"
+COMMENT="different-cache-sizes-131k-2-8k-30"
 CASCADE_STRIDE=1024
 
 # MAIN PG19 experiment code

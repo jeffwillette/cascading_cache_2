@@ -13,7 +13,7 @@ import triton.language as tl
 from torch import Tensor
 from torch.autograd import Function
 from transformers.cache_utils import Cache, DynamicCache
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Union
 import warnings
 
 IDTYPE = tl.int64
@@ -437,7 +437,7 @@ def _update_kv_cache_inner(
 
         # only selectively add to the cache when it is already full.
         tmp = tl.full((CASCADES, ), value=rti, dtype=tl.int64)
-        if rti - 1 <= max_seq_len and eager_fill:
+        if rti - 1 <= max_seq_len + NUM_SINK and eager_fill:
             do_cache = (tmp >= -1).to(tl.int64)  # always true
         else:
             do_cache_every_n = tl.load(DO_CACHE_EVERY_N + cascades_idx)
@@ -468,7 +468,7 @@ def _update_kv_cache_inner(
             u = ((i + 1) * WINDOW_SIZE).to(IDTYPE)
             segment_len = WINDOW_SIZE.to(IDTYPE)
 
-            if rti - 1 <= max_seq_len and eager_fill:
+            if rti - 1 <= max_seq_len + NUM_SINK and eager_fill:
                 do_cache_i = True
             else:
                 do_cache_every_n_i = tl.load(DO_CACHE_EVERY_N + i.to(IDTYPE))
@@ -1022,12 +1022,12 @@ def sink_cache(
 class CascadingKVCache(Cache):
     def __init__(
         self,
-        window_length: int = 8,
+        window_length: Union[int, List[int]] = 8,
         num_sink_tokens: int = 4,
         max_batch_size: int = 1,
         heads: int = 16,
         dim: int = 128,
-        max_seq_len: int = 32,
+        max_seq_len: Union[int, List[int]] = 32,
         device: torch.device = "cpu",
         dtype: torch.dtype = torch.float16,
         cascade_func: str = "pow2",
@@ -1036,6 +1036,16 @@ class CascadingKVCache(Cache):
         eager_fill: bool = True,
     ) -> None:
         super().__init__()
+
+        if isinstance(max_seq_len, int) != isinstance(window_length, int):
+            raise ValueError(f"max_seq_len must be same type as window length: {type(max_seq_len)=} {type(window_length)=}")
+
+        if isinstance(max_seq_len, int):
+            max_seq_len = [max_seq_len for _ in range(layers)]
+
+        if isinstance(window_length, int):
+            window_length = [window_length for _ in range(layers)]
+
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.heads = heads
@@ -1067,8 +1077,12 @@ class CascadingKVCache(Cache):
         self.seen_tokens_by_layer: torch.Tensor
 
         self.bh = self.max_batch_size * self.heads
-        self.cascades = max_seq_len // window_length
 
+        all_even_div = [(self.max_seq_len[l] % self.window_length[l]) == 0for l in range(layers)]
+        if not all(all_even_div):
+            raise ValueError(f"window length must evenly divide max seq len: {self.window_length=} {self.max_seq_len=}")
+
+        self.cascades = [self.max_seq_len[l] // self.window_length[l] for l in range(layers)]
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
 
         self.init_cache(self.device)
@@ -1104,7 +1118,7 @@ class CascadingKVCache(Cache):
         return stored_sinks + stored_tokens
 
     def get_max_length(self) -> Optional[int]:
-        return self.max_seq_len
+        return self.max_seq_len[0]
 
     @classmethod
     def from_legacy_cache(cls, past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCache":
@@ -1157,7 +1171,7 @@ class CascadingKVCache(Cache):
         self.sink_mask = [v.fill_(torch.finfo(dtp).min) for v in self.sink_mask]
 
     def init_cache(self, device):
-        L, B, H, S, D = self.layers, self.max_batch_size, self.heads, self.max_seq_len, self.dim
+        L, B, H, D = self.layers, self.max_batch_size, self.heads, self.dim
         nsink, dev, dtp = self.num_sink_tokens, device, self.dtype
 
         print(f"INIT CLEAN TRITON CACHE {self.cascade_func=}")
@@ -1166,58 +1180,71 @@ class CascadingKVCache(Cache):
         # for tracking real token idx in triton.
         self.seen_tokens_by_layer = torch.zeros(L, dtype=torch.long, device=dev)
 
-        self.do_cache = [torch.tensor([True for _ in range(self.cascades)], device=dev, dtype=torch.bool) for _ in range(L)]
+        self.do_cache = [torch.tensor([True for _ in range(self.cascades[l])], device=dev, dtype=torch.bool) for l in range(L)]
 
         # TODO: format these nicer
         if self.cascade_func == "pow2":
-            self.do_cache_every_n = [torch.tensor([2**i for i in range(self.cascades)], device=dev, dtype=torch.long) for _ in range(L)]
+            self.do_cache_every_n = [torch.tensor([2**i for i in range(self.cascades[l])], device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow2-1":
-            self.do_cache_every_n = [torch.tensor([1 for i in range(self.cascades - 1)] + [2**i for i in range(self.cascades - 1, self.cascades)], device=dev, dtype=torch.long) for _ in range(L)]
+            self.do_cache_every_n = [torch.tensor(
+                [1 for i in range(self.cascades[l] - 1)] + \
+                [2**i for i in range(self.cascades[l] - 1, self.cascades[l])],
+                device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow2-1-4":
-            n = self.cascades // 4
-            self.do_cache_every_n = [torch.tensor([1 for i in range(3 * n)] + [2**i for i in range(3 * n, self.cascades)], device=dev, dtype=torch.long) for _ in range(L)]
+            n = [c // 4 for c in self.cascades]
+            self.do_cache_every_n = [torch.tensor(
+                [1 for i in range(3 * n[l])] + \
+                [2**i for i in range(3 * n[l], self.cascades[l])],
+                device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow2-2-4":
-            n = self.cascades // 4
-            self.do_cache_every_n = [torch.tensor([1 for i in range(2 * n)] + [2**i for i in range(2 * n, self.cascades)], device=dev, dtype=torch.long) for _ in range(L)]
+            n = [c // 4 for c in self.cascades]
+            self.do_cache_every_n = [torch.tensor(
+                [1 for i in range(2 * n[l])] + \
+                [2**i for i in range(2 * n[l], self.cascades[l])],
+                device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow2-3-4":
-            n = self.cascades // 4
-            self.do_cache_every_n = [torch.tensor([1 for i in range(1 * n)] + [2**i for i in range(1 * n, self.cascades)], device=dev, dtype=torch.long) for _ in range(L)]
+            n = [c // 4 for c in self.cascades]
+            self.do_cache_every_n = [torch.tensor(
+                [1 for i in range(1 * n[l])] + \
+                [2**i for i in range(1 * n[l], self.cascades[l])],
+                device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow3":
-            self.do_cache_every_n = [torch.tensor([3**i for i in range(self.cascades)], device=dev, dtype=torch.long) for _ in range(L)]
+            self.do_cache_every_n = [torch.tensor([3**i for i in range(self.cascades[l])], device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow4":
-            self.do_cache_every_n = [torch.tensor([4**i for i in range(self.cascades)], device=dev, dtype=torch.long) for _ in range(L)]
+            self.do_cache_every_n = [torch.tensor([4**i for i in range(self.cascades[l])], device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "iplus1":
-            self.do_cache_every_n = [torch.tensor([i + 1 for i in range(self.cascades)], device=dev, dtype=torch.long) for _ in range(L)]
+            self.do_cache_every_n = [torch.tensor([i + 1 for i in range(self.cascades[l])], device=dev, dtype=torch.long) for l in range(L)]
         else:
             raise ValueError(f"unknown cascade func: {self.cascade_func}")
 
-        self.beta = np.exp(-np.log(100) / self.window_length)
+        # self.beta = np.exp(-np.log(100) / self.window_length)
+        self.beta = 0.995
 
         # per layer, not per cascade
-        self.stored_tokens = [torch.zeros(B, H, self.cascades, device=dev, dtype=torch.long) for _ in range(L)]
+        self.stored_tokens = [torch.zeros(B, H, self.cascades[l], device=dev, dtype=torch.long) for l in range(L)]
         self.stored_sinks = [torch.zeros(B, H, device=dev, dtype=torch.long) for _ in range(L)]
 
         # each cascade will have start indices which are considered the beginning of
         # the cascade cache to avoid excessive concatenation.
-        self.start_indices = [torch.zeros(B, H, self.cascades, device=dev, dtype=torch.long) for _ in range(L)]
+        self.start_indices = [torch.zeros(B, H, self.cascades[l], device=dev, dtype=torch.long) for l in range(L)]
 
         # index for positional encodings, this will be modified on
         # each return in order to grab the correct positional encoding indices.
-        self.pos = [torch.zeros(B, H, self.max_seq_len, device=dev, dtype=torch.long) for _ in range(L)]
-        self.og_pos = [torch.zeros(B, H, self.max_seq_len, device=dev, dtype=torch.long) for _ in range(L)]
+        self.pos = [torch.zeros(B, H, self.max_seq_len[l], device=dev, dtype=torch.long) for l in range(L)]
+        self.og_pos = [torch.zeros(B, H, self.max_seq_len[l], device=dev, dtype=torch.long) for l in range(L)]
         self.sink_pos = [torch.zeros(B, H, self.num_sink_tokens, device=dev, dtype=torch.long) for _ in range(L)]
 
-        blank = torch.zeros(B, H, S, D, device=dev, dtype=dtp)
-        blank_scores = torch.zeros(B, H, self.max_seq_len, device=dev, dtype=dtp)
+        blank = torch.zeros(B, H, 1, D, device=dev, dtype=dtp)
+        blank_scores = torch.zeros(B, H, 1, device=dev, dtype=dtp)
         blank_sinks = torch.zeros(B, H, nsink, D, device=dev, dtype=dtp)
 
-        self.key_cache = [blank.clone() for _ in range(L)]
-        self.value_cache = [blank.clone() for _ in range(L)]
-        self.score_cache = [blank_scores.clone() for _ in range(L)]
+        self.key_cache = [blank.clone().repeat(1, 1, self.max_seq_len[l], 1) for l in range(L)]
+        self.value_cache = [blank.clone().repeat(1, 1, self.max_seq_len[l], 1) for l in range(L)]
+        self.score_cache = [blank_scores.clone().repeat(1, 1, self.max_seq_len[l]) for l in range(L)]
         self.sink_keys = [blank_sinks.clone() for _ in range(L)]
         self.sink_values = [blank_sinks.clone() for _ in range(L)]
 
-        self.mask = [torch.empty(B, H, S, device=dev, dtype=torch.bool) for _ in range(L)]
+        self.mask = [torch.empty(B, H, self.max_seq_len[l], device=dev, dtype=torch.bool) for l in range(L)]
         self.sink_mask = [torch.empty(B, H, self.num_sink_tokens, device=dev, dtype=torch.bool) for _ in range(L)]
         self.mask = [v.fill_(True) for v in self.mask]
         self.sink_mask = [v.fill_(True) for v in self.sink_mask]
@@ -1276,9 +1303,9 @@ class CascadingKVCache(Cache):
             self.start_indices[layer_idx],
             self.stored_sinks[layer_idx],
             self.num_sink_tokens,
-            self.window_length,
+            self.window_length[layer_idx],
             self.seen_tokens_by_layer[layer_idx],
-            self.max_seq_len,
+            self.max_seq_len[layer_idx],
             self.eager_fill,
         )
 

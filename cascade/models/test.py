@@ -1,4 +1,5 @@
 from cascade.models.cascading_cache import SinkAttentionNaive, CascadingKVCache, CascadingKVCacheSlow, add_sinks, append_to_cache, evict_from_cache, overwrite_cache
+import numpy as np
 import unittest
 from argparse import Namespace
 from cascade.main.llama_eval import load_model
@@ -83,6 +84,58 @@ class TestCascadeAttention(unittest.TestCase):
 
 
 class TestCascadingKVCache(unittest.TestCase):
+    def test_different_sized_layer_caches(self):
+        # toy settings
+        cache_sizes = [2**i for i in range(5, 10)]
+        windows = [2**i for i in range(4)]
+
+        for i in range(10):
+            n_layers = np.random.randint(8, 33, size=(1,)).tolist()[0]
+            N = 1
+            HID = 128
+            NSINK = 4
+            HEAD = 1
+            DEVICE = "cuda:0"
+            DTYPE = torch.float16
+
+            MAX_SEQ = np.random.choice(np.array(cache_sizes), size=(n_layers,)).tolist()
+            w = np.random.choice(windows, size=(n_layers,)).tolist()
+
+            # MAX_SEQ = [s for _ in range(n_layers)]
+            WIND = [ms // win for ms, win in zip(MAX_SEQ, w)]
+
+            S = torch.randint(max(MAX_SEQ) + 4, max(MAX_SEQ) * 2, size=(1,)).item()
+            # S = s + 4
+            with torch.no_grad():
+
+                cache = CascadingKVCache(
+                    window_length=WIND,
+                    num_sink_tokens=NSINK,
+                    max_batch_size=N,
+                    heads=HEAD,
+                    dim=HID,
+                    max_seq_len=MAX_SEQ,
+                    device=DEVICE,
+                    dtype=DTYPE,
+                    layers=n_layers,
+                    eager_fill=True,
+                )
+
+                for l in range(n_layers):
+                    _k = torch.randn(N, HEAD, S, HID, device=DEVICE, dtype=DTYPE)
+                    _v = torch.randn(N, HEAD, S, HID, device=DEVICE, dtype=DTYPE)
+
+                    k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask, of_pos = \
+                        cache.update(_k, _v, l)
+
+                    self.assertEqual(k_nosink.size(2), MAX_SEQ[l], f"{k.size()=} expected to match {MAX_SEQ[l]=} at dim 2")
+                    self.assertEqual(v_nosink.size(2), MAX_SEQ[l], f"{v.size()=} expected to match {MAX_SEQ[l]=} at dim 2")
+                    self.assertEqual(mask.sum().item(), 0,
+                                     "expected nothing to be masked due to eager filling: " + \
+                                     f"({MAX_SEQ[l]=}, {k_nosink.size()=}, {mask.size()=}, queries: {_k.size()=})\n{mask=}" + \
+                                     f"{WIND[l]=} layer: {l=} {cache.stored_tokens[l]=}"
+                                     )
+
     def test_against_naive_single_iter(self):
         # toy settings
         N = 1
