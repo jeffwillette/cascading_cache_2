@@ -12,6 +12,7 @@ from cascade.utils import seed
 from cascade.main.jobs.passkey import job_passkey
 from cascade.main.jobs.latency import job_latency
 from cascade.main.jobs.ppl_memory import job_ppl_memory
+from cascade.main.jobs.ppl import job_ppl
 from cascade.main.jobs.profile import job_profile
 from cascade.main.jobs.pg19 import job_ppl_pg19
 # from cascade.main.jobs.stream import job_stream
@@ -19,25 +20,31 @@ from cascade.main.jobs.mmlu import job_mmlu
 from cascade.main.eval_args import eval_args, ArgsType
 
 
-def get_model(model_id, **from_pretrained_kwargs):
-    if "llama" in model_id.lower():
-        return LlamaForCausalLM.from_pretrained(model_id,
-                                                **from_pretrained_kwargs)
-    elif "qwen" in model_id.lower():
-        return Qwen2ForCausalLM.from_pretrained(model_id,
-                                                **from_pretrained_kwargs)
+MODEL_GETTERS = {
+    "llama": LlamaForCausalLM,
+    "qwen": Qwen2ForCausalLM,
+}
 
-    else:
-        raise ValueError(f"{model_id} not supported")
+CONFIG_GETTERS = {
+    "llama": LlamaConfig,
+    "qwen": Qwen2Config,
+}
+
+
+def get_model(model_id, **from_pretrained_kwargs):
+    keys = list(MODEL_GETTERS.keys())
+    key_idx = [1 if k in model_id.lower() else 0 for k in keys].index(1)
+    key = keys[key_idx]
+
+    return MODEL_GETTERS[key].from_pretrained(model_id, **from_pretrained_kwargs)
 
 
 def get_config(model_id):
-    if "llama" in model_id.lower():
-        return LlamaConfig.from_pretrained(model_id)
-    elif "qwen" in model_id.lower():
-        return Qwen2Config.from_pretrained(model_id)
-    else:
-        raise ValueError(f"{model_id} not supported")
+    keys = list(CONFIG_GETTERS.keys())
+    key_idx = [1 if k in model_id.lower() else 0 for k in keys].index(1)
+    key = keys[key_idx]
+
+    return CONFIG_GETTERS[key].from_pretrained(model_id)
 
 
 def load_vllm_model(args: ArgsType):
@@ -195,10 +202,6 @@ def load_model(args):
         raise NotImplementedError("need to figure out how to run hyper again with new workflow")
         # model = get_model(model_id, **from_pretrained_kwargs)
 
-    for m in model.modules():
-        if hasattr(m, 'attention_method'):
-            m.attention_method = args.method
-
     if args.lora_r > 0 and args.checkpoint is not None:
         print("LoRA init")
         peft_config = LoraConfig(
@@ -255,9 +258,7 @@ def main():
     model, tokenizer, device = load_model(args)
 
     if args.job == 'ppl':
-        raise NotImplementedError(
-            "implementation needs to be updated to current")
-        # job_ppl(args, model, tokenizer, device)
+        job_ppl(args, model, tokenizer, device)
     elif args.job == 'ppl-memory':
         job_ppl_memory(args, model, tokenizer, device)
     elif args.job == 'latency':

@@ -5,10 +5,11 @@ import numpy as np
 from tqdm import tqdm
 import json
 from cascade.models.cascading_cache import CascadingKVCache
+from cascade.utils.other import pad_targets
 
 
 def job_ppl_pg19(args, model, tokenizer, device):
-    stride, world_size = args.cascade_stride, 1
+    stride = args.cascade_stride
     mdl = model.model
 
     # all_nll = []  # for hyper attention loop
@@ -27,7 +28,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
             window,
             num_sink_tokens=mdl.config._sinks,
             max_batch_size=mdl.config._batch_size,
-            heads=mdl.config.num_key_value_heads // world_size,
+            heads=mdl.config.num_key_value_heads // args.world_size,
             dim=mdl.config.hidden_size // mdl.config.num_attention_heads,
             max_seq_len=max_seq_len,
             dtype=torch.float16,
@@ -52,6 +53,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
                     inputs = input_ids[:, i:i + stride]
                     targets = target_ids[:, i + 1:i + stride + 1]
 
+                    targets = pad_targets(inputs, targets)
                     # should only happen if they are off by 1 at the very end
                     if targets.size(1) < inputs.size(1):
                         target_pad = torch.full(
