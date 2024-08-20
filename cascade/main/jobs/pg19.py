@@ -52,17 +52,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
 
                     inputs = input_ids[:, i:i + stride]
                     targets = target_ids[:, i + 1:i + stride + 1]
-
-                    targets = pad_targets(inputs, targets)
-                    # should only happen if they are off by 1 at the very end
-                    if targets.size(1) < inputs.size(1):
-                        target_pad = torch.full(
-                            (inputs.size(0), inputs.size(1) - targets.size(1)),
-                            -100,
-                            device=inputs.device,
-                            dtype=inputs.dtype)
-
-                        targets = torch.cat((targets, target_pad), dim=-1)
+                    targets = pad_targets(inputs, targets, ignore_index=-100)
 
                     output = model(inputs, use_cache=use_cache, past_key_values=past_key_values)
                     past_key_values = output.past_key_values
