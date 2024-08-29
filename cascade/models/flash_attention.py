@@ -247,6 +247,251 @@ def _attn_fwd(
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
 
+@triton.jit
+def _attn_bwd_preprocess(O, DO,  #
+                         Delta,  #
+                         Z, H, N_CTX,  #
+                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr  #
+                         ):
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_hz = tl.program_id(1)
+    off_n = tl.arange(0, HEAD_DIM)
+    # load
+    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :])
+    do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
+    delta = tl.sum(o * do, axis=1)
+    # write-back
+    tl.store(Delta + off_hz * N_CTX + off_m, delta)
+
+
+# The main inner-loop logic for computing dK and dV.
+@triton.jit
+def _attn_bwd_dkdv(dk, dv,  #
+                   Q, k, v, sm_scale,  #
+                   DO,  #
+                   M, D,  #
+                   # shared by Q/K/V/DO.
+                   stride_tok, stride_d,  #
+                   H, N_CTX, N_KV, BLOCK_M1: tl.constexpr,  #
+                   BLOCK_N1: tl.constexpr,  #
+                   HEAD_DIM: tl.constexpr,  #
+                   # Filled in by the wrapper.
+                   start_n, start_m, num_steps,  #
+                   MASK_TNS,
+                   stride_m_q, stride_m_k,
+                   ):
+    offs_m = start_m + tl.arange(0, BLOCK_M1)
+    offs_n = start_n + tl.arange(0, BLOCK_N1)
+    offs_k = tl.arange(0, HEAD_DIM)
+    qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
+    do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+    # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
+    tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
+    curr_m = start_m
+    step_m = BLOCK_M1
+    for blk_idx in range(num_steps):
+        qT = tl.load(qT_ptrs)
+        # Load m before computing qk to reduce pipeline stall.
+        offs_m = curr_m + tl.arange(0, BLOCK_M1)
+        m = tl.load(M + offs_m)
+        qkT = tl.dot(k, qT)
+        pT = tl.math.exp2(qkT - m[None, :])
+        # Autoregressive masking.
+
+        # TODO: this is a likely place where an error would be
+        mask = tl.load(
+            MASK_TNS + \
+                offs_m[None, :] * stride_m_q + \
+                offs_n[:, None] * stride_m_k
+        )
+        pT = tl.where(mask, 0.0, pT)
+
+        # this was from the original implementation
+        # mask = (offs_m[None, :] >= offs_n[:, None])
+        # pT = tl.where(mask, pT, 0.0)
+
+        do = tl.load(do_ptrs)
+        # Compute dV.
+        ppT = pT
+        ppT = ppT.to(tl.float16)
+        dv += tl.dot(ppT, do)
+        # D (= delta) is pre-divided by ds_scale.
+        Di = tl.load(D + offs_m)
+        # Compute dP and dS.
+        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        dsT = pT * (dpT - Di[None, :])
+        dsT = dsT.to(tl.float16)
+        dk += tl.dot(dsT, tl.trans(qT))
+        # Increment pointers.
+        curr_m += step_m
+        qT_ptrs += step_m * stride_tok
+        do_ptrs += step_m * stride_tok
+    return dk, dv
+
+
+# the main inner-loop logic for computing dQ
+@triton.jit
+def _attn_bwd_dq(dq, q, K, V,  #
+                 do, m, D,
+                 # shared by Q/K/V/DO.
+                 stride_tok, stride_d,  #
+                 H, N_CTX, N_KV,  #
+                 MASK_TNS,
+                 stride_m_q, stride_m_k,
+                 BLOCK_M2: tl.constexpr,  #
+                 BLOCK_N2: tl.constexpr,  #
+                 HEAD_DIM: tl.constexpr,
+                 # Filled in by the wrapper.
+                 start_m, start_n, num_steps,  #
+                 ):
+    offs_m = start_m + tl.arange(0, BLOCK_M2)
+    offs_n = start_n + tl.arange(0, BLOCK_N2)
+    offs_k = tl.arange(0, HEAD_DIM)
+    kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
+    vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
+    # D (= delta) is pre-divided by ds_scale.
+    Di = tl.load(D + offs_m)
+    # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
+    tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
+    curr_n = start_n
+    step_n = BLOCK_N2
+    for blk_idx in range(num_steps):
+        kT = tl.load(kT_ptrs)
+        vT = tl.load(vT_ptrs)
+        qk = tl.dot(q, kT)
+        p = tl.math.exp2(qk - m)
+        # Autoregressive masking.
+        # TODO: this is a likely place where an error would be
+        offs_n = curr_n + tl.arange(0, BLOCK_N2)
+        mask = tl.load(
+            MASK_TNS + \
+                offs_m[:, None] * stride_m_q + \
+                offs_n[None, :] * stride_m_k
+        )
+        p = tl.where(mask, 0.0, p)
+
+        # original implementation
+        # offs_n = curr_n + tl.arange(0, BLOCK_N2)
+        # mask = (offs_m[:, None] >= offs_n[None, :])
+        # p = tl.where(mask, p, 0.0)
+
+        # Compute dP and dS.
+        dp = tl.dot(do, vT).to(tl.float32)
+        ds = p * (dp - Di[:, None])
+        ds = ds.to(tl.float16)
+        # Compute dQ.
+        # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
+        dq += tl.dot(ds, tl.trans(kT))
+        # Increment pointers.
+        curr_n += step_n
+        kT_ptrs += step_n * stride_tok
+        vT_ptrs += step_n * stride_tok
+    return dq
+
+
+@triton.jit
+def _attn_bwd(Q, K, V, sm_scale,  #
+              DO,  #
+              DQ, DK, DV,  #
+              M, D,
+              # shared by Q/K/V/DO.
+              stride_z, stride_h, stride_tok, stride_d,  #
+              MASK,
+              stride_m_q, stride_m_k,
+              H, N_CTX, N_KV,  #
+              BLOCK_M1: tl.constexpr,  #
+              BLOCK_N1: tl.constexpr,  #
+              BLOCK_M2: tl.constexpr,  #
+              BLOCK_N2: tl.constexpr,  #
+              BLK_SLICE_FACTOR: tl.constexpr,  #
+              HEAD_DIM: tl.constexpr):
+    LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
+
+    bhid = tl.program_id(2)
+    off_chz = (bhid * N_CTX).to(tl.int64)
+    adj = (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
+    pid = tl.program_id(0)
+
+    # offset pointers for batch/head
+    Q += adj
+    K += adj
+    V += adj
+    DO += adj
+    DQ += adj
+    DK += adj
+    DV += adj
+    M += off_chz
+    D += off_chz
+
+    # load scales
+    offs_k = tl.arange(0, HEAD_DIM)
+
+    start_n = pid * BLOCK_N1
+    start_m = 0
+
+    # MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
+    offs_n = start_n + tl.arange(0, BLOCK_N1)
+
+    dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+    dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+
+    # load K and V: they stay in SRAM throughout the inner loop.
+    k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+    v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+
+    num_steps = N_CTX // BLOCK_M1
+
+    dk, dv = _attn_bwd_dkdv(dk, dv,  #
+                            Q, k, v, sm_scale,  #
+                            DO,  #
+                            M, D,  #
+                            stride_tok, stride_d,  #
+                            H, N_CTX, N_KV,  #
+                            BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+                            start_n, start_m, num_steps,  #
+                            MASK,
+                            stride_m_q, stride_m_k,
+                            )
+
+    dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+    tl.store(dv_ptrs, dv)
+
+    # Write back dK.
+    dk *= sm_scale
+    dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+    tl.store(dk_ptrs, dk)
+
+    # THIS BLOCK DOES DQ:
+    start_m = pid * BLOCK_M2
+    start_n = 0
+
+    offs_m = start_m + tl.arange(0, BLOCK_M2)
+
+    q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+    dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+    do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+
+    m = tl.load(M + offs_m)
+    m = m[:, None]
+
+    num_steps = N_CTX // BLOCK_N2
+
+    dq = _attn_bwd_dq(dq, q, K, V,  #
+                      do, m, D,  #
+                      stride_tok, stride_d,  #
+                      H, N_CTX, N_KV,
+                      MASK,
+                      stride_m_q, stride_m_k,
+                      BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
+                      start_m, start_n, num_steps,  #
+                      )
+
+    # Write back dQ.
+    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+    dq *= LN2
+    tl.store(dq_ptrs, dq)
+
+
 class _attention(torch.autograd.Function):
 
     @staticmethod
@@ -370,22 +615,68 @@ class _attention(torch.autograd.Function):
             num_stages=3,
             **extra_kern_args)
 
-        o = o[:, :, :og_q].contiguous()
-        scores = scores[:, :, :N_KV]
-
         # print(f"{o.size()=} {scores.size()=}")
 
-        ctx.save_for_backward(q, k, v, o, M)
+        ctx.save_for_backward(q, k, v, o, M, mask)
         ctx.grid = grid
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
 
+        o = o[:, :, :og_q].contiguous()
+        scores = scores[:, :, :N_KV]
+
         return o, scores
 
     @staticmethod
-    def backward(ctx, do):
-        raise NotImplementedError("refer to triton tutorials to get the bwd functions and modify them")
+    def backward(ctx, do, d_scores):
+        q, k, v, o, M, mask = ctx.saved_tensors
+        assert do.is_contiguous()
+        assert q.stride() == o.stride() == do.stride()
+        assert k.stride() == v.stride()
+
+        # TODO: stopped here:
+        #  - figure out how to get this working with a rectangular attention matrix
+
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        BATCH, N_HEAD, N_CTX = q.shape[:3]
+        N_KV = k.shape[2]
+        PRE_BLOCK = 128
+        NUM_WARPS, NUM_STAGES = 4, 5
+        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+        BLK_SLICE_FACTOR = 2
+        RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
+        arg_k = k
+        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
+        PRE_BLOCK = 128
+        assert N_CTX % PRE_BLOCK == 0
+        pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
+        delta = torch.empty_like(M)
+        _attn_bwd_preprocess[pre_grid](
+            o, do,  #
+            delta,  #
+            BATCH, N_HEAD, N_CTX,  #
+            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
+        )
+        grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
+        _attn_bwd[grid](
+            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
+            M, delta,  #
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            mask,
+            mask.stride(0), mask.stride(1),
+            N_HEAD, N_CTX, N_KV,  #
+            BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
+            BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
+            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+            HEAD_DIM=ctx.HEAD_DIM,  #
+            num_warps=NUM_WARPS,  #
+            num_stages=NUM_STAGES  #
+        )
+
+        return dq, dk, dv, None, None, None, None
 
 
 attention = _attention.apply
@@ -450,6 +741,66 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16, N_KV=None):
     # assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=rtol)
     # assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=rtol)
     # assert torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=rtol)
+
+
+def test_op_with_backward(Z, H, N_CTX, N_KV, HEAD_DIM, causal, dtype=torch.float16):
+    torch.manual_seed(20)
+    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    k = (torch.empty((Z, H, N_KV, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    v = (torch.empty((Z, H, N_KV, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    M = torch.full((N_CTX, N_KV), 1, dtype=torch.bool, device="cuda").triu(1)
+
+    sm_scale = 0.5
+    dout = torch.randn_like(q)
+    # reference implementation
+    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+    if causal:
+        p[:, :, M == 1] = float("-inf")
+    p = torch.softmax(p.float(), dim=-1).half()
+    # p = torch.exp(p)
+    ref_out = torch.matmul(p, v)
+    ref_out.backward(dout)
+    ref_dv, v.grad = v.grad.clone(), None
+    ref_dk, k.grad = k.grad.clone(), None
+    ref_dq, q.grad = q.grad.clone(), None
+    # triton implementation
+    tri_out, _ = attention(q, k, v, causal, sm_scale, M, 1.0)
+    tri_out = tri_out.half()
+
+    # compare
+    assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
+    fwd_diff = (ref_out - tri_out).abs().mean().amax()
+    print(f"{fwd_diff=}")
+
+    tri_out.backward(dout, None)
+    tri_dv, v.grad = v.grad.clone(), None
+    tri_dk, k.grad = k.grad.clone(), None
+    tri_dq, q.grad = q.grad.clone(), None
+
+    rtol = 0.0
+    # Relative tolerance workaround for known hardware limitation of MI200 GPU.
+    # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
+    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
+        rtol = 1e-2
+
+    dv_close = torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=rtol)
+    dk_close = torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=rtol)
+    dq_close = torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=rtol)
+
+    dv_diff = (ref_dv - tri_dv).abs().mean().amax()
+    dk_diff = (ref_dk - tri_dk).abs().mean().amax()
+    dq_diff = (ref_dq - tri_dq).abs().mean().amax()
+
+    print(f"{dv_diff=} {dk_diff=} {dq_diff=}")
+
+    dv_diff = (ref_dv - tri_dv).abs()
+    dk_diff = (ref_dk - tri_dk).abs()
+    dq_diff = (ref_dq - tri_dq).abs()
+
+    # print(f"{dv_diff=}")
+    # print(f"{dk_diff=}")
+    print(f"{dq_diff=}")
+    print(f"{dv_close=} {dk_close=} {dq_close=}")
 
 
 try:
@@ -553,6 +904,9 @@ def bench_flash_attention(BATCH,
 
 
 if __name__ == "__main__":
+    test_op_with_backward(1, 2, 128, 128, 64, True)
+    test_op_with_backward(1, 2, 128, 256, 64, True)
+    exit()
     # only works on post-Ampere GPUs right now
     # print("64 test")
     # test_op(1, 1, 64, 64, True)
