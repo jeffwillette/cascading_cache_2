@@ -466,34 +466,35 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     tl.store(dk_ptrs, dk)
 
     # THIS BLOCK DOES DQ:
-    # start_m = pid * BLOCK_M2
-    # start_n = 0
+    start_m = pid * BLOCK_M2
+    start_n = 0
 
-    # offs_m = start_m + tl.arange(0, BLOCK_M2)
+    if start_m < N_CTX:
+        offs_m = start_m + tl.arange(0, BLOCK_M2)
 
-    # q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
-    # dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-    # do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+        do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
 
-    # m = tl.load(M + offs_m)
-    # m = m[:, None]
+        m = tl.load(M + offs_m)
+        m = m[:, None]
 
-    # num_steps = N_CTX // BLOCK_N2
+        num_steps = N_CTX // BLOCK_N2
 
-    # dq = _attn_bwd_dq(dq, q, K, V,  #
-    #                   do, m, D,  #
-    #                   stride_tok, stride_d,  #
-    #                   H, N_CTX, N_KV,
-    #                   MASK,
-    #                   stride_m_q, stride_m_k,
-    #                   BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
-    #                   start_m, start_n, num_steps,  #
-    #                   )
+        dq = _attn_bwd_dq(dq, q, K, V,  #
+                          do, m, D,  #
+                          stride_ktok, stride_kd,  #
+                          H, N_CTX, N_KV,
+                          MASK,
+                          stride_m_q, stride_m_k,
+                          BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
+                          start_m, start_n, num_steps,  #
+                          )
 
-    # # Write back dQ.
-    # dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    # dq *= LN2
-    # tl.store(dq_ptrs, dq)
+        # Write back dQ.
+        dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+        dq *= LN2
+        tl.store(dq_ptrs, dq)
 
 
 class _attention(torch.autograd.Function):
@@ -514,8 +515,8 @@ class _attention(torch.autograd.Function):
         # we will have to mask out the unwanted values in the attention_inner
         b, h, s, d = k.shape
         N_SCORES = N_KV
-        if N_KV % 32 != 0:
-            n = 32 - (N_KV % 32)  # + 32
+        if N_KV % 64 != 0:
+            n = 64 - (N_KV % 64)  # + 32
             k = torch.cat(
                 (k, torch.zeros(b, h, n, d, dtype=k.dtype, device=k.device)),
                 dim=2)
@@ -622,6 +623,8 @@ class _attention(torch.autograd.Function):
         # print(f"{o.size()=} {scores.size()=}")
 
         ctx.save_for_backward(q, k, v, o, M, mask)
+        ctx.og_q = og_q
+        ctx.og_kv = N_KV
         ctx.grid = grid
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
@@ -648,8 +651,8 @@ class _attention(torch.autograd.Function):
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         N_KV = k.shape[2]
         PRE_BLOCK = 128
-        NUM_WARPS, NUM_STAGES = 4, 5
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+        NUM_WARPS, NUM_STAGES = 4, 4
+        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 64, 64, 32
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
         arg_k = k
@@ -681,132 +684,14 @@ class _attention(torch.autograd.Function):
             num_stages=NUM_STAGES  #
         )
 
+        dq = dq[:, :, :ctx.og_q]
+        dk = dk[:, :, :ctx.og_kv]
+        dv = dv[:, :, :ctx.og_kv]
+
         return dq, dk, dv, None, None, None, None
 
 
 attention = _attention.apply
-
-
-@pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 1024, 64)])
-@pytest.mark.parametrize("causal", [True])
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16, N_KV=None):
-    if N_KV is None:
-        N_KV = N_CTX
-
-    torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype,
-                     device="cuda").normal_(mean=0.0,
-                                            std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_KV, HEAD_DIM), dtype=dtype,
-                     device="cuda").normal_(mean=0.0,
-                                            std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_KV, HEAD_DIM), dtype=dtype,
-                     device="cuda").normal_(mean=0.0,
-                                            std=0.5).requires_grad_())
-    sm_scale = 0.5
-    dout = torch.randn_like(q)
-    # reference implementation
-    # M = torch.rand(N_CTX, N_KV, device="cuda") > 0.5
-    M = ~torch.ones(N_CTX, N_KV, device="cuda", dtype=torch.bool).tril()
-    print(f"{M} {M.size()=}")
-    print(f"{(~M).sum(dim=0)=}")
-    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-
-    if causal:
-        p[:, :, M == 1] = float("-inf")
-        a = torch.matmul(q, k.transpose(2, 3))
-        a[:, :, M == 1] = 0
-        print(f"analytic scores {a[0, 0].sum(dim=0)}")
-    p = torch.softmax(p.float(), dim=-1).half()
-    # p = torch.exp(p)
-    ref_out = torch.matmul(p, v)
-    # ref_out.backward(dout)
-    # ref_dv, v.grad = v.grad.clone(), None
-    # ref_dk, k.grad = k.grad.clone(), None
-    # ref_dq, q.grad = q.grad.clone(), None
-    # triton implementation
-    tri_out, scores = attention(q, k, v, causal, sm_scale, M)
-    tri_out = tri_out.half()
-    # print(f"{(tri_attention - att).abs().amax()=}")
-    # tri_out.backward(dout)
-    # tri_dv, v.grad = v.grad.clone(), None
-    # tri_dk, k.grad = k.grad.clone(), None
-    # tri_dq, q.grad = q.grad.clone(), None
-    # compare
-    diff = (ref_out - tri_out).abs()
-    print(f"{diff.amax()=}")
-
-    assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
-    # rtol = 0.0
-    # # Relative tolerance workaround for known hardware limitation of MI200 GPU.
-    # # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    # if torch.version.hip is not None and triton.runtime.driver.active.get_current_target(
-    # ).arch == "gfx90a":
-    #     rtol = 1e-2
-    # assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=rtol)
-    # assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=rtol)
-    # assert torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=rtol)
-
-
-def test_op_with_backward(Z, H, N_CTX, N_KV, HEAD_DIM, causal, dtype=torch.float16):
-    torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_KV, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_KV, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
-    M = torch.full((N_CTX, N_KV), 1, dtype=torch.bool, device="cuda").triu(1)
-
-    sm_scale = 0.5
-    dout = torch.randn_like(q)
-    # reference implementation
-    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-    if causal:
-        p[:, :, M == 1] = float("-inf")
-    p = torch.softmax(p.float(), dim=-1).half()
-    # p = torch.exp(p)
-    ref_out = torch.matmul(p, v)
-    ref_out.backward(dout)
-    ref_dv, v.grad = v.grad.clone(), None
-    ref_dk, k.grad = k.grad.clone(), None
-    ref_dq, q.grad = q.grad.clone(), None
-    # triton implementation
-    tri_out, _ = attention(q, k, v, causal, sm_scale, M, 1.0)
-    tri_out = tri_out.half()
-
-    # compare
-    assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
-    fwd_diff = (ref_out - tri_out).abs().mean().amax()
-    print(f"{fwd_diff=}")
-
-    tri_out.backward(dout, None)
-    tri_dv, v.grad = v.grad.clone(), None
-    tri_dk, k.grad = k.grad.clone(), None
-    tri_dq, q.grad = q.grad.clone(), None
-
-    rtol = 0.0
-    # Relative tolerance workaround for known hardware limitation of MI200 GPU.
-    # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
-        rtol = 1e-2
-
-    dv_close = torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=rtol)
-    dk_close = torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=rtol)
-    dq_close = torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=rtol)
-
-    dv_diff = (ref_dv - tri_dv).abs().mean().amax()
-    dk_diff = (ref_dk - tri_dk).abs().mean().amax()
-    dq_diff = (ref_dq - tri_dq).abs().mean().amax()
-
-    print(f"{dv_diff=} {dk_diff=} {dq_diff=}")
-
-    dv_diff = (ref_dv - tri_dv).abs()
-    dk_diff = (ref_dk - tri_dk).abs()
-    dq_diff = (ref_dq - tri_dq).abs()
-
-    # print(f"{dv_diff=}")
-    # print(f"{dk_diff=}")
-    print(f"{dq_diff=}")
-    print(f"{dv_close=} {dk_close=} {dq_close=}")
-
 
 try:
     from flash_attn.flash_attn_interface import \
@@ -909,9 +794,6 @@ def bench_flash_attention(BATCH,
 
 
 if __name__ == "__main__":
-    test_op_with_backward(1, 2, 128, 128, 64, True)
-    test_op_with_backward(1, 2, 128, 256, 64, True)
-    exit()
     # only works on post-Ampere GPUs right now
     # print("64 test")
     # test_op(1, 1, 64, 64, True)
