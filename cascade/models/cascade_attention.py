@@ -61,6 +61,8 @@ class CascadeAttention(nn.Module):
                 cache_position=cache_position,
                 use_flash=hidden_states.size(1) >= 64,
                 position_embeddings=position_embeddings,
+                homogeneous_heads=self.config._homogeneous_heads,
+                do_og_pos=self.config._do_og_pos,
             )
 
         elif hasattr(self, "hyper_attn"):
@@ -96,7 +98,7 @@ class CascadeAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         use_flash: bool = True,
-        homogeneous_heads: bool = False,
+        homogeneous_heads: bool = True,
         do_og_pos: bool = False,
         use_selfextend: bool = False,
         position_embeddings: Optional[torch.Tensor] = None,
@@ -204,19 +206,19 @@ class CascadeAttention(nn.Module):
         if first_it or self.last_attn_called != "flash" or self.last_q_size != query_states.size(2):
             self.last_attn_called = "flash"
             self.last_q_size = query_states.size(2)
-            causal_mask = torch.full((query_states.size(2), query_states.size(2)), 1,
-                                     device=query_states.device,
-                                     dtype=torch.bool).triu(1)
+            _causal_mask = torch.full((query_states.size(2), query_states.size(2)), 1,
+                                      device=query_states.device,
+                                      dtype=torch.bool).triu(1)
 
-            sink_mask = torch.full((query_states.size(2), sink_key_states.size(2)), 1,
-                                   device=query_states.device,
-                                   dtype=torch.bool)
-
-            cache_mask = torch.full((query_states.size(2), k_states.size(2)), 1,
+            _sink_mask = torch.full((query_states.size(2), sink_key_states.size(2)), 1,
                                     device=query_states.device,
                                     dtype=torch.bool)
 
-            self.causal_mask = torch.cat((sink_mask, cache_mask, causal_mask), dim=-1)
+            _cache_mask = torch.full((query_states.size(2), k_states.size(2)), 1,
+                                     device=query_states.device,
+                                     dtype=torch.bool)
+
+            self.causal_mask = torch.cat((_sink_mask, _cache_mask, _causal_mask), dim=-1)
 
         n_sink = sink_key_states.size(2)
         self.causal_mask[:, :n_sink] =\
@@ -557,8 +559,11 @@ def _sample_monkeypatch(
             inputs = model_inputs["input_ids"]
 
             for i in range(0, inputs.size(1), stride):
+                # print(f"{list(model_inputs.keys())=}")
                 model_inputs["input_ids"] = inputs[:, i:i + stride]
                 outputs = self(**model_inputs, return_dict=True)
+                # print(f"after {list(model_inputs.keys())=}")
+                model_inputs["past_key_values"] = outputs["past_key_values"]
 
             first_it = False
         else:

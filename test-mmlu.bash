@@ -1,18 +1,24 @@
 #!/bin/bash
 
-WINDOW=(1024)
-CASCADES=(1)
+WINDOW=(2048)
+CASCADES=(4)
 SINKS=(4)
-BATCH_SIZE=15
+BATCH_SIZE=10
 HEAD_REDUCTION=mean
 CASCADE_FUNC="pow2"
+CASCADE_STRIDE=512
+GPU=4
+# COMMENT="quarter-avg-len-budget"
+COMMENT="quarter-avg-len-budget"
+# MODEL=llama3.1-8b-instruct
+MODEL=qwen2-7b-instruct
 
 for i in "${!WINDOW[@]}";
 do 
-        # PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python cascade/main/llama_eval.py \
         # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 cascade/main/llama_eval.py \
-        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,3 --master_port 63290 cascade/main/llama_eval.py \
-        --model qwen7b \
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,3 --master_port 63290 cascade/main/llama_eval.py \
+        PYTHONPATH=. CUDA_VISIBLE_DEVICES=$GPU python cascade/main/llama_eval.py \
+        --model $MODEL \
         --job mmlu \
         --method sink \
         --lora_r 0 \
@@ -21,8 +27,10 @@ do
         --cascades ${CASCADES[$i]} \
         --cascade_func $CASCADE_FUNC \
         --head_reduction $HEAD_REDUCTION \
-        --comment rerun-since-deepspeed-bugfix \
-        --batch_size $BATCH_SIZE
+        --comment $COMMENT \
+        --batch_size $BATCH_SIZE \
+        --homogeneous_heads \
+        --cascade_stride $CASCADE_STRIDE
         sleep 1
 done
 

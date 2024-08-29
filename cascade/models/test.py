@@ -1,11 +1,14 @@
 from cascade.models.cascading_cache import SinkAttentionNaive, CascadingKVCache, CascadingKVCacheSlow, add_sinks, append_to_cache, evict_from_cache, overwrite_cache
 import numpy as np
 import unittest
+import triton
+
 from argparse import Namespace
 from cascade.main.llama_eval import load_model
 import torch
 import time
 from cascade.models.cascade_attention import sample_monkeypatch
+from cascade.models.flash_attention import attention
 
 
 def get_cache(model):
@@ -43,8 +46,14 @@ class TestCascadeAttention(unittest.TestCase):
             cascade_stride=128,
             job="test",
             lora_r=0,
+            homogeneous_heads=True,
+            do_og_pos=False,
         )
         self.args = args
+        torch.set_grad_enabled(False)
+
+    def tearDown(self):
+        torch.set_grad_enabled(True)
 
     def test_cascade_attention_iterative_generate(self):
         args = self.args
@@ -55,7 +64,7 @@ class TestCascadeAttention(unittest.TestCase):
             past_key_values = get_cache(model)
 
             stride = args.cascade_stride
-            inputs = torch.randint(0, 1024, size=(1, 2048), device=device)
+            inputs = torch.randint(0, 1024, size=(args.batch_size, 2048), device=device)
 
             # test a manual iterative generation
             for i in range(0, inputs.size(1), stride):
@@ -81,6 +90,111 @@ class TestCascadeAttention(unittest.TestCase):
             )[0]
 
             _ = tokenizer.decode(output[inputs.size(1):])
+
+    def test_cascade_attention_with_cache_equals_dense(self):
+        """
+        with a seqeuence length which gits inside the sliding window, it should
+        be equivalent to dense attention.
+        """
+        args = self.args
+        args.cascades = 1
+        args.model = "llama3.1-8b-instruct"
+
+        model, tokenizer, device = load_model(args)
+        model = sample_monkeypatch(model)
+        past_key_values = get_cache(model)
+
+        stride = args.cascade_stride
+        inputs = torch.randint(0, 1024, size=(args.batch_size, 1024 - (128 - 92)), device=device)
+
+        # test a manual iterative generation
+        cascade_logits = []
+        for i in range(0, inputs.size(1), stride):
+            inp = inputs[:, i: i + args.cascade_stride]
+            output = model(inp, past_key_values=past_key_values, use_cache=True)
+            cascade_logits += [output.logits]
+            past_key_values = output.past_key_values
+            del output
+
+        past_key_values.reset(verbose=True)
+        output = model(inputs, past_key_values=past_key_values, use_cache=True)
+        dense_logits = output.logits
+        dense_logits = torch.split(dense_logits, args.cascade_stride, dim=1)
+
+        for c, d in zip(cascade_logits, dense_logits):
+            diff = (c - d).abs().mean(dim=-1)
+            print(f"{diff=}")
+            argmax_same = c.argmax(dim=-1) == d.argmax(dim=-1)
+            print(f"{argmax_same=}")
+
+
+class TestFlashAttention(unittest.TestCase):
+    def test_flash_attention_fwd_bwd(self):
+        def test_op_with_backward(Z, H, N_CTX, N_KV, HEAD_DIM, causal, dtype=torch.float16):
+            torch.manual_seed(20)
+            q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+            k = (torch.empty((Z, H, N_KV, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+            v = (torch.empty((Z, H, N_KV, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+            M = torch.full((N_CTX, N_KV), 1, dtype=torch.bool, device="cuda").triu(1)
+
+            sm_scale = 0.5
+            dout = torch.randn_like(q)
+            # reference implementation
+            p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+            if causal:
+                p[:, :, M == 1] = float("-inf")
+            p = torch.softmax(p.float(), dim=-1).half()
+            # p = torch.exp(p)
+            ref_out = torch.matmul(p, v)
+            ref_out.backward(dout)
+            ref_dv, v.grad = v.grad.clone(), None
+            ref_dk, k.grad = k.grad.clone(), None
+            ref_dq, q.grad = q.grad.clone(), None
+            # triton implementation
+            tri_out, _ = attention(q, k, v, causal, sm_scale, M, 1.0)
+            tri_out = tri_out.half()
+
+            # compare
+            close = torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
+            self.assertTrue(close)
+
+            # fwd_diff = (ref_out - tri_out).abs().mean().amax()
+            # print(f"{fwd_diff=}")
+
+            tri_out.backward(dout, None)
+            tri_dv, v.grad = v.grad.clone(), None
+            tri_dk, k.grad = k.grad.clone(), None
+            tri_dq, q.grad = q.grad.clone(), None
+
+            rtol = 0.0
+            # Relative tolerance workaround for known hardware limitation of MI200 GPU.
+            # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
+            if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
+                rtol = 1e-2
+
+            dv_close = torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=rtol)
+            dk_close = torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=rtol)
+            dq_close = torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=rtol)
+
+            # dv_diff = (ref_dv - tri_dv).abs()
+            # dk_diff = (ref_dk - tri_dk).abs()
+            # dq_diff = (ref_dq - tri_dq).abs()
+            # print(f"{dv_diff=} {dk_diff=} {dq_diff=}")
+
+            # print(f"{dv_diff=}")
+            # print(f"{dk_diff=}")
+            # print(f"{dq_diff=}")
+
+            self.assertTrue(dv_close)
+            self.assertTrue(dk_close)
+            self.assertTrue(dq_close)
+
+        for Z, H, N_CTX, N_KV, HEAD_DIM in (
+            (1, 2, 128, 128, 64),
+            (1, 2, 1024, 16384 + 1024 + 4, 64),
+            (2, 32, 1024, 16384 + 1024 + 4, 128),
+        ):
+            test_op_with_backward(Z, H, N_CTX, N_KV, HEAD_DIM, True)
 
 
 class TestCascadingKVCache(unittest.TestCase):

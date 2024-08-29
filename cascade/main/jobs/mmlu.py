@@ -1,5 +1,6 @@
 import json
 import os
+from cascade.models.cascading_cache import CascadingKVCache
 import time
 import math
 import torch
@@ -44,27 +45,27 @@ The examples of similar questions are:
 
 I want to know the answer to question 1. The answer ({answer_placeholder}) to the question I am interested in is:"""
 
-MMLU_STEM = [
-    'abstract_algebra',
-    'anatomy',
-    'astronomy',
-    'college_biology',
-    'college_chemistry',
-    'college_computer_science',
-    'college_mathematics',
-    'college_physics',
-    'computer_security',
-    'conceptual_physics',
-    'electrical_engineering',
-    'elementary_mathematics',
-    'high_school_biology',
-    'high_school_chemistry',
-    'high_school_computer_science',
-    'high_school_mathematics',
-    'high_school_physics',
-    'high_school_statistics',
-    'machine_learning',
-]
+# MMLU_STEM = [
+#     'abstract_algebra',
+#     'anatomy',
+#     'astronomy',
+#     'college_biology',
+#     'college_chemistry',
+#     'college_computer_science',
+#     'college_mathematics',
+#     'college_physics',
+#     'computer_security',
+#     'conceptual_physics',
+#     'electrical_engineering',
+#     'elementary_mathematics',
+#     'high_school_biology',
+#     'high_school_chemistry',
+#     'high_school_computer_science',
+#     'high_school_mathematics',
+#     'high_school_physics',
+#     'high_school_statistics',
+#     'machine_learning',
+# ]
 
 MMLU_SUBJECTS_SORTED = [
     'management',
@@ -223,7 +224,7 @@ def format_mmlu(question,
     )
 
 
-def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args):
+def exam_mmlu(model, use_cache, past_key_values, tokenizer: transformers.PreTrainedTokenizer, texts, args):
 
     def gather_token_ids(candidates):
         ids = []
@@ -249,11 +250,13 @@ def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args):
     if text_len < args.batch_size:
         texts += ["null text"] * (args.batch_size - text_len)
 
+    is_sink = isinstance(past_key_values, CascadingKVCache)
+
     inputs = tokenizer(
         texts,
         return_tensors='pt',
         max_length=model.config.max_position_embeddings,
-        truncation=True,
+        truncation=False if is_sink else True,
         padding=True,
     )
 
@@ -263,18 +266,34 @@ def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args):
 
     seq_lens = inputs.attention_mask[:text_len].sum(dim=-1).tolist()
 
+    torch.set_printoptions(profile="full")
     with torch.no_grad():
-        sink = True
-        if sink:
+        if is_sink:
+            past_key_values.reset(verbose=False)
             input_ids = inputs["input_ids"].cuda()
 
             # these are the first outputs after the last of the prompt sequence
             pred_indices = inputs.attention_mask[:text_len].sum(
                 dim=-1, keepdim=True) - 1
 
-            output = model(input_ids, use_cache=False)
-            logits = output.logits[:text_len]
+            # print(f"{pred_indices=}")
 
+            logits = []
+            for i in range(0, input_ids.size(1), args.cascade_stride):
+                # print(f"{past_key_values._seen_tokens=}")
+                output = model(
+                    input_ids[:, i: i + args.cascade_stride],
+                    use_cache=use_cache,
+                    past_key_values=past_key_values
+                )
+                logits += [output.logits[:text_len].cpu().half()]
+                past_key_values = output.past_key_values
+                # print(f"{past_key_values.stored_sinks=}")
+                # print([o.size() for o in logits])
+
+            logits = torch.cat(logits, dim=1).to(pred_indices.device)
+
+            # print(f"{logits.size()=}")
             pred_indices = pred_indices.unsqueeze(-1).repeat(
                 1, 1, logits.size(-1))
 
@@ -292,6 +311,7 @@ def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args):
         prob_c = max([output[i, -1, token].item() for token in tokens_c])
         prob_d = max([output[i, -1, token].item() for token in tokens_d])
         probs = [('A', prob_a), ('B', prob_b), ('C', prob_c), ('D', prob_d)]
+
         probs = list(sorted(probs, key=lambda x: x[1], reverse=True))
         out_probs.append(probs)
 
@@ -343,14 +363,12 @@ def format_mmlu_plain(question, subject_name, few_shots):
         answer_placeholder="",
     )
     truth = question['target']
-    text = "\n\n".join(few_shots + [
-        text,
-    ])
+    text = "\n\n".join(few_shots + [text,])
     return text, truth
 
 
-def evaluate_mmlu(args, model, tokenizer, subject_name, reverse=False):
-    dataset = load_dataset('lukaemon/mmlu', subject_name)
+def evaluate_mmlu(args, model, use_cache, past_key_values, tokenizer, subject_name, reverse=False):
+    dataset = load_dataset('lukaemon/mmlu', subject_name, trust_remote_code=True)
 
     few_shots = get_fewshots(dataset, subject_name, shift=2 if reverse else 1)
 
@@ -376,7 +394,7 @@ def evaluate_mmlu(args, model, tokenizer, subject_name, reverse=False):
             texts = [v[0] for v in input_slice]
             truths = [v[1] for v in input_slice]
 
-            batch_estimations, seq_lens = exam_mmlu(model, tokenizer, texts,
+            batch_estimations, seq_lens = exam_mmlu(model, use_cache, past_key_values, tokenizer, texts,
                                                     args)
             # print(f"{truths=} {batch_estimations=}")
 
@@ -404,16 +422,14 @@ def evaluate_mmlu(args, model, tokenizer, subject_name, reverse=False):
     elapsed = time.time() - t_start
     accuracy = (n_correct / len(results)) * 100
     avg_seq_len = seq_len_sum / len(results)
-    print(
-        f'{subject_name} = Accuracy: {accuracy:.4f} %, avg_seq_len: {avg_seq_len:.2f}. elapsed: {elapsed:.1f} s'
-    )
+    print(f'{subject_name} = Accuracy: {accuracy:.4f} %, avg_seq_len: {avg_seq_len:.2f}. elapsed: {elapsed:.1f} s')
 
     os.makedirs('./saves/llama_eval/mmlu/', exist_ok=True)
     json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}_reverse_{reverse}.json'
     if args.method == 'sink':
         json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}_window_{args.window}_' + \
             f'head_reduction_{args.head_reduction}_cascade_{args.cascades}_sinks_{args.sinks}_' + \
-            f'comment_{args.comment}_reverse_{reverse}.json'
+            f'homogeneous_heads_{args.homogeneous_heads}_cascade_stride_{args.cascade_stride}_comment_{args.comment}_reverse_{reverse}.json'
 
     with open(json_path, 'w') as f:
         json.dump(
@@ -442,28 +458,42 @@ def job_mmlu(args, model, tokenizer, device):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if args.method == "vanilla":
-        model = model.cuda()
+    model = model.cuda()
+    past_key_values = None
+    use_cache = False
 
-    elif args.method == "sink":
-        model.model.setup_caches(args.world_size)
-
-        if args.world_size > 1:
-            pass
-            # model = deepspeed.init_inference(
-            #     model,
-            #     tensor_parallel={"tp_size": args.world_size},
-            #     replace_with_kernel_inject=False,
-            #     dtype=args.infer_dtype,
-            #     injection_policy=get_injection_policy(args.model),
-            # )
-        else:
-            model = model.cuda()
+    with open("./saves/llama_eval/mmlu-stats.json", "r") as f:
+        subject_stats = json.load(f)
 
     accuracies, reversed_accuracies = [], []
-    # for subjects in MMLU_SUBJECTS:
-    for subjects in MMLU_STEM:
-        acc = evaluate_mmlu(args, model, tokenizer, subjects, reverse=False)
+    for subjects in MMLU_SUBJECTS:
+        subject_mean = subject_stats[subjects][0]
+
+        max_seq_len = int(2 ** int(np.log2(subject_mean / 4) // 1))
+        # max_seq_len = min(max_seq_len, 32768)
+        max_seq_len = min(max_seq_len, 16384)
+        print(f"{max_seq_len=} {subjects=}")
+        window = max_seq_len // args.cascades
+
+        if args.method == "sink":
+            mdl = model.model
+
+            use_cache = True
+            past_key_values = CascadingKVCache(
+                window,
+                num_sink_tokens=mdl.config._sinks,
+                max_batch_size=mdl.config._batch_size,
+                heads=mdl.config.num_key_value_heads // args.world_size,
+                dim=mdl.config.hidden_size // mdl.config.num_attention_heads,
+                max_seq_len=max_seq_len,
+                dtype=torch.float16,
+                device=mdl.embed_tokens.weight.device,
+                cascade_func=mdl.config._cascade_func,
+                head_reduction=mdl.config._head_reduction,
+                layers=len(mdl.layers),
+            )
+
+        acc = evaluate_mmlu(args, model, use_cache, past_key_values, tokenizer, subjects, reverse=False)
         accuracies.append(acc)
 
         # rev_acc = evaluate_mmlu(args, model, tokenizer, subjects, reverse=True)
@@ -474,3 +504,37 @@ def job_mmlu(args, model, tokenizer, device):
 
     # rev_accuracy = np.array(reversed_accuracies).mean()
     # print(f'MMLU AVG. ACC: {rev_accuracy}')
+
+
+if __name__ == "__main__":
+    # print the average and standard deviation of the numbers
+    # of tokens for each MMLU subject
+
+    model = 'meta-llama/Meta-Llama-3.1-8B'
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model)
+
+    subject_lens = {}
+    for subject in MMLU_SUBJECTS:
+        dataset = load_dataset('lukaemon/mmlu', subject, trust_remote_code=True)
+        few_shots = get_fewshots(dataset, subject, shift=1)
+
+        lens = []
+
+        qanda = [
+            format_mmlu_plain(question, subject, few_shots)
+            for question in dataset["test"]
+        ]
+
+        for input_slice in qanda:
+            text, truth = input_slice
+            inputs = tokenizer(
+                text, return_tensors='pt', truncation=False)
+
+            inputs = inputs.input_ids
+            lens.append(inputs.size(1))
+
+        subject_lens[subject] = (np.mean(lens), np.std(lens))
+        print(f"{subject=} mean: {np.mean(lens)} std: {np.std(lens)}")
+
+    with open("./saves/llama_eval/mmlu-stats.json", "w") as f:
+        json.dump(subject_lens, f)

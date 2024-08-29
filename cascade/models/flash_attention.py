@@ -1,4 +1,3 @@
-import pytest
 import torch
 
 import triton
@@ -795,23 +794,4 @@ def bench_flash_attention(BATCH,
 
 if __name__ == "__main__":
     # only works on post-Ampere GPUs right now
-    # print("64 test")
-    # test_op(1, 1, 64, 64, True)
-
-    # print("128 test")
-    # test_op(10, 32, 128, 128, True, N_KV=128)
-    print("32 test")
-    test_op(1, 2, 64, 64, True, N_KV=32)
-    exit()
-
-    print("\n\n512/512\n\n")
-    test_op(16, 32, 512, 128, True)
-
-    print(f"\n\n512/64\n\n")
-    test_op(16, 32, 512, 128, True, N_KV=64)
-    print(f"\n\n512/2048\n\n")
-    test_op(16, 32, 512, 128, True, N_KV=2048)
-    print(f"\n\n512/2048+32\n\n")
-    test_op(16, 32, 512, 128, True, N_KV=2048 + 32)
-    print(f"\n\n512/2048+32+512\n\n")
-    test_op(1, 32, 512, 128, True, N_KV=2048 + 32 + 512)
+    bench_flash_attention.run(save_path=".", print_data=True)

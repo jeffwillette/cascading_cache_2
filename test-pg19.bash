@@ -6,11 +6,15 @@ SINKS=(4)
 BATCH_SIZE=1
 HEAD_REDUCTION=mean
 CASCADE_FUNC="pow2"
-GPUS=(5)
+GPUS=(3)
 MODEL=llama3.1-8b
 METHOD=sink
 # COMMENT="different-cache-sizes-65k-4-8k-28"
-COMMENT="different-cache-sizes-131k-2-8k-30"
+# COMMENT="different-cache-sizes-65k-4-16k-28"
+# COMMENT="different-cache-sizes-131k-2-8k-30"
+COMMENT="window-quarter-book"
+# COMMENT="window-half-book"
+# COMMENT="plain"
 CASCADE_STRIDE=1024
 
 # MAIN PG19 experiment code
@@ -27,6 +31,7 @@ do
         --cascade_stride $CASCADE_STRIDE \
         --head_reduction $HEAD_REDUCTION \
         --comment $COMMENT \
+        --homogeneous_heads \
         --batch_size $BATCH_SIZE
         sleep 1
 done

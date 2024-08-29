@@ -1087,6 +1087,9 @@ class CascadingKVCache(Cache):
 
         self.init_cache(self.device)
 
+    def __repr__(self):
+        return f"{self.max_seq_len=}, {self.cascades=} {self.max_batch_size=}, {self.layers=} {self.heads=}"
+
     def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
         """
         Support for backwards-compatible `past_key_value` indexing, e.g. `past_key_value[0][0].shape[2]` to get the
@@ -1281,7 +1284,8 @@ class CascadingKVCache(Cache):
                                        dtype=key_states.dtype)
 
         # this is for all caches and sometimes used in transformers
-        self._seen_tokens += key_states.shape[-2]
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[-2]
 
         sink_cache(
             key_states,

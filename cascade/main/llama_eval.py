@@ -109,9 +109,12 @@ def load_model(args):
         return load_vllm_model(args)
 
     device = 'cuda:0'
+    PATH = "/d1/dataset/llama/models/llama_v3.1/"
     MODELS = {
-        'llama3.1-8b-instruct': 'meta-llama/Meta-Llama-3.1-8B-Instruct',
-        'llama3.1-8b': 'meta-llama/Meta-Llama-3.1-8B',
+        'llama3.1-8b-instruct': os.path.join(PATH, "Meta-Llama-3.1-8B"),
+        'llama3.1-8b': os.path.join(PATH, "Meta-Llama-3.1-8B"),
+        'llama3.1-70b': os.path.join(PATH, "Meta-Llama-3.1-70B"),
+        'llama3.1-70b-instruct': os.path.join(PATH, "Meta-Llama-3.1-70B-Instruct"),
         'llama7b': 'togethercomputer/LLaMA-2-7B-32K',
         'llama13b': 'meta-llama/Llama-2-13b-hf',
         'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
@@ -120,6 +123,10 @@ def load_model(args):
         'qwen14b': 'Qwen/Qwen1.5-14B',
         'qwen7b': 'Qwen/Qwen1.5-7B',
         'qwen7b-chat': 'Qwen/Qwen1.5-7B-Chat',
+        "qwen2-14b-chat-32k": "Qwen/Qwen1.5-14B-Chat",
+        "qwen2-7b-chat-32k": "Qwen/Qwen1.5-7B-Chat",
+        "qwen2-7b-instruct": "Qwen/Qwen2-7B-Instruct",
+        "qwen2-7b": "Qwen/Qwen2-7B",
         'qwen0.5b': 'Qwen/Qwen1.5-0.5B',
         'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B',
         'llama3-8b-instruct':
@@ -154,6 +161,8 @@ def load_model(args):
     config._head_reduction = args.head_reduction
     config._method = args.method
     config._cascade_stride = args.cascade_stride
+    config._homogeneous_heads = args.homogeneous_heads
+    config._do_og_pos = args.do_og_pos
 
     if args.model == "llama13b_32k":
         config.max_position_embeddings = 32768
