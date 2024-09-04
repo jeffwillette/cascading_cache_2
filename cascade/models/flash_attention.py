@@ -9,6 +9,9 @@ def is_hip():
     # return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
+DTYPE = tl.float16
+
+
 @triton.jit
 def _attn_fwd_inner(
     acc,  # accumulator for qk - exp(max)
@@ -30,6 +33,7 @@ def _attn_fwd_inner(
     BLOCK_N: tl.constexpr,  #
     offs_m: tl.constexpr,
     offs_n: tl.constexpr,  #
+    N_CTX: tl.constexpr,
     N_KV: tl.constexpr,
     fp8_v: tl.constexpr,
 ):
@@ -38,14 +42,23 @@ def _attn_fwd_inner(
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
 
-    Mask_block = offs_m[:, None] * stride_mm + offs_n[None, :] * stride_mn
+    Mask_block = offs_n * stride_mn
 
     # loop over k, v and update accumulator
+    mask_vert = tl.full((BLOCK_M, 1), value=1, dtype=tl.int1)
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k = tl.load(K_block_ptr)
-        mask = tl.load(MASK + Mask_block).to(tl.int64)
+
+        N_CACHED = N_KV - N_CTX
+        if start_n < N_CACHED:
+            # load from the cache mask (sink, keyvals)
+            mask = (mask_vert * \
+                    tl.load(MASK + Mask_block)[None, :].to(tl.int1)).to(tl.int1)
+        else:
+            # load a regular causal mask for the leading block (sink, cached keyvals, ctx keyvals)
+            mask = (offs_m[:, None] < (start_n - N_CACHED + offs_n[None, :])).to(tl.int1)
 
         qk = tl.dot(q, k)
         qk = qk * qk_scale + tl.where(mask, -1.0e6, 0)
@@ -53,22 +66,29 @@ def _attn_fwd_inner(
         exps = tl.flip(tl.arange(0, BLOCK_M))[:, None]
         # do beta ** exps * (1 - beta)
         unmasked = tl.where(mask, 0, 1)
-        exps = tl.exp2(exps.to(tl.float16) * tl.log2(beta))
+        exps = tl.exp2(exps.to(DTYPE) * tl.log2(beta))
         coeff = exps * (1 - beta) * unmasked
         score_offset = (start_n + tl.arange(0, BLOCK_N)).to(
             tl.int64) * stride_sn
-
-        local_qk = tl.exp2(qk - tl.max(qk, 1)[:, None])
-        local_qk = local_qk / tl.sum(local_qk, 1)[:, None]
-        tl.atomic_add(SCORES + score_offset, val=tl.sum(local_qk * coeff, 0))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk -= m_ij[:, None]
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
+
         # -- update m_i and l_i
         alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
+
+        # this will be incrementally more accurate as we get to the end of the sequence.
+        # it is not exactly equivalent to the non-flash attention version.
+        # print("qk term: ", tl.sum((p / l_ij[:, None])))
+        # print("coeff term: ", coeff)
+        steps_left = (hi - (start_n + BLOCK_N)) // BLOCK_N
+        steps_done = (start_n + BLOCK_N) // BLOCK_N
+        adj = steps_left / steps_done
+        # print("adj: ", adj)
+        tl.atomic_add(SCORES + score_offset, val=tl.sum((p / (l_i[:, None] + (l_i[:, None] * adj) + 1e-6)) * coeff, 0))
 
         # -- update output accumulator --
         acc = acc * alpha[:, None]
@@ -77,7 +97,7 @@ def _attn_fwd_inner(
         if fp8_v:
             p = p.to(tl.float8e5)
         else:
-            p = p.to(tl.float16)
+            p = p.to(DTYPE)
 
         acc = tl.dot(p, v, acc)
         # update m_i and l_i
@@ -85,7 +105,7 @@ def _attn_fwd_inner(
 
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        Mask_block += BLOCK_N
+        Mask_block += BLOCK_N * stride_mn
 
     return acc, l_i, m_i
 
@@ -144,8 +164,8 @@ def _attn_fwd(
         stride_sn,
         Z,
         H,
-        N_CTX,  #
-        N_KV,
+        N_CTX: tl.constexpr,  #
+        N_KV: tl.constexpr,
         beta: tl.constexpr,
         BLOCK_M: tl.constexpr,  #
         BLOCK_N: tl.constexpr,  #
@@ -234,6 +254,7 @@ def _attn_fwd(
         BLOCK_N,  #
         offs_m,
         offs_n,
+        N_CTX,
         N_KV,
         V.dtype.element_ty == tl.float8e5,  #
     )
@@ -282,12 +303,18 @@ def _attn_bwd_dkdv(dk, dv,  #
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
+
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
     step_m = BLOCK_M1
+
+    # determine if we are in the cached block or the causal block
+    is_causal_block = start_n >= N_KV - N_CTX
+    mask_vert = tl.full((1, BLOCK_M1), 1, dtype=tl.int1)
+    N_CACHED = N_KV - N_CTX
     for blk_idx in range(num_steps):
         qT = tl.load(qT_ptrs)
         # Load m before computing qk to reduce pipeline stall.
@@ -297,12 +324,12 @@ def _attn_bwd_dkdv(dk, dv,  #
         pT = tl.math.exp2(qkT - m[None, :])
         # Autoregressive masking.
 
-        # TODO: this is a likely place where an error would be
-        mask = tl.load(
-            MASK_TNS + \
-                offs_m[None, :] * stride_m_q + \
-                offs_n[:, None] * stride_m_k
-        )
+        if is_causal_block:
+            mask = (offs_n[:, None] - N_CACHED > offs_m[None, :]).to(tl.int1)
+        else:
+            mask = tl.load(MASK_TNS + offs_n * stride_m_k).to(tl.int1)
+            mask = (mask_vert.to(tl.int1) * mask[:, None]).to(tl.int1)
+
         pT = tl.where(mask, 0.0, pT)
 
         # this was from the original implementation
@@ -312,14 +339,14 @@ def _attn_bwd_dkdv(dk, dv,  #
         do = tl.load(do_ptrs)
         # Compute dV.
         ppT = pT
-        ppT = ppT.to(tl.float16)
+        ppT = ppT.to(DTYPE)
         dv += tl.dot(ppT, do)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.float16)
+        dsT = dsT.to(DTYPE)
         dk += tl.dot(dsT, tl.trans(qT))
         # Increment pointers.
         curr_m += step_m
@@ -354,19 +381,24 @@ def _attn_bwd_dq(dq, q, K, V,  #
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
     curr_n = start_n
     step_n = BLOCK_N2
+
+    mask_vert = tl.full((BLOCK_M2,), 1, dtype=tl.int1)
+    N_CACHED = N_KV - N_CTX
     for blk_idx in range(num_steps):
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
         # Autoregressive masking.
-        # TODO: this is a likely place where an error would be
+
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
-        mask = tl.load(
-            MASK_TNS + \
-                offs_m[:, None] * stride_m_q + \
-                offs_n[None, :] * stride_m_k
-        )
+        is_causal_block = curr_n >= N_KV - N_CTX
+        if is_causal_block:
+            mask = (offs_m[:, None] < offs_n[None, :] - N_CACHED)
+        else:
+            mask = tl.load(MASK_TNS + offs_n * stride_m_k)
+            mask = (mask[None, :] * mask_vert[:, None]).to(tl.int1)
+
         p = tl.where(mask, 0.0, p)
 
         # original implementation
@@ -377,7 +409,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
-        ds = ds.to(tl.float16)
+        ds = ds.to(DTYPE)
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         dq += tl.dot(ds, tl.trans(kT))
@@ -409,7 +441,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
     bhid = tl.program_id(2)
-    off_chz = (bhid * N_KV).to(tl.int64)
+    # off_chz = (bhid * N_KV).to(tl.int64)
     off_chzq = (bhid * N_CTX).to(tl.int64)
     adj = (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
     adjk = (stride_kh * (bhid % H) + stride_kz * (bhid // H)).to(tl.int64)
@@ -442,8 +474,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     k = tl.load(K + offs_n[:, None] * stride_ktok + offs_k[None, :] * stride_kd)
     v = tl.load(V + offs_n[:, None] * stride_ktok + offs_k[None, :] * stride_kd)
 
+    # dk_dv sets off_n anf then iterates over the m (queries to do the bwd)
     num_steps = N_CTX // BLOCK_M1
-
     dk, dv = _attn_bwd_dkdv(dk, dv,  #
                             Q, k, v, sm_scale,  #
                             DO,  #
@@ -478,7 +510,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         m = tl.load(M + offs_m)
         m = m[:, None]
 
-        num_steps = N_CTX // BLOCK_N2
+        num_steps = N_KV // BLOCK_N2
 
         dq = _attn_bwd_dq(dq, q, K, V,  #
                           do, m, D,  #
@@ -523,11 +555,8 @@ class _attention(torch.autograd.Function):
                 (v, torch.zeros(b, h, n, d, device=v.device, dtype=v.dtype)),
                 dim=2)
 
-            mask = torch.cat(
-                (mask,
-                 torch.ones(
-                     mask.size(0), n, dtype=mask.dtype, device=mask.device)),
-                dim=-1)
+            # mask will be taken care of by trating the leading edge of the
+            # attention matrix as the causal portion
 
             N_SCORES += n
 
@@ -541,11 +570,11 @@ class _attention(torch.autograd.Function):
         if q.size(2) % 64 != 0:
             n = 64 - (q.size(2) % 64)
             q = torch.cat((q, torch.zeros(b, h, n, d, dtype=q.dtype, device=q.device)), dim=2)
-            mask = torch.cat(
-                (mask,
-                 torch.ones(
-                     n, mask.size(1), dtype=mask.dtype, device=mask.device)),
-                dim=0)
+            # mask = torch.cat(
+            #     (mask,
+            #      torch.ones(
+            #          n, mask.size(1), dtype=mask.dtype, device=mask.device)),
+            #     dim=0)
 
         o = torch.empty_like(q)
         stage = 3 if causal else 1
@@ -574,6 +603,9 @@ class _attention(torch.autograd.Function):
         # print(f"{q.size()=} {k.size()=} {v.size()=} {sm_scale=} {M.size()=} {o.size()=}")
         # print(f"{mask.size()=} {scores.size()=} {q.stride()=} {k.stride()=} {v.stride()=}")
         # print(f"{o.stride()=} {mask.stride()=} {scores.stride()=}")
+
+        mask = mask[None, :].contiguous()
+        assert len(mask.shape) == 2
 
         _attn_fwd[grid](
             q,
@@ -641,9 +673,6 @@ class _attention(torch.autograd.Function):
         assert q.stride() == o.stride() == do.stride()
         assert k.stride() == v.stride()
 
-        # TODO: stopped here:
-        #  - figure out how to get this working with a rectangular attention matrix
-
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
@@ -666,6 +695,7 @@ class _attention(torch.autograd.Function):
             BATCH, N_HEAD, N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
+
         grid = (N_KV // BLOCK_N1, 1, BATCH * N_HEAD)
         _attn_bwd[grid](
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #

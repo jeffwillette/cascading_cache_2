@@ -685,8 +685,17 @@ def _update_kv_cache_inner(
 
                     old_score = tl.load(CACHE_S + cs_shift)
 
-                    # print("score: ", score.dtype)
-                    # print("old score: ", old_score.dtype)
+                    # beta_exp = 0.0
+                    # for j in range(i + 1):
+                    #     compares = tl.exp2(2 * tl.log2(j.to(tl.float32))) * WINDOW_SIZE
+                    #     beta_exp += compares
+
+                    # beta_exp2 = beta_exp + tl.exp2(2 * tl.log2(i.to(tl.float32) + 1)) / 2
+
+                    # _score = score / (1 - tl.exp2(beta_exp * tl.log2(0.999)))
+                    # _old_score = old_score / (1 - tl.exp2(beta_exp2 * tl.log2(0.999)))
+
+                    # if _score >= _old_score:
                     if score >= old_score:
                         # if idx_n == 0:
                         #     print("overwrite do: ", t)
@@ -1221,7 +1230,7 @@ class CascadingKVCache(Cache):
             raise ValueError(f"unknown cascade func: {self.cascade_func}")
 
         # self.beta = np.exp(-np.log(100) / self.window_length)
-        self.beta = 0.995
+        self.beta = 0.9999
 
         # per layer, not per cascade
         self.stored_tokens = [torch.zeros(B, H, self.cascades[l], device=dev, dtype=torch.long) for l in range(L)]
@@ -1243,7 +1252,7 @@ class CascadingKVCache(Cache):
 
         self.key_cache = [blank.clone().repeat(1, 1, self.max_seq_len[l], 1) for l in range(L)]
         self.value_cache = [blank.clone().repeat(1, 1, self.max_seq_len[l], 1) for l in range(L)]
-        self.score_cache = [blank_scores.clone().repeat(1, 1, self.max_seq_len[l]) for l in range(L)]
+        self.score_cache = [blank_scores.clone().repeat(1, 1, self.max_seq_len[l] - self.num_sink_tokens) for l in range(L)]
         self.sink_keys = [blank_sinks.clone() for _ in range(L)]
         self.sink_values = [blank_sinks.clone() for _ in range(L)]
 
@@ -1255,16 +1264,17 @@ class CascadingKVCache(Cache):
     def get_vals(self, layer_idx: int):
         pos_shift = self.num_sink_tokens if self.seen_tokens_by_layer[layer_idx] > self.num_sink_tokens else 0
 
+        cut = self.num_sink_tokens
         return (
             self.sink_keys[layer_idx],
             self.sink_values[layer_idx],
             self.sink_pos[layer_idx][:1, 0],
             self.sink_mask[layer_idx],
-            self.key_cache[layer_idx],
-            self.value_cache[layer_idx],
-            self.pos[layer_idx][:1, 0] + pos_shift,
-            self.mask[layer_idx],
-            self.og_pos[layer_idx],
+            self.key_cache[layer_idx][:, :, :-cut],
+            self.value_cache[layer_idx][:, :, :-cut],
+            self.pos[layer_idx][:1, 0][:, :-cut] + pos_shift,
+            self.mask[layer_idx][:, :, :-cut],
+            self.og_pos[layer_idx][:, :, :-cut],
         )
 
     def update(
@@ -1504,7 +1514,6 @@ class CascadingKVCacheSlow(nn.Module):
                                      dtype=torch.bool,
                                      requires_grad=False)
 
-        print(f"{self.cascades=} {self.do_cache=}")
         self.do_cache_every_n = torch.tensor(
             [2**i for i in range(self.cascades)],
             dtype=torch.long,
@@ -1811,10 +1820,10 @@ class CascadingKVCacheSlow(nn.Module):
             self.sink_values,
             self.sink_pos,
             self.sink_mask,
-            self.key_cache,
-            self.value_cache,
-            pos,
-            self.mask,
+            self.key_cache[:, :, :-self.num_sink_tokens],
+            self.value_cache[:, :, :-self.num_sink_tokens],
+            pos[:, :-self.num_sink_tokens],
+            self.mask[:, :, :, :-self.num_sink_tokens],
         )
 
 

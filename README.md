@@ -2,9 +2,29 @@
 
 # TODO:
 
-- add more baselines and get final results for experiments
-- re-run all other experiments to get new results with llama3.1 and qwen2
-- note in new paper about beta 0.995
+- LongBench
+    - qwen
+    - llama
+
+- MMLU
+    - qwen
+    - llama
+
+- token selection ablation (PG19)
+    - llama
+
+- latency
+    - compare attention latency of (decode, batch prompt, flash prompt)
+
+- attention matrix plotting.
+
+- longer context benchmarks
+
+- pay digitalocean bill
+- add more baselines
+- note in new paper about beta 0.999
+  - also note about the approximate score of flash attention?
+
 
 ## How to Install
 

@@ -51,6 +51,9 @@ class CascadeAttention(nn.Module):
 
         cascade = isinstance(past_key_value, CascadingKVCache)
         if cascade:
+            force_eager = getattr(past_key_value, "force_eager", False)
+            use_flash = False if force_eager else hidden_states.size(1) > 1
+
             return self.forward_cascade(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -59,7 +62,7 @@ class CascadeAttention(nn.Module):
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
-                use_flash=hidden_states.size(1) >= 64,
+                use_flash=use_flash,
                 position_embeddings=position_embeddings,
                 homogeneous_heads=self.config._homogeneous_heads,
                 do_og_pos=self.config._do_og_pos,
@@ -142,6 +145,7 @@ class CascadeAttention(nn.Module):
                 g_pos = g_pos // 3 + past_key_value.num_sink_tokens
                 n_pos = n_pos - n_pos.amin(dim=-1, keepdim=True) + g_pos.amax(
                     dim=-1, keepdim=True) + 1
+
                 og_pos = torch.cat((n_pos, g_pos), dim=-1)
                 max_pos = torch.cat(
                     (sink_pos.amax().view(1), og_pos.amax().view(1)),
@@ -159,16 +163,29 @@ class CascadeAttention(nn.Module):
 
         query_pos = self.query_pos[:, :query_states.size(-2)] + max_pos
 
-        query_states = self.rope(query_states, query_pos)
-        key_states_pos = self.rope(key_states, query_pos)
-        sink_key_states = self.rope(sink_key_states, sink_pos)
+        cos_q, sin_q, cos_sink, sin_sink, cos_k, sin_k = (None,) * 6
+        if hasattr(past_key_value, "pos_embeddings") and self.layer_idx != 0:
+            cos_q, sin_q, cos_sink, sin_sink, cos_k, sin_k = \
+                (v for _, v in past_key_value.pos_embeddings.items())
+
+        query_states, cos_q, sin_q = self.rope(query_states, query_pos, cos=cos_q, sin=sin_q)
+        key_states_pos, _, _ = self.rope(key_states, query_pos, cos=cos_q, sin=sin_q)
+        sink_key_states, cos_sink, sin_sink = self.rope(sink_key_states, sink_pos, cos=cos_sink, sin=sin_sink)
 
         if do_og_pos:
             b, h, s, d = k_states.size()
-            k_states = self.rope(k_states.view(b * h, 1, s, d), og_pos.view(b * h, -1))
-            k_states = k_states.view(b, h, s, d)
+            k_states, _, _ = self.rope(k_states.view(b * h, 1, s, d), og_pos.view(b * h, -1))
+            k_states, _, _ = k_states.view(b, h, s, d)
         else:
-            k_states = self.rope(k_states, key_pos)
+            k_states, cos_k, sin_k = self.rope(k_states, key_pos, cos=cos_k, sin=sin_k)
+
+        # set the positional embeddings for layer 0 so we don't have to calculate them
+        # for every layer.
+        if self.layer_idx == 0:
+            past_key_value.pos_embeddings = dict(
+                cos_q=cos_q, sin_q=sin_q, cos_sink=cos_sink,
+                sin_sink=sin_sink, cos_k=cos_k, sin_k=sin_k
+            )
 
         key_states_pos = repeat_kv(key_states_pos, self.num_key_value_groups)
         sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
@@ -203,35 +220,16 @@ class CascadeAttention(nn.Module):
         key_mask, first_it, past_key_value,
         scale, q_len, homogeneous_heads
     ):
-        if first_it or self.last_attn_called != "flash" or self.last_q_size != query_states.size(2):
-            self.last_attn_called = "flash"
-            self.last_q_size = query_states.size(2)
-            _causal_mask = torch.full((query_states.size(2), query_states.size(2)), 1,
-                                      device=query_states.device,
-                                      dtype=torch.bool).triu(1)
-
-            _sink_mask = torch.full((query_states.size(2), sink_key_states.size(2)), 1,
-                                    device=query_states.device,
-                                    dtype=torch.bool)
-
-            _cache_mask = torch.full((query_states.size(2), k_states.size(2)), 1,
-                                     device=query_states.device,
-                                     dtype=torch.bool)
-
-            self.causal_mask = torch.cat((_sink_mask, _cache_mask, _causal_mask), dim=-1)
-
+        self.last_attn_called = "flash"
+        self.last_q_size = query_states.size(2)
         n_sink = sink_key_states.size(2)
-        self.causal_mask[:, :n_sink] =\
-            self.causal_mask[:, :n_sink] * sink_mask[0, 0]
 
-        self.causal_mask[:, n_sink:n_sink + k_states.size(2)] = \
-            self.causal_mask[:, n_sink:n_sink + k_states.size(2)] * key_mask[0, 0]
-
+        mask = torch.cat((sink_mask[0, 0], key_mask[0, 0]))
         out, scores = attention(
             query_states,
             torch.cat((sink_key_states, k_states, key_states_pos), dim=2),
             torch.cat((sink_value_states, v_states, repeat_kv(value_states, self.num_key_value_groups)), dim=2),
-            True, scale, self.causal_mask, past_key_value.beta,
+            True, scale, mask, past_key_value.beta,
         )
 
         ema_scores, scores = self.calc_scores(scores[:, :, n_sink:], homogeneous_heads, k_states.size(2), q_len)
@@ -247,20 +245,20 @@ class CascadeAttention(nn.Module):
 
     def calc_scores(self, scores, homogeneous_heads, n_keys, q_len):
         kvh = self.num_key_value_heads
+
+        func = {
+            "mean": torch.mean,
+            "max": torch.amax,
+            "median": lambda x, **kwargs: torch.median(x, **kwargs).values,
+        }[self.config._head_reduction]
+
         if homogeneous_heads:
-            if self.config._head_reduction == "mean":
-                ema_scores = scores[:, :, :n_keys].mean(dim=1, keepdim=True)
-                scores = scores[:, :, -q_len:].mean(dim=1, keepdim=True).repeat(1, kvh, 1)
-            elif self.config._head_reduction == "max":
-                ema_scores = scores[:, :, :n_keys].amax(dim=1, keepdim=True)
-                scores = scores[:, :, -q_len:].amax(dim=1, keepdim=True).repeat(1, kvh, 1)
-            elif self.config._head_reduction == "median":
-                ema_scores = scores[:, :, :n_keys].median(dim=1, keepdim=True).values
-                scores = scores[:, :, -q_len:].median(dim=1, keepdim=True).values.repeat(1, kvh, 1)
+            ema_scores = func(scores[:, :, :n_keys], dim=1, keepdim=True)
+            scores = func(scores[:, :, -q_len:], dim=1, keepdim=True).repeat(1, kvh, 1)
         else:
             b, h, s = scores.size()
-            ema_scores = scores[:, :, :n_keys].view(b, kvh, h // kvh, -1).mean(dim=2)
-            scores = scores[:, :, -q_len:].view(b, kvh, h // kvh, -1).mean(dim=2)
+            ema_scores = func(scores[:, :, :n_keys].view(b, kvh, h // kvh, -1), dim=2)
+            scores = func(scores[:, :, -q_len:].view(b, kvh, h // kvh, -1), dim=2)
 
         return ema_scores, scores
 
@@ -299,13 +297,13 @@ class CascadeAttention(nn.Module):
             self.ema_mask = torch.stack(out).T
 
         qattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), key_states_pos * np.sqrt(scale))
-        qattn = qattn + (self.causal_mask * val).half()
+        qattn = qattn + (self.causal_mask * val).to(qattn.dtype)
 
         sattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), sink_key_states * np.sqrt(scale))
-        sattn = sattn + (val * sink_mask[:1, :1, None, :]).half()
+        sattn = sattn + (val * sink_mask[:1, :1, None, :]).to(qattn.dtype)
 
         cattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), k_states * np.sqrt(scale))
-        cattn = cattn + (val * key_mask[:1, :1, None, :]).half()
+        cattn = cattn + (val * key_mask[:1, :1, None, :]).to(qattn.dtype)
 
         attn = torch.cat((sattn, cattn, qattn), dim=-1)
         attn = attn.softmax(dim=-1)
@@ -320,9 +318,9 @@ class CascadeAttention(nn.Module):
             attn.size(2), device=attn.device).flip(dims=(0, ))
 
         ema_scores = (attn[:, :, :, sk:sk + k] * \
-                      exps[None, None, :, None]).sum(dim=2).half()
+                      exps[None, None, :, None]).sum(dim=2).to(attn.dtype)
 
-        scores = attn[:, :, :, -q_len:] * self.ema_mask[None, None, :].half()
+        scores = attn[:, :, :, -q_len:] * self.ema_mask[None, None, :].to(attn.dtype)
         scores = scores.sum(dim=2)
         scores = torch.cat((ema_scores, scores), dim=-1)
 
@@ -430,23 +428,28 @@ class CascadeAttention(nn.Module):
 
 
 class LlamaCascadeAttention(CascadeAttention, LlamaAttention):
-    def rope(self, x, pos):
-        cos, sin = self.rotary_emb(x, pos)
+    def rope(self, x, pos, cos=None, sin=None):
+        if cos is None or sin is None:
+            cos, sin = self.rotary_emb(x, pos)
+
+        # cos, sin = self.rotary_emb(x, pos)
         out = apply_rotary_pos_emb_one(x, cos, sin)
-        return out
+        return out, cos, sin
 
 
 class Qwen2CascadeAttention(CascadeAttention, Qwen2Attention):
-    def rope(self, x, pos):
+    def rope(self, x, pos, cos=None, sin=None):
         # necessary because Qwen expects a max index and our index could be larger than the size
         # since we do not have the sink token positions in the cascade part of the kv cache
-        cos, sin = self.rotary_emb(x, 32768)
+        if cos is None or sin is None:
+            cos, sin = self.rotary_emb(x, 32768)
 
-        cos = cos[pos.view(-1)].reshape(1, pos.size(1), cos.size(-1))
-        sin = sin[pos.view(-1)].reshape(1, pos.size(1), sin.size(-1))
+        # cos, sin = self.rotary_emb(x, 32768)
+        _cos = cos[pos.view(-1)].reshape(1, pos.size(1), cos.size(-1))
+        _sin = sin[pos.view(-1)].reshape(1, pos.size(1), sin.size(-1))
 
-        out = apply_rotary_pos_emb_one(x, cos, sin)
-        return out
+        out = apply_rotary_pos_emb_one(x, _cos, _sin)
+        return out, cos, sin
 
 
 def _sample_monkeypatch(

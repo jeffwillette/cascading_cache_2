@@ -280,7 +280,6 @@ def exam_mmlu(model, use_cache, past_key_values, tokenizer: transformers.PreTrai
 
             logits = []
             for i in range(0, input_ids.size(1), args.cascade_stride):
-                # print(f"{past_key_values._seen_tokens=}")
                 output = model(
                     input_ids[:, i: i + args.cascade_stride],
                     use_cache=use_cache,
@@ -293,7 +292,20 @@ def exam_mmlu(model, use_cache, past_key_values, tokenizer: transformers.PreTrai
 
             logits = torch.cat(logits, dim=1).to(pred_indices.device)
 
+            preds = logits[:, :-1]
+            targets = input_ids[:, 1:]
+
+            # preds = preds[:, :args.cascade_stride]
+            # targets = targets[:, :args.cascade_stride]
+            ce = torch.nn.functional.cross_entropy(
+                preds.reshape(-1, logits.size(-1)).cuda(),
+                targets.reshape(-1).cuda(),
+            )
+            print(f"ppl: {ce.exp()=}")
+            # exit()
+
             # print(f"{logits.size()=}")
+            # print(f"{pred_indices=}")
             pred_indices = pred_indices.unsqueeze(-1).repeat(
                 1, 1, logits.size(-1))
 
@@ -301,8 +313,20 @@ def exam_mmlu(model, use_cache, past_key_values, tokenizer: transformers.PreTrai
             output = logits.softmax(dim=-1)
 
         else:
+            inputs = {k: v.cuda() for k, v in inputs.items()}
             output = model(**inputs).logits
+
+            preds = output[:, :-1]
+            targets = inputs["input_ids"][:, 1:].cuda()
+            ce = torch.nn.functional.cross_entropy(
+                preds.reshape(-1, preds.size(-1)).cuda(),
+                targets.reshape(-1).cuda(),
+            )
+            print(f"ppl: {ce.exp()=}")
+
             output = torch.softmax(output[:text_len], dim=-1)
+
+    print(f"{output.size()=}")
 
     out_probs = []
     for i in range(output.size(0)):
@@ -311,6 +335,7 @@ def exam_mmlu(model, use_cache, past_key_values, tokenizer: transformers.PreTrai
         prob_c = max([output[i, -1, token].item() for token in tokens_c])
         prob_d = max([output[i, -1, token].item() for token in tokens_d])
         probs = [('A', prob_a), ('B', prob_b), ('C', prob_c), ('D', prob_d)]
+        print(f"{probs=}")
 
         probs = list(sorted(probs, key=lambda x: x[1], reverse=True))
         out_probs.append(probs)
@@ -437,11 +462,7 @@ def evaluate_mmlu(args, model, use_cache, past_key_values, tokenizer, subject_na
                 'accuracy': accuracy,
                 'avg_seq_len': avg_seq_len,
                 'elapsed': elapsed,
-                # 'k': args.k,
                 'model': args.model,
-                # 'block_size_q': args.block_size_q,
-                # 'block_size_k': args.block_size_k,
-                # 'dense_queries': args.dense_queries,
                 'results': results,
             },
             f,
@@ -469,8 +490,8 @@ def job_mmlu(args, model, tokenizer, device):
     for subjects in MMLU_SUBJECTS:
         subject_mean = subject_stats[subjects][0]
 
-        max_seq_len = int(2 ** int(np.log2(subject_mean / 4) // 1))
-        # max_seq_len = min(max_seq_len, 32768)
+        # max_seq_len = int(2 ** math.floor(np.log2(subject_mean)))
+        max_seq_len = args.window
         max_seq_len = min(max_seq_len, 16384)
         print(f"{max_seq_len=} {subjects=}")
         window = max_seq_len // args.cascades

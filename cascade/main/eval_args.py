@@ -37,6 +37,7 @@ def eval_args(
     parser.add_argument('--max_tokens', type=int, default=512)
     parser.add_argument('--window', default=256, type=int)
     parser.add_argument('--chunk', default=32, type=int)
+    parser.add_argument("--use_fp32", action="store_true")
     parser.add_argument('--sinks', default=0, type=int)
     parser.add_argument('--cascades', default=1, type=int)
     parser.add_argument('--local_rank', default=0, type=int)

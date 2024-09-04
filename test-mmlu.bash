@@ -1,22 +1,21 @@
 #!/bin/bash
 
-WINDOW=(2048)
-CASCADES=(4)
-SINKS=(4)
-BATCH_SIZE=10
+WINDOW=(2048 2048)
+CASCADES=(1 1)
+SINKS=(4 4)
+BATCH_SIZE=1
 HEAD_REDUCTION=mean
 CASCADE_FUNC="pow2"
-CASCADE_STRIDE=512
+CASCADE_STRIDE=128
 GPU=4
 # COMMENT="quarter-avg-len-budget"
 COMMENT="quarter-avg-len-budget"
-# MODEL=llama3.1-8b-instruct
-MODEL=qwen2-7b-instruct
+MODEL=llama3.1-8b-instruct
+# MODEL=qwen2-7b-instruct
+# --homogeneous_heads \
 
 for i in "${!WINDOW[@]}";
 do 
-        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port 63290 cascade/main/llama_eval.py \
-        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. deepspeed --include localhost:0,3 --master_port 63290 cascade/main/llama_eval.py \
         PYTHONPATH=. CUDA_VISIBLE_DEVICES=$GPU python cascade/main/llama_eval.py \
         --model $MODEL \
         --job mmlu \

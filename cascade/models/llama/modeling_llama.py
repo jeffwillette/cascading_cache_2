@@ -513,6 +513,7 @@ class LlamaFlashAttention2(LlamaAttention):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
+
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
@@ -560,7 +561,7 @@ class LlamaFlashAttention2(LlamaAttention):
             value_states,
             attention_mask,
             q_len,
-            position_ids=position_ids,
+            # position_ids=position_ids,
             dropout=dropout_rate,
             sliding_window=getattr(self, "sliding_window", None),
             use_top_left_mask=self._flash_attn_uses_top_left_mask,

@@ -36,11 +36,11 @@ def job_ppl_pg19(args, model, tokenizer, device):
             elif "half-book" in args.comment:
                 max_seq_len = int(2 ** int(np.log2(input_ids.size(1) / 2) // 1))
             else:
-                raise ValueError("invalid max_seq_len setting")
-                # max_seq_len = mdl.config._window
+                max_seq_len = mdl.config._window
 
             if "llama" in args.model:
-                max_seq_len = min(max_seq_len, 32768)
+                # max_seq_len = min(max_seq_len, 32768)
+                max_seq_len = min(max_seq_len, 65536)
             elif "qwen" in args.model:
                 max_seq_len = min(max_seq_len, 16384)
 
@@ -95,6 +95,9 @@ def job_ppl_pg19(args, model, tokenizer, device):
                     if j not in stats['ppl-book'].keys():
                         stats['ppl-book'][j] = []
                     stats['ppl-book'][j].append((nll, count, max_seq_len))
+
+        del past_key_values, logits, targets, inputs, output, input_ids, target_ids
+        torch.cuda.empty_cache()
 
     print(f"final ppl: {np.exp(stats['nll-total'] / stats['count-total'])}")
     os.makedirs('./cache/llama_eval/pg19/', exist_ok=True)

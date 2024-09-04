@@ -1,40 +1,62 @@
 #!/bin/bash
 
-WINDOW=(16384)
-CASCADES=(4)
-SINKS=(4)
+WINDOW=16384
+CASCADES=4
+SINKS=4
 BATCH_SIZE=1
-HEAD_REDUCTION=mean
+HEAD_REDUCTION=(mean)
 CASCADE_FUNC="pow2"
-GPUS=(3)
-MODEL=llama3.1-8b
+GPUS=(4)
+MODEL=llama3.1-8b-instruct
+# MODEL=qwen2-7b
+# MODEL=llama3.1-70b
+# MODEL=llama3.1-70b-instruct-gptq-int4
 METHOD=sink
 # COMMENT="different-cache-sizes-65k-4-8k-28"
 # COMMENT="different-cache-sizes-65k-4-16k-28"
 # COMMENT="different-cache-sizes-131k-2-8k-30"
-COMMENT="window-quarter-book"
+# COMMENT="window-quarter-book-score-correct-32768all"
+COMMENT="16384all"
 # COMMENT="window-half-book"
 # COMMENT="plain"
 CASCADE_STRIDE=1024
 
 # MAIN PG19 experiment code
-for i in "${!WINDOW[@]}";
+for i in "${!HEAD_REDUCTION[@]}";
 do 
     PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
         --model $MODEL \
         --job ppl-pg19 \
         --method $METHOD \
-        --window ${WINDOW[$i]} \
-        --sinks ${SINKS[$i]} \
-        --cascades ${CASCADES[$i]} \
+        --window $WINDOW \
+        --sinks $SINKS \
+        --cascades $CASCADES \
         --cascade_func $CASCADE_FUNC \
         --cascade_stride $CASCADE_STRIDE \
-        --head_reduction $HEAD_REDUCTION \
+        --head_reduction ${HEAD_REDUCTION[$i]} \
         --comment $COMMENT \
-        --homogeneous_heads \
-        --batch_size $BATCH_SIZE
+        --batch_size $BATCH_SIZE \
+        --homogeneous_heads
         sleep 1
 done
+
+# for i in "${!WINDOW[@]}";
+# do 
+#     PYTHONPATH=. deepspeed --include localhost:2,3,4,5 --master_port 63290 cascade/main/llama_eval.py \
+#         --model $MODEL \
+#         --job ppl-pg19 \
+#         --method $METHOD \
+#         --window ${WINDOW[$i]} \
+#         --sinks ${SINKS[$i]} \
+#         --cascades ${CASCADES[$i]} \
+#         --cascade_func $CASCADE_FUNC \
+#         --cascade_stride $CASCADE_STRIDE \
+#         --head_reduction $HEAD_REDUCTION \
+#         --comment $COMMENT \
+#         --batch_size $BATCH_SIZE
+#         # --homogeneous_heads
+#         sleep 1
+# done
 
 # WINDOW=(2048)
 # CASCADES=(1)

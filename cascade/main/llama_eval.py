@@ -4,8 +4,8 @@ import transformers
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
-from cascade.models.llama.modeling_llama import LlamaForCausalLM, LlamaConfig
-from cascade.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config
+from cascade.models.llama.modeling_llama import LlamaForCausalLM, LlamaConfig, LlamaDecoderLayer
+from cascade.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config, Qwen2DecoderLayer
 from cascade.utils import seed
 
 # from cascade.main.jobs.bench_single_layer import job_bench_single_layer
@@ -95,13 +95,44 @@ def load_vllm_model(args: ArgsType):
     return model, tokenizer, device
 
 
-def get_dtype(model_name):
+def get_dtype(model_name, use_fp32=False):
+    if use_fp32:
+        return torch.float
+
     if "llama" in model_name.lower():
         return torch.float16
     elif "qwen" in model_name.lower():
         return torch.float16
     else:
         raise ValueError(f"unknown dtype for model: {model_name}")
+
+
+def get_injection_policy(model_id):
+    if "llama" in model_id.lower():
+        return {
+            LlamaDecoderLayer: (
+                'mlp.down_proj',
+                'self_attn.o_proj',
+            )
+        }
+    elif "qwen" in model_id.lower():
+        return {
+            Qwen2DecoderLayer: (
+                'mlp.down_proj',
+                'self_attn.o_proj',
+            ),
+        }
+    else:
+        raise ValueError()
+
+
+def model_hash(model):
+    import hashlib
+    flt = hashlib.shake_256()
+    for name, param in sorted(model.named_parameters(), key=lambda x: x[0]):
+        flt.update(name.encode())
+        flt.update(param.data.view(-1)[:min(16, param.data.numel())].cpu().numpy().tobytes())
+    return flt.hexdigest(16)
 
 
 def load_model(args):
@@ -111,10 +142,11 @@ def load_model(args):
     device = 'cuda:0'
     PATH = "/d1/dataset/llama/models/llama_v3.1/"
     MODELS = {
-        'llama3.1-8b-instruct': os.path.join(PATH, "Meta-Llama-3.1-8B"),
+        'llama3.1-8b-instruct': os.path.join(PATH, "Meta-Llama-3.1-8B-Instruct"),
         'llama3.1-8b': os.path.join(PATH, "Meta-Llama-3.1-8B"),
         'llama3.1-70b': os.path.join(PATH, "Meta-Llama-3.1-70B"),
         'llama3.1-70b-instruct': os.path.join(PATH, "Meta-Llama-3.1-70B-Instruct"),
+        'llama3.1-70b-instruct-gptq-int4': "hugging-quants/Meta-Llama-3.1-70B-Instruct-GPTQ-INT4",
         'llama7b': 'togethercomputer/LLaMA-2-7B-32K',
         'llama13b': 'meta-llama/Llama-2-13b-hf',
         'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
@@ -169,44 +201,97 @@ def load_model(args):
 
     print(f"{config=}")
 
-    if "70B" not in model_id or "70b" not in model_id:
-        args.infer_dtype = get_dtype(model_id)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
+    if "70b" not in model_id.lower():
+        args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
         from_pretrained_kwargs = dict(
             config=config,
             device_map={"": device},
-            # device_map=None,
-            # quantization_config=transformers.BitsAndBytesConfig(
-            #     load_in_4bit=True,
-            #     bnb_4bit_compute_dtype=infer_dtype,
-            #     bnb_4bit_use_double_quant=True,
-            #     bnb_4bit_quant_type="nf4",
-            #     llm_int8_skip_modules=[
-            #         # "input_layernorm",
-            #         # "post_attention_layernorm",
-            #         # "norm",
-            #     ]),
             torch_dtype=args.infer_dtype,
-            trust_remote_code=True,
         )
+        model = get_model(model_id, **from_pretrained_kwargs)
+
     else:
-        args.infer_dtype = get_dtype(model_id)
+        assert "gptq" in model_id.lower()
+        args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
         from_pretrained_kwargs = dict(
             config=config,
-            # device_map={"": device},
-            device_map="auto",
-            # load_in_4bit=True,
-            # device_map=None,
-            quantization_config=transformers.BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=args.infer_dtype,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-            ),
+            device_map={"": device},
             torch_dtype=args.infer_dtype,
-            trust_remote_code=True,
         )
+        model = get_model(model_id, **from_pretrained_kwargs)
 
-    model = get_model(model_id, **from_pretrained_kwargs)
+        # args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
+        # from_pretrained_kwargs = dict(
+        #     config=config,
+        #     device_map={"": device},
+        #     quantization_config=transformers.BitsAndBytesConfig(
+        #         load_in_4bit=True,
+        #         bnb_4bit_compute_dtype=args.infer_dtype,
+        #         bnb_4bit_use_double_quant=True,
+        #         bnb_4bit_quant_type="fp4",
+        #         llm_int8_skip_modules=[
+        #             "input_layernorm",
+        #             "post_attention_layernorm",
+        #             "norm",
+        #             "lm_head",
+        #         ]
+        #     ),
+        #     torch_dtype=args.infer_dtype,
+        # )
+        # model = get_model(model_id, **from_pretrained_kwargs)
+
+        # import deepspeed
+        # args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
+        # from_pretrained_kwargs = dict(
+        #     config=config,
+        #     device_map="cpu",
+        #     quantization_config=transformers.BitsAndBytesConfig(
+        #         load_in_8bit=True,
+        #         bnb_8bit_compute_dtype=args.infer_dtype,
+        #         llm_int8_skip_modules=[
+        #             "input_layernorm",
+        #             "post_attention_layernorm",
+        #             "norm",
+        #         ]
+        #     ),
+        #     torch_dtype=args.infer_dtype,
+        #     trust_remote_code=True,
+        # )
+        # model = get_model(model_id, **from_pretrained_kwargs)
+
+        # model = deepspeed.init_inference(
+        #     model,
+        #     tensor_parallel={"tp_size": args.world_size},
+        #     replace_with_kernel_inject=False,
+        #     dtype=torch.int8,
+        #     injection_policy=get_injection_policy(args.model),
+        # )
+
+        # args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
+        # from_pretrained_kwargs = dict(
+        #     config=config,
+        #     device_map={"": "cpu"},
+        #     quantization_config=transformers.GPTQConfig(
+        #         bits=4,
+        #         tokenizer=tokenizer,
+        #         dataset="wikitext2",
+        #     ),
+        #     torch_dtype=args.infer_dtype,
+        #     trust_remote_code=True,
+        # )
+
+        # assert "awq" in model_id.lower()
+        # args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
+        # from_pretrained_kwargs = dict(
+        #     config=config,
+        #     device_map={"": device},
+        #     quantization_config=transformers.AwqConfig(bits=4, do_fuse=False),
+        #     torch_dtype=args.infer_dtype,
+        #     trust_remote_code=True,
+        # )
+        # model = get_model(model_id, **from_pretrained_kwargs)
+
     if args.method == "hyper":
         raise NotImplementedError("need to figure out how to run hyper again with new workflow")
         # model = get_model(model_id, **from_pretrained_kwargs)
@@ -250,7 +335,6 @@ def load_model(args):
         print('load result', result)
         print('lora checkpoint loaded from', args.checkpoint)
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
     return model, tokenizer, device
 
 
