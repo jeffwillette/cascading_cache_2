@@ -7,7 +7,6 @@ import os
 import json
 import torch
 import tqdm
-from torch.utils.data import Dataset
 import transformers
 
 
@@ -18,13 +17,16 @@ class BookSumDataset:
         tokenizer: transformers.PreTrainedTokenizer,
         json_path='./cache/long_data_collection/booksum.jsonl',
         max_seq_len=32768,
+        truncation=True,
         for_eval=False,
         need_tokenization=False,
     ):
+
         with open(json_path, 'r') as f:
             lines = f.readlines()
 
         self.max_seq_len = max_seq_len
+        self.truncation = truncation
 
         self.data = []
         for line in lines:
@@ -39,7 +41,7 @@ class BookSumDataset:
 
             self.processed = []
             os.makedirs('./cache/long_data_collection', exist_ok=True)
-            cache_path = './cache/long_data_collection/booksum.pth'
+            cache_path = f'./cache/long_data_collection/{tokenizer.name_or_path.split("/")[-1]}-booksum.pth'
             if not os.path.exists(cache_path):
                 with tqdm.tqdm(self.data,
                                desc='tokenizing',
@@ -111,8 +113,16 @@ class BookSumDataset:
 
 if __name__ == '__main__':
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        'togethercomputer/LLaMA-2-7B-32K')
-    ds = BookSumDataset(tokenizer, need_tokenization=True, for_eval=True)
+        "/d1/dataset/llama/models/llama_v3.1/Meta-Llama-3.1-8B-Instruct"
+    )
+    ds = BookSumDataset(
+        tokenizer,
+        max_seq_len=None,
+        truncation=False,
+        need_tokenization=True,
+        for_eval=True
+    )
+
     total_tokens, completions = 0, 0
     for idx in tqdm.tqdm(range(len(ds))):
         prompt, completion = ds[idx]
@@ -122,5 +132,4 @@ if __name__ == '__main__':
         completions += compl_length
 
         print(f"{idx=} {token_length=} {compl_length=}")
-        assert token_length <= 32768, token_length
     print(f"{total_tokens=} {completions=}")

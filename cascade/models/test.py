@@ -10,6 +10,8 @@ import torch
 import time
 from cascade.models.cascade_attention import sample_monkeypatch
 from cascade.models.flash_attention import attention
+from cascade.main.llama_eval import MODELS
+import transformers
 
 
 def get_cache(model):
@@ -31,6 +33,20 @@ def get_cache(model):
         layers=len(mdl.layers),
         eager_fill=False,
     )
+
+
+class TestTokenizer(unittest.TestCase):
+    def test_tokenizer_chat_prompts(self):
+        messages = [
+            {"role": "system", "content": "You are a helpful chat bot."},
+            {"role": "user", "content": "Who are you?"},
+        ]
+        for model in ["llama3.1-8b-instruct", "qwen2-7b-instruct"]:
+            model_id = MODELS[model]
+            tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
+            out = tokenizer.apply_chat_template(messages, tokenize=True)
+            print(out)
+            self.assertIsNotNone(out)
 
 
 class TestCascadeAttention(unittest.TestCase):
@@ -154,6 +170,7 @@ class TestFlashAttention(unittest.TestCase):
 
     def test_flash_attention_fwd_bwd(self):
         def test_op_with_backward(Z, H, N_CTX, N_KV, HEAD_DIM, causal, dtype=torch.float16):
+            print(f"{Z=} {H=} {N_CTX=} {N_KV=}")
             torch.manual_seed(20)
             q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
             k = (torch.empty((Z, H, N_KV, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
@@ -236,6 +253,9 @@ class TestFlashAttention(unittest.TestCase):
             (1, 2, 1024, 16384 + 1024, 64),
             (1, 2, 1024, 16384 + 1024, 64),
             (2, 32, 1024, 16384 + 1024, 128),
+            (1, 2, 512, 2560, 64),
+            (1, 2, 500, 2048 + 500, 64),
+
         ):
             test_op_with_backward(Z, H, N_CTX, N_KV, HEAD_DIM, True)
 

@@ -1,15 +1,15 @@
 #!/bin/bash
 
 WINDOW=(2048 2048)
-CASCADES=(1 1)
+CASCADES=(4 1)
 SINKS=(4 4)
-BATCH_SIZE=1
-HEAD_REDUCTION=mean
+BATCH_SIZE=5
+HEAD_REDUCTION=max
 CASCADE_FUNC="pow2"
 CASCADE_STRIDE=128
 GPU=4
 # COMMENT="quarter-avg-len-budget"
-COMMENT="quarter-avg-len-budget"
+COMMENT="half-ctx"
 MODEL=llama3.1-8b-instruct
 # MODEL=qwen2-7b-instruct
 # --homogeneous_heads \
@@ -28,7 +28,6 @@ do
         --head_reduction $HEAD_REDUCTION \
         --comment $COMMENT \
         --batch_size $BATCH_SIZE \
-        --homogeneous_heads \
         --cascade_stride $CASCADE_STRIDE
         sleep 1
 done

@@ -540,7 +540,8 @@ class _attention(torch.autograd.Function):
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         assert k.size(2) == v.size(2)
-        N_KV = k.size(2)
+        N_KV = k.size(2)  # constant
+        n_kv = N_KV       # variable
 
         # pad the key values because the BLOCK_N is always expecting some multiple of BLOCK_N
         # we will have to mask out the unwanted values in the attention_inner
@@ -554,6 +555,7 @@ class _attention(torch.autograd.Function):
             v = torch.cat(
                 (v, torch.zeros(b, h, n, d, device=v.device, dtype=v.dtype)),
                 dim=2)
+            n_kv += n
 
             # mask will be taken care of by trating the leading edge of the
             # attention matrix as the causal portion
@@ -570,11 +572,6 @@ class _attention(torch.autograd.Function):
         if q.size(2) % 64 != 0:
             n = 64 - (q.size(2) % 64)
             q = torch.cat((q, torch.zeros(b, h, n, d, dtype=q.dtype, device=q.device)), dim=2)
-            # mask = torch.cat(
-            #     (mask,
-            #      torch.ones(
-            #          n, mask.size(1), dtype=mask.dtype, device=mask.device)),
-            #     dim=0)
 
         o = torch.empty_like(q)
         stage = 3 if causal else 1
@@ -593,12 +590,6 @@ class _attention(torch.autograd.Function):
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]),
                         device=q.device,
                         dtype=torch.float32)
-
-        # scores = torch.zeros(q.size(0),
-        #                      q.size(1),
-        #                      N_KV,
-        #                      device=q.device,
-        #                      dtype=q.dtype)
 
         # print(f"{q.size()=} {k.size()=} {v.size()=} {sm_scale=} {M.size()=} {o.size()=}")
         # print(f"{mask.size()=} {scores.size()=} {q.stride()=} {k.stride()=} {v.stride()=}")
@@ -640,7 +631,7 @@ class _attention(torch.autograd.Function):
             q.shape[0],
             q.shape[1],  #
             N_CTX=q.shape[2],  #
-            N_KV=N_KV,
+            N_KV=n_kv,
             beta=beta,
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
@@ -669,6 +660,11 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do, d_scores):
         q, k, v, o, M, mask = ctx.saved_tensors
+        if do.size() != q.size():
+            n = q.size(2) - do.size(2)
+            b, h, _, d = q.size()
+            do = torch.cat((do, torch.zeros(b, h, n, d, device=do.device, dtype=do.dtype)), dim=-2)
+
         assert do.is_contiguous()
         assert q.stride() == o.stride() == do.stride()
         assert k.stride() == v.stride()

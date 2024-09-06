@@ -26,18 +26,6 @@ def job_ppl_pg19(args, model, tokenizer, device):
         if args.method == "sink":
             use_cache = True
 
-            # max_seq_len = [65536] * 4 + [8192] * 28
-            # max_seq_len = [65536] * 4 + [16384] * 28
-            # max_seq_len = [131072] * 2 + [8192] * 30
-            # window = [m // args.cascades for m in max_seq_len]
-
-            if "quarter-book" in args.comment:
-                max_seq_len = int(2 ** int(np.log2(input_ids.size(1) / 4) // 1))
-            elif "half-book" in args.comment:
-                max_seq_len = int(2 ** int(np.log2(input_ids.size(1) / 2) // 1))
-            else:
-                max_seq_len = mdl.config._window
-
             if "llama" in args.model:
                 # max_seq_len = min(max_seq_len, 32768)
                 max_seq_len = min(max_seq_len, 65536)

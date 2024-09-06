@@ -1262,7 +1262,13 @@ class CascadingKVCache(Cache):
         self.sink_mask = [v.fill_(True) for v in self.sink_mask]
 
     def get_vals(self, layer_idx: int):
-        pos_shift = self.num_sink_tokens if self.seen_tokens_by_layer[layer_idx] > self.num_sink_tokens else 0
+        # in order to not have an weird sized total cache (like 2048 + 4), we cut off the oldest num_sink_tokens
+        # from the end of the cache. In the case that the cache is full, we need to then downshift all positions
+        # by the number of sink tokens
+        do_shift_pos = self.seen_tokens_by_layer[layer_idx] > self.num_sink_tokens and \
+            self.seen_tokens_by_layer[layer_idx] <= self.max_seq_len[layer_idx] + self.num_sink_tokens
+
+        pos_shift = self.num_sink_tokens if do_shift_pos else 0
 
         cut = self.num_sink_tokens
         return (

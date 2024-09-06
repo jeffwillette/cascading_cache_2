@@ -6,6 +6,7 @@ from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
 from cascade.models.llama.modeling_llama import LlamaForCausalLM, LlamaConfig, LlamaDecoderLayer
 from cascade.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config, Qwen2DecoderLayer
+from cascade.models.cascade_attention import sample_monkeypatch
 from cascade.utils import seed
 
 # from cascade.main.jobs.bench_single_layer import job_bench_single_layer
@@ -15,6 +16,7 @@ from cascade.main.jobs.ppl_memory import job_ppl_memory
 from cascade.main.jobs.ppl import job_ppl
 from cascade.main.jobs.profile import job_profile
 from cascade.main.jobs.pg19 import job_ppl_pg19
+from cascade.main.jobs.booksum import job_booksum
 # from cascade.main.jobs.stream import job_stream
 from cascade.main.jobs.mmlu import job_mmlu
 from cascade.main.eval_args import eval_args, ArgsType
@@ -36,7 +38,8 @@ def get_model(model_id, **from_pretrained_kwargs):
     key_idx = [1 if k in model_id.lower() else 0 for k in keys].index(1)
     key = keys[key_idx]
 
-    return MODEL_GETTERS[key].from_pretrained(model_id, **from_pretrained_kwargs)
+    model = MODEL_GETTERS[key].from_pretrained(model_id, **from_pretrained_kwargs)
+    return model
 
 
 def get_config(model_id):
@@ -135,39 +138,41 @@ def model_hash(model):
     return flt.hexdigest(16)
 
 
+PATH = "/d1/dataset/llama/models/llama_v3.1/"
+MODELS = {
+    'llama3.1-8b-instruct': os.path.join(PATH, "Meta-Llama-3.1-8B-Instruct"),
+    'llama3.1-8b': os.path.join(PATH, "Meta-Llama-3.1-8B"),
+    'llama3.1-70b': os.path.join(PATH, "Meta-Llama-3.1-70B"),
+    'llama3.1-70b-instruct': os.path.join(PATH, "Meta-Llama-3.1-70B-Instruct"),
+    'llama3.1-70b-instruct-gptq-int4': "hugging-quants/Meta-Llama-3.1-70B-Instruct-GPTQ-INT4",
+    'llama7b': 'togethercomputer/LLaMA-2-7B-32K',
+    'llama13b': 'meta-llama/Llama-2-13b-hf',
+    'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
+    'llama7b-chat': '/d1/dataset/llama/models/llama_v2/llama-2-7b-chat-hf',
+    "llama2-7b-chat-32k": "togethercomputer/Llama-2-7B-32K-Instruct",
+    'qwen14b': 'Qwen/Qwen1.5-14B',
+    'qwen7b': 'Qwen/Qwen1.5-7B',
+    'qwen7b-chat': 'Qwen/Qwen1.5-7B-Chat',
+    "qwen2-14b-chat-32k": "Qwen/Qwen1.5-14B-Chat",
+    "qwen2-7b-chat-32k": "Qwen/Qwen1.5-7B-Chat",
+    "qwen2-7b-instruct": "Qwen/Qwen2-7B-Instruct",
+    "qwen2-7b": "Qwen/Qwen2-7B",
+    'qwen0.5b': 'Qwen/Qwen1.5-0.5B',
+    'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B',
+    'llama3-8b-instruct':
+    "/d1/dataset/llama/models/llama_v3/Meta-Llama-3-8B-Instruct",
+    'llama3-8b': 'meta-llama/Meta-Llama-3-8B',
+    'llama3-70b-instruct':
+    "/d1/dataset/llama/models/llama_v3/Meta-Llama-3-70B-Instruct",
+    'llama2-70b': "/d1/dataset/llama/models/llama_v2/llama-2-70b",
+}
+
+
 def load_model(args):
     if args.model.startswith('vllm'):
         return load_vllm_model(args)
 
     device = 'cuda:0'
-    PATH = "/d1/dataset/llama/models/llama_v3.1/"
-    MODELS = {
-        'llama3.1-8b-instruct': os.path.join(PATH, "Meta-Llama-3.1-8B-Instruct"),
-        'llama3.1-8b': os.path.join(PATH, "Meta-Llama-3.1-8B"),
-        'llama3.1-70b': os.path.join(PATH, "Meta-Llama-3.1-70B"),
-        'llama3.1-70b-instruct': os.path.join(PATH, "Meta-Llama-3.1-70B-Instruct"),
-        'llama3.1-70b-instruct-gptq-int4': "hugging-quants/Meta-Llama-3.1-70B-Instruct-GPTQ-INT4",
-        'llama7b': 'togethercomputer/LLaMA-2-7B-32K',
-        'llama13b': 'meta-llama/Llama-2-13b-hf',
-        'llama13b_32k': 'Yukang/Llama-2-13b-longlora-32k-ft',
-        'llama7b-chat': '/d1/dataset/llama/models/llama_v2/llama-2-7b-chat-hf',
-        "llama2-7b-chat-32k": "togethercomputer/Llama-2-7B-32K-Instruct",
-        'qwen14b': 'Qwen/Qwen1.5-14B',
-        'qwen7b': 'Qwen/Qwen1.5-7B',
-        'qwen7b-chat': 'Qwen/Qwen1.5-7B-Chat',
-        "qwen2-14b-chat-32k": "Qwen/Qwen1.5-14B-Chat",
-        "qwen2-7b-chat-32k": "Qwen/Qwen1.5-7B-Chat",
-        "qwen2-7b-instruct": "Qwen/Qwen2-7B-Instruct",
-        "qwen2-7b": "Qwen/Qwen2-7B",
-        'qwen0.5b': 'Qwen/Qwen1.5-0.5B',
-        'llama1.3b': 'princeton-nlp/Sheared-LLaMA-1.3B',
-        'llama3-8b-instruct':
-        "/d1/dataset/llama/models/llama_v3/Meta-Llama-3-8B-Instruct",
-        'llama3-8b': 'meta-llama/Meta-Llama-3-8B',
-        'llama3-70b-instruct':
-        "/d1/dataset/llama/models/llama_v3/Meta-Llama-3-70B-Instruct",
-        'llama2-70b': "/d1/dataset/llama/models/llama_v2/llama-2-70b",
-    }
 
     assert args.model in MODELS, MODELS.keys()
     model_id = MODELS[args.model]
@@ -292,6 +297,9 @@ def load_model(args):
         # )
         # model = get_model(model_id, **from_pretrained_kwargs)
 
+    if args.method == "sink":
+        model = sample_monkeypatch(model)
+
     if args.method == "hyper":
         raise NotImplementedError("need to figure out how to run hyper again with new workflow")
         # model = get_model(model_id, **from_pretrained_kwargs)
@@ -345,7 +353,7 @@ def main():
 
     assert args.job in [
         'ppl', 'ppl-pg19', 'ppl-memory', 'stream', 'mmlu',
-        'bench_single_layer', 'passkey', 'profile', "latency"
+        'bench_single_layer', 'passkey', 'profile', "latency", "booksum",
     ]
 
     model, tokenizer, device = load_model(args)
@@ -362,6 +370,8 @@ def main():
         job_ppl_pg19(args, model, tokenizer, device)
     elif args.job == 'profile':
         job_profile(args, model, tokenizer, device)
+    elif args.job == 'booksum':
+        job_booksum(args, model, tokenizer, device)
     elif args.job == 'stream':
         raise NotImplementedError(
             "implementation needs to be updated to current")
