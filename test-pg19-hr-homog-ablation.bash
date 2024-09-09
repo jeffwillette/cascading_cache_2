@@ -1,30 +1,39 @@
 #!/bin/bash
 
+model=invalid-model-name
+method=sink
+while getopts m:d:g: flag
+do
+    case "${flag}" in
+        m) model=${OPTARG};;
+        d) method=${OPTARG};;
+        g) gpu=${OPTARG};;
+    esac
+done
+
+GPU=$gpu
+MODEL=$model
+METHOD=$method
+HOMOGENEOUS_HEADS=("" "" "" "--homogeneous_heads" "--homogeneous_heads" "--homogeneous_heads")
+HEAD_REDUCTION=(mean median max mean median max)
+
+if [ "$METHOD" = "vanilla" ]; then
+    HOMOGENEOUS_HEADS=""
+    HEAD_REDUCTION=(mean)
+fi
+
 WINDOW=16384
 CASCADES=4
 SINKS=4
 BATCH_SIZE=1
-HEAD_REDUCTION=(mean)
 CASCADE_FUNC="pow2"
-GPUS=(4)
-MODEL=llama3.1-8b-instruct
-# MODEL=qwen2-7b
-# MODEL=llama3.1-70b
-# MODEL=llama3.1-70b-instruct-gptq-int4
-METHOD=sink
-# COMMENT="different-cache-sizes-65k-4-8k-28"
-# COMMENT="different-cache-sizes-65k-4-16k-28"
-# COMMENT="different-cache-sizes-131k-2-8k-30"
-# COMMENT="window-quarter-book-score-correct-32768all"
-COMMENT="16384all"
-# COMMENT="window-half-book"
-# COMMENT="plain"
+COMMENT="none"
 CASCADE_STRIDE=1024
 
 # MAIN PG19 experiment code
 for i in "${!HEAD_REDUCTION[@]}";
 do 
-    PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
+    PYTHONPATH=. CUDA_VISIBLE_DEVICES=$GPU python cascade/main/llama_eval.py \
         --model $MODEL \
         --job ppl-pg19 \
         --method $METHOD \
@@ -35,8 +44,8 @@ do
         --cascade_stride $CASCADE_STRIDE \
         --head_reduction ${HEAD_REDUCTION[$i]} \
         --comment $COMMENT \
-        --batch_size $BATCH_SIZE \
-        --homogeneous_heads
+        ${HOMOGENEOUS_HEADS[$i]} \
+        --batch_size $BATCH_SIZE
         sleep 1
 done
 

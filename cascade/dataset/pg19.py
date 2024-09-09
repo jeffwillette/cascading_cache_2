@@ -123,28 +123,24 @@ class PG19Streaming(Dataset):
 
 if __name__ == '__main__':
     import transformers
-    print("Llama")
+    import json
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        'togethercomputer/LLaMA-2-7B-32K')
+        '/d1/dataset/llama/models/llama_v3.1/Meta-Llama-3.1-8B/')
+
     ds = PG19Streaming(tokenizer)
 
-    print(f"{len(ds)=}")
+    stats = {
+        8192: {"index": [], "token_count": 0},
+        16384: {"index": [], "token_count": 0},
+        32768: {"index": [], "token_count": 0},
+        65536: {"index": [], "token_count": 0}
+    }
     for i, (x, y) in enumerate(ds):
-        print(f"{i} {x.size()=} {y.size()=}")
+        for l in [8192, 16384, 32768, 65536]:
+            if x.size(1) > l:
+                stats[l]["index"].append(i)
+                stats[l]["token_count"] += x.size(1)
 
-    print("Qwen")
-    tokenizer = transformers.AutoTokenizer.from_pretrained('Qwen/Qwen1.5-7B')
-    ds = PG19Streaming(tokenizer)
-
-    print("Qwen14b")
-    tokenizer = transformers.AutoTokenizer.from_pretrained('Qwen/Qwen1.5-14B')
-    ds = PG19Streaming(tokenizer)
-
-    print("Llama3")
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        'meta-llama/Meta-Llama-3-8B')
-    ds = PG19Streaming(tokenizer)
-
-    # print(f"{len(ds)=}")
-    # for i, (x, y) in enumerate(ds):
-    #     print(f"{i} {x.size()=} {y.size()=}")
+    print(stats)
+    with open("cache/pg19/stats.json", "w") as fl:
+        json.dump(stats, fl)

@@ -1043,6 +1043,7 @@ class CascadingKVCache(Cache):
         head_reduction: str = "mean",
         layers: int = 32,
         eager_fill: bool = True,
+        verbose: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1055,6 +1056,7 @@ class CascadingKVCache(Cache):
         if isinstance(window_length, int):
             window_length = [window_length for _ in range(layers)]
 
+        self.verbose = verbose
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.heads = heads
@@ -1186,7 +1188,8 @@ class CascadingKVCache(Cache):
         L, B, H, D = self.layers, self.max_batch_size, self.heads, self.dim
         nsink, dev, dtp = self.num_sink_tokens, device, self.dtype
 
-        print(f"INIT CLEAN TRITON CACHE {self.cascade_func=}")
+        if self.verbose:
+            print(f"INIT CLEAN TRITON CACHE {self.cascade_func=}")
 
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
         # for tracking real token idx in triton.
@@ -1495,6 +1498,7 @@ class CascadingKVCacheSlow(nn.Module):
         max_seq_len: int = 32,
         device: torch.device = "cpu",
         dtype: torch.dtype = torch.float16,
+        verbose: bool = True,
     ) -> None:
         super().__init__()
         self.max_seq_len = max_seq_len
@@ -1504,6 +1508,7 @@ class CascadingKVCacheSlow(nn.Module):
         self.n_layers = n_layers
         self.device = device
         self.dtype = dtype
+        self.verbose = verbose
 
         self.key_cache: torch.Tensor
         self.score_cache: torch.Tensor
@@ -1568,7 +1573,7 @@ class CascadingKVCacheSlow(nn.Module):
                                     dtype=torch.long,
                                     requires_grad=False).view(1, -1)
 
-        self.init_cache()
+        self.init_cache(verbose=verbose)
 
     def init_cache(self):
         B, H, S, D = self.max_batch_size, self.heads, self.max_seq_len, self.dim

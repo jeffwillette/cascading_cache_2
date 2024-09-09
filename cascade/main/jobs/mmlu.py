@@ -13,9 +13,7 @@ import numpy as np
 from cascade.utils import seed
 # from cascade.main.jobs.pg19 import get_injection_policy
 
-MMLU_FORMAT = """> The following are multiple choice questions (with answers) about {subject_name}.
-
-{number}. {question}
+MMLU_FORMAT = """{number}. {question}
 
 A. {choice_a}
 B. {choice_b}
@@ -24,7 +22,7 @@ D. {choice_d}
 
 Answer:"""
 
-MMLU_FORMAT_TARGET_QUESTION = """> I want you to answer the following multiple choice question about {subject_name}.
+MMLU_FORMAT_TARGET_QUESTION = """I want you to answer the following multiple choice question about {subject_name}.
 
 {number}. {question}
 
@@ -34,98 +32,6 @@ C. {choice_c}
 D. {choice_d}
 
 Answer:{answer_placeholder}"""
-
-MMLU_REVERSED = """I want you to answer a question, but first I will show you some examples of similar questions. The question I am interested in is:
-
-{original_question}
-
-The examples of similar questions are:
-
-{examples}
-
-I want to know the answer to question 1. The answer ({answer_placeholder}) to the question I am interested in is:"""
-
-# MMLU_STEM = [
-#     'abstract_algebra',
-#     'anatomy',
-#     'astronomy',
-#     'college_biology',
-#     'college_chemistry',
-#     'college_computer_science',
-#     'college_mathematics',
-#     'college_physics',
-#     'computer_security',
-#     'conceptual_physics',
-#     'electrical_engineering',
-#     'elementary_mathematics',
-#     'high_school_biology',
-#     'high_school_chemistry',
-#     'high_school_computer_science',
-#     'high_school_mathematics',
-#     'high_school_physics',
-#     'high_school_statistics',
-#     'machine_learning',
-# ]
-
-MMLU_SUBJECTS_SORTED = [
-    'management',
-    'global_facts',
-    'abstract_algebra',
-    'human_sexuality',
-    'medical_genetics',
-    'us_foreign_policy',
-    'college_chemistry',
-    'miscellaneous',
-    'conceptual_physics',
-    'world_religions',
-    'jurisprudence',
-    'human_aging',
-    'anatomy',
-    'business_ethics',
-    'public_relations',
-    'high_school_geography',
-    'college_physics',
-    'college_mathematics',
-    'electrical_engineering',
-    'machine_learning',
-    'computer_security',
-    'philosophy',
-    'clinical_knowledge',
-    'high_school_computer_science',
-    'marketing',
-    'logical_fallacies',
-    'nutrition',
-    'high_school_microeconomics',
-    'college_biology',
-    'high_school_macroeconomics',
-    'sociology',
-    'moral_disputes',
-    'econometrics',
-    'prehistory',
-    'astronomy',
-    'college_computer_science',
-    'high_school_mathematics',
-    'virology',
-    'high_school_government_and_politics',
-    'high_school_psychology',
-    'international_law',
-    'elementary_mathematics',
-    'high_school_biology',
-    'college_medicine',
-    'formal_logic',
-    'high_school_chemistry',
-    'high_school_physics',
-    'professional_psychology',
-    'moral_scenarios',
-    'professional_accounting',
-    'high_school_statistics',
-    'security_studies',
-    'professional_medicine',
-    'professional_law',
-    'high_school_world_history',
-    'high_school_us_history',
-    'high_school_european_history',
-]
 
 MMLU_SUBJECTS = [
     'business_ethics',
@@ -224,7 +130,7 @@ def format_mmlu(question,
     )
 
 
-def exam_mmlu(model, use_cache, past_key_values, tokenizer: transformers.PreTrainedTokenizer, texts, args):
+def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args):
 
     def gather_token_ids(candidates):
         ids = []
@@ -250,25 +156,45 @@ def exam_mmlu(model, use_cache, past_key_values, tokenizer: transformers.PreTrai
     if text_len < args.batch_size:
         texts += ["null text"] * (args.batch_size - text_len)
 
-    is_sink = isinstance(past_key_values, CascadingKVCache)
-
     inputs = tokenizer(
         texts,
         return_tensors='pt',
         max_length=model.config.max_position_embeddings,
-        truncation=False if is_sink else True,
+        truncation=False if args.method == "sink" else True,
         padding=True,
     )
 
-    # print(inputs.input_ids.shape)
+    use_cache, past_key_values = False, None
+    if args.method == "sink":
+        # max_seq_len = int(2 ** math.floor(np.log2(inputs.input_ids.size(1) / 2)))
+        # max_seq_len = min(max_seq_len, 16384)
+        max_seq_len = args.window
+        window = max_seq_len // args.cascades
+        mdl = model.model
+
+        use_cache = True
+        past_key_values = CascadingKVCache(
+            window,
+            num_sink_tokens=mdl.config._sinks,
+            max_batch_size=mdl.config._batch_size,
+            heads=mdl.config.num_key_value_heads // args.world_size,
+            dim=mdl.config.hidden_size // mdl.config.num_attention_heads,
+            max_seq_len=max_seq_len,
+            dtype=torch.float16,
+            device=mdl.embed_tokens.weight.device,
+            cascade_func=mdl.config._cascade_func,
+            head_reduction=mdl.config._head_reduction,
+            layers=len(mdl.layers),
+            verbose=False,
+        )
+
     # inputs["input_ids"] = inputs["input_ids"][:, :50]
     # inputs["attention_mask"] = inputs["attention_mask"][:, :50]
 
     seq_lens = inputs.attention_mask[:text_len].sum(dim=-1).tolist()
 
-    torch.set_printoptions(profile="full")
     with torch.no_grad():
-        if is_sink:
+        if args.method == "sink":
             past_key_values.reset(verbose=False)
             input_ids = inputs["input_ids"].cuda()
 
@@ -331,26 +257,6 @@ def get_fewshots(dataset, subject_name, shift=1):
     return few_shots
 
 
-def format_mmlu_reversed(question, subject_name, few_shots):
-    original_question = format_mmlu(
-        question,
-        1,
-        subject_name,
-        target_question=True,
-        answer_placeholder="<|YOUR ANSWER|>",
-    )
-
-    examples = "\n\n".join(few_shots)
-    truth = question['target']
-
-    text = MMLU_REVERSED.format(
-        original_question=original_question,
-        examples=examples,
-        answer_placeholder="<|YOUR ANSWER|>",
-    )
-    return text, truth
-
-
 def format_mmlu_plain(question, subject_name, few_shots):
     text = format_mmlu(
         question,
@@ -359,26 +265,28 @@ def format_mmlu_plain(question, subject_name, few_shots):
         target_question=True,
         answer_placeholder="",
     )
+
+    questions = "\n\n".join(few_shots)
+    text = "You are a helpful chat bot that answers multiple choice test " + \
+        "questions. The following are examples of multiple choice test questions " + \
+        f"about {subject_name}:\n\n{questions}\n\n" + \
+        text
+
     truth = question['target']
-    text = "\n\n".join(few_shots + [text,])
     return text, truth
 
 
-def evaluate_mmlu(args, model, use_cache, past_key_values, tokenizer, subject_name, reverse=False):
+def evaluate_mmlu(args, model, tokenizer, subject_name):
     dataset = load_dataset('lukaemon/mmlu', subject_name, trust_remote_code=True)
 
-    few_shots = get_fewshots(dataset, subject_name, shift=2 if reverse else 1)
+    few_shots = get_fewshots(dataset, subject_name, shift=1)
 
     t_start = time.time()
     results = []
     n_correct = 0
     seq_len_sum = 0
 
-    qanda = [
-        format_mmlu_reversed(question, subject_name, few_shots)
-        if reverse else format_mmlu_plain(question, subject_name, few_shots)
-        for question in dataset["test"]
-    ]
+    qanda = [format_mmlu_plain(question, subject_name, few_shots) for question in dataset["test"]]
 
     print("total len of questions and answers: ", len(qanda))
     n = math.ceil(len(qanda) / args.batch_size)
@@ -391,8 +299,7 @@ def evaluate_mmlu(args, model, use_cache, past_key_values, tokenizer, subject_na
             texts = [v[0] for v in input_slice]
             truths = [v[1] for v in input_slice]
 
-            batch_estimations, seq_lens = exam_mmlu(model, use_cache, past_key_values, tokenizer, texts,
-                                                    args)
+            batch_estimations, seq_lens = exam_mmlu(model, tokenizer, texts, args)
             # print(f"{truths=} {batch_estimations=}")
 
             for estimations, truth, seq_len in zip(batch_estimations, truths,
@@ -422,11 +329,11 @@ def evaluate_mmlu(args, model, use_cache, past_key_values, tokenizer, subject_na
     print(f'{subject_name} = Accuracy: {accuracy:.4f} %, avg_seq_len: {avg_seq_len:.2f}. elapsed: {elapsed:.1f} s')
 
     os.makedirs('./saves/llama_eval/mmlu/', exist_ok=True)
-    json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}_reverse_{reverse}.json'
+    json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}.json'
     if args.method == 'sink':
         json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}_window_{args.window}_' + \
             f'head_reduction_{args.head_reduction}_cascade_{args.cascades}_sinks_{args.sinks}_' + \
-            f'homogeneous_heads_{args.homogeneous_heads}_cascade_stride_{args.cascade_stride}_comment_{args.comment}_reverse_{reverse}.json'
+            f'homogeneous_heads_{args.homogeneous_heads}_cascade_stride_{args.cascade_stride}_comment_{args.comment}.json'
 
     with open(json_path, 'w') as f:
         json.dump(
@@ -452,51 +359,19 @@ def job_mmlu(args, model, tokenizer, device):
         tokenizer.pad_token = tokenizer.eos_token
 
     model = model.cuda()
-    past_key_values = None
-    use_cache = False
-
     with open("./saves/llama_eval/mmlu-stats.json", "r") as f:
         subject_stats = json.load(f)
 
-    accuracies, reversed_accuracies = [], []
-    for subjects in MMLU_SUBJECTS:
-        subject_mean = subject_stats[subjects][0]
-
-        max_seq_len = int(2 ** math.floor(np.log2(subject_mean / 2)))
-        # max_seq_len = args.window
-        max_seq_len = min(max_seq_len, 16384)
-        print(f"{max_seq_len=} {subjects=}")
-        window = max_seq_len // args.cascades
-
-        if args.method == "sink":
-            mdl = model.model
-
-            use_cache = True
-            past_key_values = CascadingKVCache(
-                window,
-                num_sink_tokens=mdl.config._sinks,
-                max_batch_size=mdl.config._batch_size,
-                heads=mdl.config.num_key_value_heads // args.world_size,
-                dim=mdl.config.hidden_size // mdl.config.num_attention_heads,
-                max_seq_len=max_seq_len,
-                dtype=torch.float16,
-                device=mdl.embed_tokens.weight.device,
-                cascade_func=mdl.config._cascade_func,
-                head_reduction=mdl.config._head_reduction,
-                layers=len(mdl.layers),
-            )
-
-        acc = evaluate_mmlu(args, model, use_cache, past_key_values, tokenizer, subjects, reverse=False)
+    accuracies = []
+    for subject in MMLU_SUBJECTS:
+        print(f"mean len for {subject}: {subject_stats[subject][0]=}")
+        # if subject_stats[subject][0] < args.window:
+        #     continue
+        acc = evaluate_mmlu(args, model, tokenizer, subject)
         accuracies.append(acc)
-
-        # rev_acc = evaluate_mmlu(args, model, tokenizer, subjects, reverse=True)
-        # reversed_accuracies.append(rev_acc)
 
     accuracy = np.array(accuracies).mean()
     print(f'MMLU AVG. ACC: {accuracy}')
-
-    # rev_accuracy = np.array(reversed_accuracies).mean()
-    # print(f'MMLU AVG. ACC: {rev_accuracy}')
 
 
 if __name__ == "__main__":

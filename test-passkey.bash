@@ -1,48 +1,43 @@
 #!/bin/bash
 
+model=invalid-model-name
+method=sink
+while getopts m:d:g: flag
+do
+    case "${flag}" in
+        m) model=${OPTARG};;
+        d) method=${OPTARG};;
+        g) gpu=${OPTARG};;
+    esac
+done
+
 # passkey experiment
-GPUS=(0)
-WINDOW=(4096)
-CASCADES=(8)
-SINKS=(64)
-BATCH_SIZE=1
-
-# GPUS=(2)
-# WINDOW=(512)
-# CASCADES=(1)
-# SINKS=(32)
-# BATCH_SIZE=50
-
-# GPUS=(7)
-# WINDOW=(1024)
-# CASCADES=(1)
-# SINKS=(4)
-# BATCH_SIZE=50
+WINDOW=32768
+# CASCADES=(8 1)
+CASCADES=(1)
+SINKS=64
+BATCH_SIZE=2
 HEAD_REDUCTION=max
-# MODEL=llama7b
-# MODEL=llama3-8b-instruct
-MODEL=llama3.1-8b-instruct
+CASCADE_STRIDE=4096
 CASCADE_FUNC="pow2"
-# MODEL=llama7b-chat
-# MODEL=llama13b
-# MODEL=qwen14b
-# MODEL=qwen7b
-# MODEL=qwen7b-chat
+GPU=$gpu
+MODEL=$model
+METHOD=$method
 
-for i in "${!GPUS[@]}";
+for i in "${!CASCADES[@]}";
 do 
     # PYTHONPATH=. deepspeed --include localhost:3,4,5,6 --master_port 63280 cascade/main/llama_eval.py \
-    PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
+    PYTHONPATH=. CUDA_VISIBLE_DEVICES=$GPU python cascade/main/llama_eval.py \
         --model $MODEL \
         --job passkey \
-        --method sink \
+        --method $METHOD \
         --lora_r 0 \
-        --window ${WINDOW[$i]} \
-        --sinks ${SINKS[$i]} \
+        --window $WINDOW \
+        --sinks $SINKS \
         --head_reduction $HEAD_REDUCTION \
         --cascade_func $CASCADE_FUNC \
+        --cascade_stride $CASCADE_STRIDE \
         --cascades ${CASCADES[$i]} \
         --batch_size $BATCH_SIZE
-        
         sleep 1
 done

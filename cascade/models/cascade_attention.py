@@ -563,6 +563,7 @@ def _sample_monkeypatch(
 
             for i in range(0, inputs.size(1), stride):
                 # print(f"{list(model_inputs.keys())=}")
+                # print(f"stride step: {i}")
                 model_inputs["input_ids"] = inputs[:, i:i + stride]
                 outputs = self(**model_inputs, return_dict=True)
                 # print(f"after {list(model_inputs.keys())=}")

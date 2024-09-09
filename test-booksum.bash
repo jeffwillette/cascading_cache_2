@@ -1,20 +1,36 @@
 #!/bin/bash
 
+model=invalid-model-name
+method=sink
+while getopts m:d:g: flag
+do
+    case "${flag}" in
+        m) model=${OPTARG};;
+        d) method=${OPTARG};;
+        g) gpu=${OPTARG};;
+    esac
+done
+
 WINDOW=2048
 CASCADES=(4 1)
+METHOD=$method
+
+if [ "$METHOD" = "vanilla" ]; then
+    CASCADES=(1)
+fi
+
 SINKS=4
 BATCH_SIZE=1
 HEAD_REDUCTION=max
 CASCADE_FUNC="pow2"
-GPUS=(5 5)
-MODEL=llama3.1-8b-instruct
-METHOD=sink
-COMMENT="half-ctx"
+GPU=$gpu
+MODEL=$model
+COMMENT="vanilla-truncate-right-half-ctx"
 CASCADE_STRIDE=512
 
-for i in "${!GPUS[@]}";
+for i in "${!CASCADES[@]}";
 do 
-    PYTHONPATH=. CUDA_VISIBLE_DEVICES=${GPUS[$i]} python cascade/main/llama_eval.py \
+    PYTHONPATH=. CUDA_VISIBLE_DEVICES=$GPU python cascade/main/llama_eval.py \
         --model $MODEL \
         --job booksum \
         --method $METHOD \

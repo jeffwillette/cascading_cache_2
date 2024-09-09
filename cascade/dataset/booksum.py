@@ -112,6 +112,9 @@ class BookSumDataset:
 
 
 if __name__ == '__main__':
+    from sklearn.model_selection import train_test_split
+    from torch.utils.data import Subset
+
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         "/d1/dataset/llama/models/llama_v3.1/Meta-Llama-3.1-8B-Instruct"
     )
@@ -119,17 +122,37 @@ if __name__ == '__main__':
         tokenizer,
         max_seq_len=None,
         truncation=False,
-        need_tokenization=True,
+        need_tokenization=False,
         for_eval=True
     )
 
+    test_fname = "saves/llama_eval/booksum/test_idx.pt"
+    train_fname = "saves/llama_eval/booksum/train_idx.pt"
+    if not os.path.exists(test_fname):
+        train_idx, test_idx = train_test_split(list(range(len(ds))), test_size=0.05)
+        train_idx, test_idx = torch.tensor(train_idx), torch.tensor(test_idx)
+        torch.save(train_idx, train_fname)
+        torch.save(test_idx, test_fname)
+    else:
+        train_idx = torch.load(train_fname).tolist()
+        test_idx = torch.load(test_fname).tolist()
+
+    ds = Subset(ds, test_idx)
+
     total_tokens, completions = 0, 0
+    max_len = 0
     for idx in tqdm.tqdm(range(len(ds))):
         prompt, completion = ds[idx]
+
+        prompt = tokenizer(prompt, return_tensors="pt", truncation=False).input_ids[0]
+        completion = tokenizer(completion, return_tensors="pt", truncation=False).input_ids[0]
         token_length = prompt.shape[0]
         compl_length = completion.shape[0]
         total_tokens += token_length
         completions += compl_length
 
+        max_len = max(max_len, token_length + compl_length)
+
         print(f"{idx=} {token_length=} {compl_length=}")
     print(f"{total_tokens=} {completions=}")
+    print(f"{max_len=}")

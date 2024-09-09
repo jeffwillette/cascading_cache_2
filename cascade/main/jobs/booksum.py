@@ -50,6 +50,9 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
             return f.read()
 
     tokenizer.truncation_side = 'left'
+    if "truncate-right" in args.comment:
+        print("setting truncation right")
+        tokenizer.truncation_side = 'right'
 
     assert hasattr(model, 'config')
     assert hasattr(model.config, 'max_position_embeddings')
@@ -62,7 +65,8 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
     if messages[1]["content"].endswith('</s>'):
         messages[1]["content"] = messages[1]["content"][:-4]
 
-    max_length = model.config.max_position_embeddings - args.max_tokens
+    # because the vanilla models go OOM on more than 32768 tokens
+    max_length = 32768 - args.max_tokens
     truncation = True
     if args.method != "vanilla":
         max_length = None
@@ -77,6 +81,21 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
     seq_len = inputs.shape[-1]
     print(f"seq_len: {seq_len}")
 
+    # to run vanilla with truncation to the same context length as the window models,
+    # we need to make the same calculation as for the "sink" method below and retokenize
+    # the text, truncating based on that length.
+    if "vanilla-truncate" in args.comment:
+        print("truncating vanilla model")
+        max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
+        max_seq_len = min(max_seq_len, 16384)
+        inputs = tokenizer.apply_chat_template(messages,
+                                               return_tensors='pt',
+                                               max_length=max_seq_len,
+                                               truncation=True,
+                                               )
+        seq_len = inputs.shape[-1]
+        print(f"seq_len after truncating: {seq_len}")
+
     additional_args = {}
     args.no_sample = True
     if not args.no_sample:
@@ -87,6 +106,7 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
             top_k=50,
         )
 
+    past_key_values = None
     if args.method == "sink":
         max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
         # max_seq_len = args.window
@@ -246,6 +266,6 @@ def job_booksum(args, model, tokenizer, device):
     out_dir.mkdir(parents=True, exist_ok=True)
     pathlib.Path("saves/llama_eval/booksum/reference").mkdir(parents=True, exist_ok=True)
 
-    # generate_samples(args, model, tokenizer, device, out_dir)
+    generate_samples(args, model, tokenizer, device, out_dir)
     evaluate_rouge(args, model, tokenizer, device, out_dir)
     print(args)

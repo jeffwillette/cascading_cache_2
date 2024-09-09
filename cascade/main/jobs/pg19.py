@@ -1,10 +1,10 @@
 import os
 import torch
 from cascade.dataset.pg19 import PG19Streaming
-import numpy as np
 from tqdm import tqdm
 import json
 from cascade.models.cascading_cache import CascadingKVCache
+import numpy as np
 from cascade.utils.other import pad_targets
 
 
@@ -19,15 +19,26 @@ def job_ppl_pg19(args, model, tokenizer, device):
     past_key_values = None
     use_cache = False
 
+    path = "cache/pg19/stats.json"
+    if not os.path.exists(path):
+        raise ValueError("run pg19 dataset file as __main__ to generate stats")
+
+    with open(path, "r") as fl:
+        ds_stats = json.load(fl)
+        ds_stats = {int(k): v for k, v in ds_stats.items()}
+
     for j, (x, y) in enumerate(dataset):
+        if j not in ds_stats[args.window]["index"]:
+            continue  # skip book because it contains fewer tokens than the window
+
         input_ids = x.cuda()
         target_ids = y.cuda()
 
         if args.method == "sink":
             use_cache = True
 
+            max_seq_len = mdl.config._window
             if "llama" in args.model:
-                # max_seq_len = min(max_seq_len, 32768)
                 max_seq_len = min(max_seq_len, 65536)
             elif "qwen" in args.model:
                 max_seq_len = min(max_seq_len, 16384)
@@ -49,7 +60,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
                 layers=len(mdl.layers),
             )
         elif args.method == "vanilla":
-            max_seq_len = args.cascade_stride
+            max_seq_len = 32768
         else:
             raise ValueError(f"unsupported method: {args.method=}")
 

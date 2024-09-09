@@ -388,6 +388,81 @@ class TestCascadingKVCache(unittest.TestCase):
                                      )
             del cache, k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask, of_pos
 
+    def test_eager_add_same_as_one_cascade(self):
+        # toy settings
+        N = 1
+        HID = 1
+        NSINK = 4
+        HEAD = 1
+        MAX_SEQ = 32
+        DEVICE = "cuda:0"
+        DTYPE = torch.float16
+
+        for i in range(10):
+            with torch.no_grad():
+                MAX_SEQ = 2 ** torch.randint(5, 10, size=(1,)).item()
+                WIND = MAX_SEQ // 4
+                S = MAX_SEQ
+
+                cache_sllm = CascadingKVCache(
+                    window_length=MAX_SEQ,
+                    num_sink_tokens=NSINK,
+                    max_batch_size=N,
+                    heads=HEAD,
+                    dim=HID,
+                    max_seq_len=MAX_SEQ,
+                    device=DEVICE,
+                    dtype=DTYPE,
+                    layers=1,
+                    eager_fill=False,
+                )
+
+                cache = CascadingKVCache(
+                    window_length=WIND,
+                    num_sink_tokens=NSINK,
+                    max_batch_size=N,
+                    heads=HEAD,
+                    dim=HID,
+                    max_seq_len=MAX_SEQ,
+                    device=DEVICE,
+                    dtype=DTYPE,
+                    layers=1,
+                    eager_fill=True,
+                )
+
+                _k = torch.arange(S, device=DEVICE, dtype=DTYPE) + 1
+                _k = _k.view(1, 1, -1, 1).repeat(N, HEAD, 1, HID)
+                _v = _k.clone()
+
+                for i in range(_k.size(2)):
+                    # print(f"\n\n{'='*100}\n\n")
+                    sllm_out = cache_sllm.update(_k[:, :, i:i + 1].clone(), _v[:, :, i:i + 1].clone(), 0)
+
+                out = cache.update(_k, _v, 0)
+
+                names = ("sink keys", "sink values", "sink pos", "sink mask", "keys", "values", "pos", "mask", "og pos")
+                sizes = (4, 4, 2, 2, 4, 4, 2, 2, 3)
+
+                for sllm_item, item, name, size in zip(sllm_out, out, names, sizes):
+                    if size == 4:
+                        sllm_list = sllm_item[0, 0, :, 0].tolist()
+                        item_list = item[0, 0, :, 0].tolist()
+                    elif size == 2:
+                        sllm_list = sllm_item[0].tolist()
+                        item_list = item[0].tolist()
+                    elif size == 3:
+                        sllm_list = sllm_item[0, 0].tolist()
+                        item_list = item[0, 0].tolist()
+                    passing = True
+                    for v in item_list:
+                        if v not in sllm_list:
+                            passing = False
+                            break
+
+                    self.assertTrue(passing, f"failed {name=} Streaming LLM: {sllm_item=} Ours: {item=}")
+
+            del cache, cache_sllm, sllm_out, out
+
     def test_against_naive_single_iter(self):
         # toy settings
         N = 1
