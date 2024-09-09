@@ -40,10 +40,12 @@ python cascade/models/sink_cache_cascade.py
 
 ## Run Passkey
 
+```
 ./test-passkey.bash -m llama3.1-8b-instruct -d sink -g [GPU INDEX] -c [CASCADE NUMBER]
 
 ./test-passkey.bash -m llama3.1-8b-instruct -d sink -g [GPU INDEX] -c 1
 ./test-passkey.bash -m llama3.1-8b-instruct -d sink -g [GPU INDEX] -c 8
+```
 
 ## RUN PG19
 
