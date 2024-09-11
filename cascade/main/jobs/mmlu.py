@@ -156,10 +156,14 @@ def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args):
     if text_len < args.batch_size:
         texts += ["null text"] * (args.batch_size - text_len)
 
+    max_length = model.config.max_position_embeddings
+    if args.method == "vanilla" and "truncate" in args.comment:
+        max_length = args.window
+
     inputs = tokenizer(
         texts,
         return_tensors='pt',
-        max_length=model.config.max_position_embeddings,
+        max_length=max_length,
         truncation=False if args.method == "sink" else True,
         padding=True,
     )
@@ -276,7 +280,7 @@ def format_mmlu_plain(question, subject_name, few_shots):
     return text, truth
 
 
-def evaluate_mmlu(args, model, tokenizer, subject_name):
+def evaluate_mmlu(args, model, tokenizer, subject_name, json_path):
     dataset = load_dataset('lukaemon/mmlu', subject_name, trust_remote_code=True)
 
     few_shots = get_fewshots(dataset, subject_name, shift=1)
@@ -328,13 +332,6 @@ def evaluate_mmlu(args, model, tokenizer, subject_name):
     avg_seq_len = seq_len_sum / len(results)
     print(f'{subject_name} = Accuracy: {accuracy:.4f} %, avg_seq_len: {avg_seq_len:.2f}. elapsed: {elapsed:.1f} s')
 
-    os.makedirs('./saves/llama_eval/mmlu/', exist_ok=True)
-    json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}.json'
-    if args.method == 'sink':
-        json_path = f'./saves/llama_eval/mmlu/{subject_name}_{args.model}_{args.method}_window_{args.window}_' + \
-            f'head_reduction_{args.head_reduction}_cascade_{args.cascades}_sinks_{args.sinks}_' + \
-            f'homogeneous_heads_{args.homogeneous_heads}_cascade_stride_{args.cascade_stride}_comment_{args.comment}.json'
-
     with open(json_path, 'w') as f:
         json.dump(
             {
@@ -364,10 +361,21 @@ def job_mmlu(args, model, tokenizer, device):
 
     accuracies = []
     for subject in MMLU_SUBJECTS:
+        os.makedirs('./saves/llama_eval/mmlu/', exist_ok=True)
+        json_path = f'./saves/llama_eval/mmlu/{subject}_{args.model}_{args.method}_comment_{args.comment}.json'
+        if args.method == 'sink':
+            json_path = f'./saves/llama_eval/mmlu/{subject}_{args.model}_{args.method}_window_{args.window}_' + \
+                f'head_reduction_{args.head_reduction}_cascade_{args.cascades}_sinks_{args.sinks}_' + \
+                f'homogeneous_heads_{args.homogeneous_heads}_cascade_stride_{args.cascade_stride}_comment_{args.comment}.json'
+
+        if os.path.exists(json_path):
+            print(f"skipping {subject} because the file already exists.")
+            continue
+
         print(f"mean len for {subject}: {subject_stats[subject][0]=}")
         # if subject_stats[subject][0] < args.window:
         #     continue
-        acc = evaluate_mmlu(args, model, tokenizer, subject)
+        acc = evaluate_mmlu(args, model, tokenizer, subject, json_path)
         accuracies.append(acc)
 
     accuracy = np.array(accuracies).mean()

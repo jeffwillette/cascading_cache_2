@@ -59,7 +59,7 @@ def gen_text(tokenizer):
 
     inputs, targets, len_loc = [], [], []
     prompt_lens = [32768, 65536, 131072, 262144, 524288, 524288 * 2]
-    insert_locs = [0.2, 0.4, 0.6, 0.8]
+    insert_locs = [0.2, 0.4, 0.6, 0.8, 1.0]
 
     for l in prompt_lens:
         n_fillers = (l - prefix_len - query_len)

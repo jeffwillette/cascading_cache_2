@@ -50,9 +50,9 @@ def job_passkey(args, model, tokenizer, device):
 
     stride = args.cascade_stride
 
-    savepath = f'{savedir}/passkey/{args.method}-sinks-{args.sinks}-window-" + \
-        "{args.window}-cascade-{args.cascades}-{args.model}-head-reduction-" + \
-        "{args.head_reduction}-cascade-func-{args.cascade_func}.json'
+    savepath = f"{savedir}/passkey/{args.method}-sinks-{args.sinks}-window-" + \
+        f"{args.window}-cascade-{args.cascades}-{args.model}-head-reduction-" + \
+        f"{args.head_reduction}-cascade-func-{args.cascade_func}.json"
 
     total_acc = {}
     if os.path.exists(savepath):
@@ -68,6 +68,7 @@ def job_passkey(args, model, tokenizer, device):
             total_acc[ll_str] = [correct, count]
 
         if total_acc[ll_str][1] == 100:
+            print(f"skipping: {ll_str} because it has already been done")
             continue
 
         input_ids = input_ids.cuda()

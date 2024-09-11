@@ -16,19 +16,21 @@ METHOD=$method
 WINDOW=(2048 2048)
 CASCADES=(4 1)
 SINKS=(4 4)
+COMMENT=("2048-all" "2048-all")
+BATCH_SIZE=20
 
 if [ "$METHOD" = "vanilla" ]; then
-    WINDOW=(2048)
-    CASCADES=(1)
-    SINKS=(4)
+    WINDOW=(2048 2048)
+    CASCADES=(1 1)
+    SINKS=(4 4)
+    BATCH_SIZE=1
+    COMMENT=("vanilla-unconstrained" "vanilla-truncate")
 fi
 
-BATCH_SIZE=20
 HEAD_REDUCTION=max
 CASCADE_FUNC="pow2"
 CASCADE_STRIDE=512
 GPU=$gpu
-COMMENT="2048-all"
 # --homogeneous_heads \
 
 for i in "${!WINDOW[@]}";
@@ -43,7 +45,7 @@ do
         --cascades ${CASCADES[$i]} \
         --cascade_func $CASCADE_FUNC \
         --head_reduction $HEAD_REDUCTION \
-        --comment $COMMENT \
+        --comment ${COMMENT[$i]} \
         --batch_size $BATCH_SIZE \
         --cascade_stride $CASCADE_STRIDE
         sleep 1

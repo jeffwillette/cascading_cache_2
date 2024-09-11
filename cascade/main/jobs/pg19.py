@@ -41,7 +41,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
             if "llama" in args.model:
                 max_seq_len = min(max_seq_len, 65536)
             elif "qwen" in args.model:
-                max_seq_len = min(max_seq_len, 16384)
+                max_seq_len = min(max_seq_len, 32768)
 
             print(f"{max_seq_len=}")
             window = max_seq_len // args.cascades
