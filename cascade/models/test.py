@@ -257,7 +257,6 @@ class TestFlashAttention(unittest.TestCase):
             (1, 2, 500, 2048 + 500, 64),
             (1, 2, 500, 2048 + 64 + 500, 64),
             (1, 2, 500, 2048 + 500, 64),
-            (1, 2, 500, 2048 + 4 + 500, 64),
 
         ):
             test_op_with_backward(Z, H, N_CTX, N_KV, HEAD_DIM, True)

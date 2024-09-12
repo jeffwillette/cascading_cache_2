@@ -2,20 +2,25 @@
 
 # TODO:
 
+- booksum
+  - rerun ours
+
 - PG19
   - token selection ablation (use scores vs no scores) (PG19)
-  - re-run qwen 32k result because pos encodings were set to max of 16k
+  - re run all of ours
   - run vanilla 16, 32k strided
 
 - Passkey
-  - run 65K window?
+  - run 32k wiundow
+  - run 65K window? (youngwan will run, touch up the files and send him the dataset)
 
 - LongBench
-    - qwen
-    - llama
+    - move our outdated results to new foler
+    - run llama 
+    - run qwen
 
 - MMLU
-    - 2048 (all, running)
+    - run our llama and qwen
 
 - attention matrix plotting.
   - plot new ones with eager fill to see if there is any difference.
@@ -26,6 +31,7 @@
 - add more baselines
 - note in new paper about beta 0.999
   - also note about the approximate score of flash attention?
+  - note about LLM lost in the middle paper (cite it and give inspiration in intro)
 
 
 ## How to Install
