@@ -222,7 +222,6 @@ class CascadeAttention(nn.Module):
     ):
         self.last_attn_called = "flash"
         self.last_q_size = query_states.size(2)
-        n_sink = sink_key_states.size(2)
 
         mask = torch.cat((sink_mask[0, 0], key_mask[0, 0]))
         out, scores = attention(
@@ -232,7 +231,7 @@ class CascadeAttention(nn.Module):
             True, scale, mask, past_key_value.beta,
         )
 
-        ema_scores, scores = self.calc_scores(scores[:, :, n_sink:], homogeneous_heads, k_states.size(2), q_len)
+        ema_scores, scores = self.calc_scores(scores, homogeneous_heads, k_states.size(2), q_len)
 
         beta = past_key_value.beta
         past_key_value.score_cache[self.layer_idx] = beta**out.size(

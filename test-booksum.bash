@@ -19,7 +19,7 @@ if [ "$METHOD" = "vanilla" ]; then
     CASCADES=(1)
 fi
 
-SINKS=4
+SINKS=64
 BATCH_SIZE=1
 HEAD_REDUCTION=max
 CASCADE_FUNC="pow2"

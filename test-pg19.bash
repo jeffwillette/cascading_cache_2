@@ -24,7 +24,7 @@ MODEL=(llama3.1-8b qwen2-7b)
 
 
 
-SINKS=4
+SINKS=64
 BATCH_SIZE=1
 CASCADE_FUNC="pow2"
 COMMENT="none"

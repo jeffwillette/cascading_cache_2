@@ -54,7 +54,7 @@ class TestCascadeAttention(unittest.TestCase):
         print('\n', unittest.TestCase.id(self))
         args = Namespace(
             batch_size=1,
-            sinks=4,
+            sinks=64,
             cascades=1,
             window=2048,
             world_size=1,
@@ -255,6 +255,9 @@ class TestFlashAttention(unittest.TestCase):
             (2, 32, 1024, 16384 + 1024, 128),
             (1, 2, 512, 2560, 64),
             (1, 2, 500, 2048 + 500, 64),
+            (1, 2, 500, 2048 + 64 + 500, 64),
+            (1, 2, 500, 2048 + 500, 64),
+            (1, 2, 500, 2048 + 4 + 500, 64),
 
         ):
             test_op_with_backward(Z, H, N_CTX, N_KV, HEAD_DIM, True)
@@ -279,7 +282,7 @@ class TestFlashAttention(unittest.TestCase):
         window = 128
         total = window * 4
         cache = CascadingKVCache(
-            window, num_sink_tokens=4, max_batch_size=1,
+            window, num_sink_tokens=64, max_batch_size=1,
             heads=1, dim=128,
             max_seq_len=total,
             dtype=torch.float16,
@@ -291,7 +294,7 @@ class TestFlashAttention(unittest.TestCase):
         )
 
         eager_cache = CascadingKVCache(
-            window, num_sink_tokens=4, max_batch_size=1,
+            window, num_sink_tokens=64, max_batch_size=1,
             heads=1, dim=128,
             max_seq_len=total,
             dtype=torch.float16,
@@ -344,7 +347,7 @@ class TestCascadingKVCache(unittest.TestCase):
             n_layers = np.random.randint(8, 33, size=(1,)).tolist()[0]
             N = 1
             HID = 128
-            NSINK = 4
+            NSINK = 64
             HEAD = 1
             DEVICE = "cuda:0"
             DTYPE = torch.float
@@ -355,8 +358,8 @@ class TestCascadingKVCache(unittest.TestCase):
             # MAX_SEQ = [s for _ in range(n_layers)]
             WIND = [ms // win for ms, win in zip(MAX_SEQ, w)]
 
-            S = torch.randint(max(MAX_SEQ) + 4, max(MAX_SEQ) * 2, size=(1,)).item()
-            # S = s + 4
+            S = torch.randint(max(MAX_SEQ) + NSINK, max(MAX_SEQ) * 2, size=(1,)).item()
+            # S = s + NSINK
             with torch.no_grad():
 
                 cache = CascadingKVCache(
@@ -379,8 +382,8 @@ class TestCascadingKVCache(unittest.TestCase):
                     k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask, of_pos = \
                         cache.update(_k, _v, l)
 
-                    self.assertEqual(k_nosink.size(2), MAX_SEQ[l] - NSINK, f"{k.size()=} expected to match {MAX_SEQ[l] - NSINK=} at dim 2")
-                    self.assertEqual(v_nosink.size(2), MAX_SEQ[l] - NSINK, f"{v.size()=} expected to match {MAX_SEQ[l] - NSINK=} at dim 2")
+                    self.assertEqual(k_nosink.size(2), MAX_SEQ[l], f"{k.size()=} expected to match {MAX_SEQ[l]=} at dim 2")
+                    self.assertEqual(v_nosink.size(2), MAX_SEQ[l], f"{v.size()=} expected to match {MAX_SEQ[l]=} at dim 2")
                     self.assertEqual(mask.sum().item(), 0,
                                      "expected nothing to be masked due to eager filling: " + \
                                      f"({MAX_SEQ[l]=}, {k_nosink.size()=}, {mask.size()=}, queries: {_k.size()=})\n{mask=}" + \
@@ -388,11 +391,52 @@ class TestCascadingKVCache(unittest.TestCase):
                                      )
             del cache, k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask, of_pos
 
+    def test_num_sinks(self):
+        # toy settings
+        N = 2
+        HID = 128
+        HEAD = 32
+        MAX_SEQ = 4096
+        DEVICE = "cuda:0"
+        DTYPE = torch.float16
+
+        # NOTE: ONLY TESTING THE CACHE HERE, BUT <64 sinks does not work with flash attention
+        for NSINK in [4, 8, 16, 32, 64]:
+            with torch.no_grad():
+                # MAX_SEQ = 2 ** torch.randint(10, 10, size=(1,)).item()
+                WIND = MAX_SEQ // 4
+                S = 512
+
+                for j in range(20):
+                    cache = CascadingKVCache(
+                        window_length=WIND,
+                        num_sink_tokens=NSINK,
+                        max_batch_size=N,
+                        heads=HEAD,
+                        dim=HID,
+                        max_seq_len=MAX_SEQ,
+                        device=DEVICE,
+                        dtype=DTYPE,
+                        layers=1,
+                        eager_fill=False,
+                    )
+
+                    start = 0
+                    for i in range(20):
+                        print(f"{start=}")
+                        _k = torch.arange(S, device=DEVICE, dtype=DTYPE) + start + 1
+                        start += S
+                        _k = _k.view(1, 1, -1, 1).repeat(N, HEAD, 1, HID)
+                        _v = _k.clone()
+
+                        out = cache.update(_k, _v, 0)
+                    print(f"{NSINK=}")
+
     def test_eager_add_same_as_one_cascade(self):
         # toy settings
         N = 1
         HID = 1
-        NSINK = 4
+        NSINK = 64
         HEAD = 1
         MAX_SEQ = 32
         DEVICE = "cuda:0"
@@ -467,7 +511,7 @@ class TestCascadingKVCache(unittest.TestCase):
         # toy settings
         N = 1
         HID = 128
-        NSINK = 4
+        NSINK = 64
         WIND = 4
         HEAD = 32
         MAX_SEQ = 32
@@ -620,7 +664,7 @@ class TestCascadingKVCache(unittest.TestCase):
         # toy settings
         N = 1
         HID = 128
-        NSINK = 4
+        NSINK = 64
         WIND = 512
         HEAD = 32
         MAX_SEQ = 2048
@@ -773,12 +817,12 @@ class TestCascadingKVCache(unittest.TestCase):
 
     def test_bench_cascade_single_vs_four(self):
         total_cache = 16384
-        naive = SinkAttentionNaive(4, total_cache).cuda()
+        naive = SinkAttentionNaive(64, total_cache).cuda()
 
         dev = "cuda:0"
         cache = CascadingKVCache(
             window_length=total_cache // 1,
-            num_sink_tokens=4,
+            num_sink_tokens=64,
             max_batch_size=8,
             heads=32,
             dim=128,
@@ -790,7 +834,7 @@ class TestCascadingKVCache(unittest.TestCase):
 
         cache_cascade = CascadingKVCache(
             window_length=total_cache // 4,
-            num_sink_tokens=4,
+            num_sink_tokens=64,
             max_batch_size=8,
             heads=32,
             dim=128,
@@ -871,7 +915,7 @@ class TestCascadingKVCache(unittest.TestCase):
 if __name__ == "__main__":
     N = 128
     HID = 128
-    NSINK = 4
+    NSINK = 64
     WIND = 2048 // 4
     HEAD = 32
     MAX_SEQ = 2048

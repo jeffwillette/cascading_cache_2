@@ -480,9 +480,9 @@ def _update_kv_cache_inner(
             # if idx_n == 0:
             #     print(f"do cache i: ", do_cache_i)
 
-            stored_shift = idx_n.to(tl.int64) * stride_st_n + \
-                idx_h.to(tl.int64) * stride_st_h + \
-                i.to(tl.int64) * stride_st_c
+            stored_shift = idx_n.to(IDTYPE) * stride_st_n + \
+                idx_h.to(IDTYPE) * stride_st_h + \
+                i.to(IDTYPE) * stride_st_c
 
             stored_tokens_i = tl.load(STORED_TOKENS + stored_shift)
             start_idx_i = tl.load(START_INDICES + stored_shift)
@@ -1089,7 +1089,7 @@ class CascadingKVCache(Cache):
 
         self.bh = self.max_batch_size * self.heads
 
-        all_even_div = [(self.max_seq_len[l] % self.window_length[l]) == 0for l in range(layers)]
+        all_even_div = [(self.max_seq_len[l] % self.window_length[l]) == 0 for l in range(layers)]
         if not all(all_even_div):
             raise ValueError(f"window length must evenly divide max seq len: {self.window_length=} {self.max_seq_len=}")
 
@@ -1255,7 +1255,7 @@ class CascadingKVCache(Cache):
 
         self.key_cache = [blank.clone().repeat(1, 1, self.max_seq_len[l], 1) for l in range(L)]
         self.value_cache = [blank.clone().repeat(1, 1, self.max_seq_len[l], 1) for l in range(L)]
-        self.score_cache = [blank_scores.clone().repeat(1, 1, self.max_seq_len[l] - self.num_sink_tokens) for l in range(L)]
+        self.score_cache = [blank_scores.clone().repeat(1, 1, self.max_seq_len[l]) for l in range(L)]
         self.sink_keys = [blank_sinks.clone() for _ in range(L)]
         self.sink_values = [blank_sinks.clone() for _ in range(L)]
 
@@ -1268,22 +1268,19 @@ class CascadingKVCache(Cache):
         # in order to not have an weird sized total cache (like 2048 + 4), we cut off the oldest num_sink_tokens
         # from the end of the cache. In the case that the cache is full, we need to then downshift all positions
         # by the number of sink tokens
-        do_shift_pos = self.seen_tokens_by_layer[layer_idx] > self.num_sink_tokens and \
-            self.seen_tokens_by_layer[layer_idx] <= self.max_seq_len[layer_idx] + self.num_sink_tokens
-
+        do_shift_pos = self.seen_tokens_by_layer[layer_idx] > self.num_sink_tokens
         pos_shift = self.num_sink_tokens if do_shift_pos else 0
 
-        cut = self.num_sink_tokens
         return (
             self.sink_keys[layer_idx],
             self.sink_values[layer_idx],
             self.sink_pos[layer_idx][:1, 0],
             self.sink_mask[layer_idx],
-            self.key_cache[layer_idx][:, :, :-cut],
-            self.value_cache[layer_idx][:, :, :-cut],
-            self.pos[layer_idx][:1, 0][:, :-cut] + pos_shift,
-            self.mask[layer_idx][:, :, :-cut],
-            self.og_pos[layer_idx][:, :, :-cut],
+            self.key_cache[layer_idx],
+            self.value_cache[layer_idx],
+            self.pos[layer_idx][:1, 0] + pos_shift,
+            self.mask[layer_idx],
+            self.og_pos[layer_idx],
         )
 
     def update(
@@ -1498,7 +1495,6 @@ class CascadingKVCacheSlow(nn.Module):
         max_seq_len: int = 32,
         device: torch.device = "cpu",
         dtype: torch.dtype = torch.float16,
-        verbose: bool = True,
     ) -> None:
         super().__init__()
         self.max_seq_len = max_seq_len
@@ -1508,7 +1504,6 @@ class CascadingKVCacheSlow(nn.Module):
         self.n_layers = n_layers
         self.device = device
         self.dtype = dtype
-        self.verbose = verbose
 
         self.key_cache: torch.Tensor
         self.score_cache: torch.Tensor
@@ -1573,7 +1568,7 @@ class CascadingKVCacheSlow(nn.Module):
                                     dtype=torch.long,
                                     requires_grad=False).view(1, -1)
 
-        self.init_cache(verbose=verbose)
+        self.init_cache()
 
     def init_cache(self):
         B, H, S, D = self.max_batch_size, self.heads, self.max_seq_len, self.dim
@@ -1831,10 +1826,10 @@ class CascadingKVCacheSlow(nn.Module):
             self.sink_values,
             self.sink_pos,
             self.sink_mask,
-            self.key_cache[:, :, :-self.num_sink_tokens],
-            self.value_cache[:, :, :-self.num_sink_tokens],
-            pos[:, :-self.num_sink_tokens],
-            self.mask[:, :, :, :-self.num_sink_tokens],
+            self.key_cache,
+            self.value_cache,
+            pos,
+            self.mask,
         )
 
 

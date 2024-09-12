@@ -14,7 +14,7 @@ do
 done
 
 # passkey experiment
-WINDOW=65536
+WINDOW=32768
 SINKS=64
 BATCH_SIZE=2
 HEAD_REDUCTION=max

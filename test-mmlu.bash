@@ -15,14 +15,14 @@ MODEL=$model
 METHOD=$method
 WINDOW=(2048 2048)
 CASCADES=(4 1)
-SINKS=(4 4)
+SINKS=(64 64)
 COMMENT=("2048-all" "2048-all")
 BATCH_SIZE=20
 
 if [ "$METHOD" = "vanilla" ]; then
     WINDOW=(2048 2048)
     CASCADES=(1 1)
-    SINKS=(4 4)
+    SINKS=(64 64)
     BATCH_SIZE=1
     COMMENT=("vanilla-unconstrained" "vanilla-truncate")
 fi
