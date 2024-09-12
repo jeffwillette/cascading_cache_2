@@ -26,7 +26,7 @@ def job_passkey(args, model, tokenizer, device):
     model = model.to(args.infer_dtype).cuda()
     m = model.model
 
-    past_key_values = True, None
+    past_key_values = None
     if args.method != "vanilla":
         max_seq_len = m.config._window
         print(f"{max_seq_len=}")
