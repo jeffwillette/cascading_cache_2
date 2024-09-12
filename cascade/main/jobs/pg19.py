@@ -38,10 +38,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
             use_cache = True
 
             max_seq_len = mdl.config._window
-            if "llama" in args.model:
-                max_seq_len = min(max_seq_len, 65536)
-            elif "qwen" in args.model:
-                max_seq_len = min(max_seq_len, 32768)
+            max_seq_len = min(max_seq_len, mdl.config.max_position_embeddings // 2)
 
             print(f"{max_seq_len=}")
             window = max_seq_len // args.cascades

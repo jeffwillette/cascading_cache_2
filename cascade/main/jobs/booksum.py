@@ -87,7 +87,7 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
     if "vanilla-truncate" in args.comment:
         print("truncating vanilla model")
         max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
-        max_seq_len = min(max_seq_len, 16384)
+        max_seq_len = min(max_seq_len, 32768)  # OOM above this
         inputs = tokenizer.apply_chat_template(messages,
                                                return_tensors='pt',
                                                max_length=max_seq_len,
@@ -108,13 +108,13 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
 
     past_key_values = None
     if args.method == "sink":
+        mdl = model.model
         max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
         # max_seq_len = args.window
-        max_seq_len = min(max_seq_len, 16384)
+        max_seq_len = min(max_seq_len, mdl.config.max_position_embeddings // 2)
         print(f"{max_seq_len=}")
         window = max_seq_len // args.cascades
 
-        mdl = model.model
         past_key_values = CascadingKVCache(
             window,
             num_sink_tokens=mdl.config._sinks,

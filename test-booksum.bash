@@ -25,7 +25,8 @@ HEAD_REDUCTION=max
 CASCADE_FUNC="pow2"
 GPU=$gpu
 MODEL=$model
-COMMENT="vanilla-truncate-right-half-ctx"
+# COMMENT="vanilla-truncate-right-half-ctx"
+COMMENT="half-ctx"
 CASCADE_STRIDE=512
 
 for i in "${!CASCADES[@]}";
