@@ -89,6 +89,7 @@ class Passkey(Dataset):
 
     def __init__(self, tokenizer, batch_size=10):
         self.tokenizer = tokenizer
+        os.makedirs("cache/passkey", exist_ok=True)
         cache_path = f"cache/passkey/{'-'.join(tokenizer.name_or_path.split('/'))[1:]}.pt"
         if os.path.exists(cache_path):
             inputs, targets, len_loc = torch.load(cache_path)

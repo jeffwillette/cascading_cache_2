@@ -20,7 +20,7 @@ def len_loc_str(len_loc):
 
 
 def job_passkey(args, model, tokenizer, device):
-    savedir = './cache/llama_eval/'
+    savedir = './cache/llama_eval/passkey'
     os.makedirs(savedir, exist_ok=True)
 
     model = model.to(args.infer_dtype).cuda()
@@ -50,7 +50,7 @@ def job_passkey(args, model, tokenizer, device):
 
     stride = args.cascade_stride
 
-    savepath = f"{savedir}/passkey/{args.method}-sinks-{args.sinks}-window-" + \
+    savepath = f"{savedir}/{args.method}-sinks-{args.sinks}-window-" + \
         f"{args.window}-cascade-{args.cascades}-{args.model}-head-reduction-" + \
         f"{args.head_reduction}-cascade-func-{args.cascade_func}.json"
 
