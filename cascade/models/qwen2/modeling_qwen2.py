@@ -47,6 +47,7 @@ from transformers.utils import (
 )
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from cascade.models.cascade_attention import Qwen2CascadeAttention
+from hip import hip_attention, HiPAttentionArgs
 
 
 if is_flash_attn_2_available():
@@ -482,18 +483,30 @@ class Qwen2FlashAttention2(Qwen2Attention):
         else:
             sliding_window = None
 
-        attn_output = _flash_attention_forward(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            q_len,
-            # position_ids=position_ids,
-            dropout=dropout_rate,
-            sliding_window=sliding_window,
-            is_causal=self.is_causal,
-            use_top_left_mask=self._flash_attn_uses_top_left_mask,
-        )
+        if self.config._method == "bigbird":
+
+            w = self.config._bb_window // 2
+            args = HiPAttentionArgs(mask_k=w, sliding_window_size=w)
+
+            attn_output, _ = hip_attention(
+                query_states / math.sqrt(query_states.size(-1)),
+                key_states,
+                value_states,
+                args=args
+            )
+
+        else:
+            attn_output = _flash_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                q_len,
+                dropout=dropout_rate,
+                sliding_window=sliding_window,
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                is_causal=self.is_causal,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -1121,6 +1134,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+
+        # logger.warning_once("temporarily commented out float")
         logits = logits.float()
 
         loss = None

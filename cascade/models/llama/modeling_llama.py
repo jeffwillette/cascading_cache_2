@@ -49,6 +49,7 @@ from transformers.utils import (
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
 from cascade.models.cascade_attention import LlamaCascadeAttention
+from hip import hip_attention, HiPAttentionArgs
 
 
 logger = logging.get_logger(__name__)
@@ -555,18 +556,30 @@ class LlamaFlashAttention2(LlamaAttention):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
-        attn_output = _flash_attention_forward(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            q_len,
-            # position_ids=position_ids,
-            dropout=dropout_rate,
-            sliding_window=getattr(self, "sliding_window", None),
-            use_top_left_mask=self._flash_attn_uses_top_left_mask,
-            is_causal=self.is_causal,
-        )
+        if self.config._method == "bigbird":
+
+            w = self.config._bb_window // 2
+            args = HiPAttentionArgs(mask_k=w, sliding_window_size=w)
+
+            attn_output, _ = hip_attention(
+                query_states / math.sqrt(query_states.size(-1)),
+                key_states,
+                value_states,
+                args=args
+            )
+
+        else:
+            attn_output = _flash_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                q_len,
+                dropout=dropout_rate,
+                sliding_window=getattr(self, "sliding_window", None),
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                is_causal=self.is_causal,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -689,7 +702,7 @@ class LlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         _attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation]
-        if config._method == "sink":
+        if config._method in ["sink", "hyper"]:
             _attn = LlamaCascadeAttention
 
         self.self_attn = _attn(config=config, layer_idx=layer_idx)
@@ -1212,6 +1225,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.lm_head(hidden_states)
+        # logger.warning_once("temporarily commented out float")
         logits = logits.float()
 
         loss = None
