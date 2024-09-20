@@ -1,12 +1,14 @@
 import os
 import torch
 import transformers
+from third_party.hyper_attn.models.attention.hyper_attn import HyperAttention
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
 from cascade.models.llama.modeling_llama import LlamaForCausalLM, LlamaConfig, LlamaDecoderLayer
 from cascade.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config, Qwen2DecoderLayer
 from cascade.models.cascade_attention import sample_monkeypatch
+from cascade.models.snapkv import replace_llama
 from cascade.utils import seed
 
 # from cascade.main.jobs.bench_single_layer import job_bench_single_layer
@@ -183,7 +185,7 @@ def load_model(args):
     config = get_config(model_id)
 
     config._attn_implementation = config.attn_implementation = 'eager'
-    if args.method == "vanilla":
+    if args.method in ["vanilla", "snapkv", "bigbird"]:
         config._attn_implementation = config.attn_implementation = 'flash_attention_2'
 
     if args.job == "latency":
@@ -201,13 +203,25 @@ def load_model(args):
     config._homogeneous_heads = args.homogeneous_heads
     config._do_og_pos = args.do_og_pos
 
-    if args.model == "llama13b_32k":
-        config.max_position_embeddings = 32768
-
     print(f"{config=}")
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
-    if "70b" not in model_id.lower():
+    if args.method == "h2o":
+        from cascade.models.h2o import load
+        model, _ = load(model_id, heavy_hitter=True, args=args)
+    elif args.method == "snapkv":
+        if "llama" not in args.model:
+            raise ValueError("SnapKV is only implemented for llama models")
+
+        replace_llama()
+        model = transformers.models.llama.modeling_llama.LlamaForCausalLM.from_pretrained(
+            MODELS[args.model],
+            config=config,
+            device_map={"": device},
+            torch_dtype=torch.float16,
+        )
+
+    elif "70b" not in model_id.lower():
         args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
         from_pretrained_kwargs = dict(
             config=config,
@@ -301,8 +315,20 @@ def load_model(args):
         model = sample_monkeypatch(model)
 
     if args.method == "hyper":
-        raise NotImplementedError("need to figure out how to run hyper again with new workflow")
-        # model = get_model(model_id, **from_pretrained_kwargs)
+        for i, decoder_layer in enumerate(model.model.layers):
+            # print(f"init hyper attention for layer {i=} {self.config=}")
+
+            min_seq_len = 32
+            # min_seq_len = model.model.config.max_position_embeddings
+
+            decoder_layer.self_attn.hyper_attn = HyperAttention(
+                input_dim=128,
+                lsh_num_projs=7,
+                block_size=64,
+                sample_size=1024,
+                min_seq_len=min_seq_len,
+                cuda=True,
+            ).half().to("cuda:0")
 
     if args.lora_r > 0 and args.checkpoint is not None:
         print("LoRA init")

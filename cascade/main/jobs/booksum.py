@@ -1,5 +1,6 @@
 import json
 import os
+import gc
 from pyrouge import Rouge155
 
 import pathlib
@@ -68,7 +69,7 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
     # because the vanilla models go OOM on more than 32768 tokens
     max_length = 32768 - args.max_tokens
     truncation = True
-    if args.method != "vanilla":
+    if args.method == "sink":
         max_length = None
         truncation = False
 
@@ -88,6 +89,17 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
         print("truncating vanilla model")
         max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
         max_seq_len = min(max_seq_len, 32768)  # OOM above this
+        inputs = tokenizer.apply_chat_template(messages,
+                                               return_tensors='pt',
+                                               max_length=max_seq_len,
+                                               truncation=True,
+                                               )
+        seq_len = inputs.shape[-1]
+        print(f"seq_len after truncating: {seq_len}")
+    elif args.method == "snapkv":
+        print("truncating snapkv model due to OOM")
+        tokenizer.truncation_side = "right"
+        max_seq_len = 22000
         inputs = tokenizer.apply_chat_template(messages,
                                                return_tensors='pt',
                                                max_length=max_seq_len,
@@ -128,8 +140,18 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
             head_reduction=mdl.config._head_reduction,
             layers=len(mdl.layers),
         )
+    elif args.method in ["bigbird", "snapkv"]:
+        mdl = model.model
+        max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
+        print(f"{max_seq_len=}")
 
-    output = model.generate(
+        for lyr in mdl.layers:
+            if args.method == "bigbird":
+                lyr.self_attn.config._bb_window = max_seq_len
+            elif args.method == "snapkv":
+                lyr.self_attn.config.max_capacity_prompt = max_seq_len
+
+    _output = model.generate(
         inputs=inputs.cuda(),
         past_key_values=past_key_values,
         attention_mask=torch.ones((1, inputs.shape[-1]), dtype=torch.long, device='cuda'),
@@ -142,9 +164,15 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
         **additional_args,
     )
     output: str = tokenizer.decode(
-        output[0][seq_len:].data.cpu(),
+        _output[0][seq_len:].data.cpu(),
         skip_special_tokens=True,
     )
+
+    del _output, past_key_values
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
     if output.endswith('</s>'):
         output = output[:-4]
     output = output.strip()

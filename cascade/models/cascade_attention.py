@@ -131,10 +131,8 @@ class CascadeAttention(nn.Module):
         max_pos = 0  # may be reset later
         if first_it:
             self.last_attn_called = None
-            self.query_pos = torch.arange(0,
-                                          query_states.size(2),
-                                          device=query_states.device,
-                                          dtype=torch.long).view(1, -1)
+            self.query_pos = torch.arange(
+                0, query_states.size(2), device=query_states.device, dtype=torch.long).view(1, -1)
 
         if not first_it:
             if use_selfextend:
@@ -399,7 +397,7 @@ class CascadeAttention(nn.Module):
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
             key_states, value_states = past_key_value.update(
-                key_states, value_states)
+                key_states, value_states, self.layer_idx)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -441,7 +439,7 @@ class Qwen2CascadeAttention(CascadeAttention, Qwen2Attention):
         # necessary because Qwen expects a max index and our index could be larger than the size
         # since we do not have the sink token positions in the cascade part of the kv cache
         if cos is None or sin is None:
-            cos, sin = self.rotary_emb(x, 32768)
+            cos, sin = self.rotary_emb(x, self.max_position_embeddings)
 
         # cos, sin = self.rotary_emb(x, 32768)
         _cos = cos[pos.view(-1)].reshape(1, pos.size(1), cos.size(-1))
@@ -560,9 +558,10 @@ def _sample_monkeypatch(
             stride = mdl.config._cascade_stride
             inputs = model_inputs["input_ids"]
 
+            # print(f"in sample monkeypatch {model_inputs['input_ids'].size()=}")
+
             for i in range(0, inputs.size(1), stride):
                 # print(f"{list(model_inputs.keys())=}")
-                # print(f"stride step: {i}")
                 model_inputs["input_ids"] = inputs[:, i:i + stride]
                 outputs = self(**model_inputs, return_dict=True)
                 # print(f"after {list(model_inputs.keys())=}")

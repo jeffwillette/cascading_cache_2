@@ -3,6 +3,7 @@ import numpy as np
 import unittest
 import triton
 import json
+import gc
 
 from argparse import Namespace
 from cascade.main.llama_eval import load_model
@@ -113,6 +114,7 @@ class TestCascadeAttention(unittest.TestCase):
 
             del model
             del past_key_values
+            gc.collect()
             torch.cuda.empty_cache()
 
     def test_cascade_attention_with_cache_iterative_equals_dense(self):
@@ -161,6 +163,7 @@ class TestCascadeAttention(unittest.TestCase):
 
             del model
             del past_key_values
+            gc.collect()
             torch.cuda.empty_cache()
 
 
@@ -242,6 +245,7 @@ class TestFlashAttention(unittest.TestCase):
             self.assertTrue(dq_close, f"{dq_diff.amax()=}")
 
             del q, k, v, ref_dv, ref_dk, ref_dq, ref_out, tri_out, fwd_diff
+            gc.collect()
             torch.cuda.empty_cache()
 
         # torch.set_printoptions(threshold=10_000)
@@ -267,70 +271,71 @@ class TestFlashAttention(unittest.TestCase):
         constant is never available and cannot be stored withouta big increase in memory.
         Test that the approxmate score method is accurate enough.
         """
-        torch.set_grad_enabled(False)
 
-        N_CTX, N_KV = 128, 4096
-        q = torch.randn(1, 1, N_CTX, 128, dtype=torch.float16, device="cuda")
-        k = torch.randn(1, 1, N_KV, 128, dtype=torch.float16, device="cuda")
-        v = torch.randn(1, 1, N_KV, 128, dtype=torch.float16, device="cuda")
+        with torch.no_grad():
+            N_CTX, N_KV = 128, 4096
+            q = torch.randn(1, 1, N_CTX, 128, dtype=torch.float16, device="cuda")
+            k = torch.randn(1, 1, N_KV, 128, dtype=torch.float16, device="cuda")
+            v = torch.randn(1, 1, N_KV, 128, dtype=torch.float16, device="cuda")
 
-        M = torch.full((1, N_KV - N_CTX), 0, dtype=torch.bool, device="cuda")
-        M2 = torch.full((N_CTX, N_CTX), 1, dtype=torch.bool, device="cuda").triu(1)
-        M_eager = torch.cat((M.repeat(N_CTX, 1), M2), dim=-1)
+            M = torch.full((1, N_KV - N_CTX), 0, dtype=torch.bool, device="cuda")
+            M2 = torch.full((N_CTX, N_CTX), 1, dtype=torch.bool, device="cuda").triu(1)
+            M_eager = torch.cat((M.repeat(N_CTX, 1), M2), dim=-1)
 
-        window = 128
-        total = window * 4
-        cache = CascadingKVCache(
-            window, num_sink_tokens=64, max_batch_size=1,
-            heads=1, dim=128,
-            max_seq_len=total,
-            dtype=torch.float16,
-            device="cuda",
-            cascade_func="pow2",
-            head_reduction="mean",
-            layers=1,
-            eager_fill=False,
-        )
+            window = 128
+            total = window * 4
+            cache = CascadingKVCache(
+                window, num_sink_tokens=64, max_batch_size=1,
+                heads=1, dim=128,
+                max_seq_len=total,
+                dtype=torch.float16,
+                device="cuda",
+                cascade_func="pow2",
+                head_reduction="mean",
+                layers=1,
+                eager_fill=False,
+            )
 
-        eager_cache = CascadingKVCache(
-            window, num_sink_tokens=64, max_batch_size=1,
-            heads=1, dim=128,
-            max_seq_len=total,
-            dtype=torch.float16,
-            device="cuda",
-            cascade_func="pow2",
-            head_reduction="mean",
-            layers=1,
-            eager_fill=False,
-        )
+            eager_cache = CascadingKVCache(
+                window, num_sink_tokens=64, max_batch_size=1,
+                heads=1, dim=128,
+                max_seq_len=total,
+                dtype=torch.float16,
+                device="cuda",
+                cascade_func="pow2",
+                head_reduction="mean",
+                layers=1,
+                eager_fill=False,
+            )
 
-        # flash
-        scale = 1 / np.sqrt(q.size(-1))
-        _, score = attention(q, k, v, True, scale, M.squeeze(0), cache.beta)
-        _, _, _, _, _, _, pos, _, og_pos = cache.update(k, v, 0, score)
-        # print(f"flash og pos {og_pos=}")
-        # print(f"flash score: {score=}")
+            # flash
+            scale = 1 / np.sqrt(q.size(-1))
+            _, score = attention(q, k, v, True, scale, M.squeeze(0), cache.beta)
+            _, _, _, _, _, _, pos, _, og_pos = cache.update(k, v, 0, score)
+            # print(f"flash og pos {og_pos=}")
+            # print(f"flash score: {score=}")
 
-        # eager
-        qkT = torch.einsum("bhqd,bgkd->bhqk", np.sqrt(scale) * q, np.sqrt(scale) * k)
-        qkT = qkT + (M_eager * torch.finfo(qkT.dtype).min)
-        eager_scores = qkT.softmax(dim=-1)
+            # eager
+            qkT = torch.einsum("bhqd,bgkd->bhqk", np.sqrt(scale) * q, np.sqrt(scale) * k)
+            qkT = qkT + (M_eager * torch.finfo(qkT.dtype).min)
+            eager_scores = qkT.softmax(dim=-1)
 
-        beta = eager_cache.beta
-        exps = (1 - beta) * beta**torch.arange(
-            eager_scores.size(2), device=eager_scores.device).flip(dims=(0, ))
-        eager_scores = (eager_scores * exps[None, None, :, None]).sum(dim=2).half()
-        # print(f"eager score: {eager_scores=}")
-        _, _, _, _, _, _, _, _, eager_og_pos = eager_cache.update(k, v, 0, eager_scores)
-        # print(f"{eager_og_pos=}")
+            beta = eager_cache.beta
+            exps = (1 - beta) * beta**torch.arange(
+                eager_scores.size(2), device=eager_scores.device).flip(dims=(0, ))
+            eager_scores = (eager_scores * exps[None, None, :, None]).sum(dim=2).half()
+            # print(f"eager score: {eager_scores=}")
+            _, _, _, _, _, _, _, _, eager_og_pos = eager_cache.update(k, v, 0, eager_scores)
+            # print(f"{eager_og_pos=}")
 
-        # diff = og_pos != eager_og_pos
-        # print(f"{diff.sum()=}")
+            # diff = og_pos != eager_og_pos
+            # print(f"{diff.sum()=}")
 
-        score_diff = (score - eager_scores).abs().amax()
-        self.assertTrue(torch.allclose(score, eager_scores, atol=1e-5), f"{score_diff=}")
+            score_diff = (score - eager_scores).abs().amax()
+            self.assertTrue(torch.allclose(score, eager_scores, atol=1e-5), f"{score_diff=}")
 
-        torch.set_grad_enabled(True)
+        del q, k, v, cache, eager_cache, qkT, M, M2, M_eager
+        gc.collect()
 
 
 class TestCascadingKVCache(unittest.TestCase):
@@ -389,6 +394,7 @@ class TestCascadingKVCache(unittest.TestCase):
                                      f"{WIND[l]=} layer: {l=} {cache.stored_tokens[l]=}"
                                      )
             del cache, k, v, pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask, of_pos
+            gc.collect()
 
     def test_num_sinks(self):
         # toy settings
@@ -430,6 +436,9 @@ class TestCascadingKVCache(unittest.TestCase):
 
                         out = cache.update(_k, _v, 0)
                     print(f"{NSINK=}")
+
+                    del cache, _k, _v, out
+                    gc.collect()
 
     def test_eager_add_same_as_one_cascade(self):
         # toy settings
@@ -504,7 +513,8 @@ class TestCascadingKVCache(unittest.TestCase):
 
                     self.assertTrue(passing, f"failed {name=} Streaming LLM: {sllm_item=} Ours: {item=}")
 
-            del cache, cache_sllm, sllm_out, out
+            del cache, cache_sllm, sllm_out, out, _k, _v
+            gc.collect()
 
     def test_against_naive_single_iter(self):
         # toy settings
@@ -653,6 +663,7 @@ class TestCascadingKVCache(unittest.TestCase):
             del cache, cache_slow, k, v, k_slow, v_slow, pos_slow, sink_mask_slow
             del k_nosink_slow, v_nosink_slow, pos_nosink_slow, mask_slow
             del pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask, of_pos
+            gc.collect()
             slow_times = slow_times[100:]
             fast_times = fast_times[100:]
             slow_times = sum(slow_times) / len(slow_times)
@@ -808,6 +819,7 @@ class TestCascadingKVCache(unittest.TestCase):
             del cache, cache_slow, k, v, k_slow, v_slow, pos_slow, sink_mask_slow
             del k_nosink_slow, v_nosink_slow, pos_nosink_slow, mask_slow
             del pos, sink_mask, k_nosink, v_nosink, pos_nosink, mask, of_pos
+            gc.collect()
 
             slow_times = slow_times[100:]
             slow_times = sum(slow_times) / len(slow_times)
@@ -900,6 +912,7 @@ class TestCascadingKVCache(unittest.TestCase):
         cascade_mean = sum(cascade_times) / len(cascade_times) / its
 
         del cache, cache_cascade, _k, _v, pos, sink_mask, k_nosink, v_nosink, mask, og_pos
+        gc.collect()
         print(f"{naive_mean=} {fast_mean=} {cascade_mean=}")
         print(f"{cascade_mean / naive_mean=}")
         print(f"{fast_mean / naive_mean=}")

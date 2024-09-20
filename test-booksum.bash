@@ -15,7 +15,7 @@ WINDOW=2048
 CASCADES=(4 1)
 METHOD=$method
 
-if [ "$METHOD" = "vanilla" ]; then
+if [[ "$METHOD" = "vanilla" || "$METHOD" = "snapkv" || "$METHOD" = "bigbird" ]]; then
     CASCADES=(1)
 fi
 
@@ -26,7 +26,9 @@ CASCADE_FUNC="pow2"
 GPU=$gpu
 MODEL=$model
 # COMMENT="vanilla-truncate-right-half-ctx"
-COMMENT="half-ctx"
+# COMMENT="vanilla"
+COMMENT="none"
+# COMMENT="half-ctx"
 CASCADE_STRIDE=512
 
 for i in "${!CASCADES[@]}";

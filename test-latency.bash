@@ -1,17 +1,24 @@
 #!/bin/bash
 
 # passkey experiment
-GPUS=5
+GPUS=6
 WINDOW=16384
 CASCADES=4
 SINKS=64
 BATCH_SIZE=1
 
 HEAD_REDUCTION=max
-MODEL=llama3.1-8b
+# MODEL=llama3.1-8b
 # METHODS=(vanilla sink sink sink sink sink sink sink sink sink)
 # CASCADE_STRIDES=(1 128 256 512 1024 2048 4096 8192 16384 1)
-METHODS=(sink)
+
+# MODEL=llama7b-chat
+# METHODS=(h2o)
+# CASCADE_STRIDES=(1)
+
+MODEL=llama3.1-8b
+# MODEL=llama7b-chat
+METHODS=(snapkv)
 CASCADE_STRIDES=(1)
 
 for i in "${!METHODS[@]}";

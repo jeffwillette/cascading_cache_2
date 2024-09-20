@@ -33,6 +33,7 @@ D. {choice_d}
 
 Answer:{answer_placeholder}"""
 
+
 MMLU_SUBJECTS = [
     'business_ethics',
     'clinical_knowledge',
@@ -130,7 +131,11 @@ def format_mmlu(question,
     )
 
 
-def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args):
+def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args, subject_stats, subject_name):
+
+    avg_len = subject_stats[subject_name][0]
+    target_window = 2**int(np.log2(avg_len))
+    target_window = min(2048, target_window)
 
     def gather_token_ids(candidates):
         ids = []
@@ -158,7 +163,7 @@ def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args):
 
     max_length = model.config.max_position_embeddings
     if args.method == "vanilla" and "truncate" in args.comment:
-        max_length = args.window
+        max_length = target_window
 
     inputs = tokenizer(
         texts,
@@ -172,7 +177,7 @@ def exam_mmlu(model, tokenizer: transformers.PreTrainedTokenizer, texts, args):
     if args.method == "sink":
         # max_seq_len = int(2 ** math.floor(np.log2(inputs.input_ids.size(1) / 2)))
         # max_seq_len = min(max_seq_len, 16384)
-        max_seq_len = args.window
+        max_seq_len = target_window
         window = max_seq_len // args.cascades
         mdl = model.model
 
@@ -261,7 +266,7 @@ def get_fewshots(dataset, subject_name, shift=1):
     return few_shots
 
 
-def format_mmlu_plain(question, subject_name, few_shots):
+def format_mmlu_plain(question, subject_name, few_shots, tokenizer):
     text = format_mmlu(
         question,
         len(few_shots) + 1,
@@ -270,9 +275,22 @@ def format_mmlu_plain(question, subject_name, few_shots):
         answer_placeholder="",
     )
 
+    # fs_q = [v[:-1] for v in few_shots]
+    # fs_a = [v[-1:] for v in few_shots]
+
+    # messages = [
+    #     {"role": "system", "content": f"The following are multiple choice questions (with answers) about {subject_name}"},
+    # ]
+
+    # for q, a in zip(fs_q, fs_a):
+    #     messages += [{"role": "user", "content": q}, {"role": "system", "content": a}]
+    # messages += [{"role": "user", "content": text}]
+
+    # text = tokenizer.apply_chat_template(messages, tokenize=False)
+    # text += "<|start_header_id|>system<|end_header_id|>\n"
+
     questions = "\n\n".join(few_shots)
-    text = "You are a helpful chat bot that answers multiple choice test " + \
-        "questions. The following are examples of multiple choice test questions " + \
+    text = "The following are multiple choice questions (with answers) " + \
         f"about {subject_name}:\n\n{questions}\n\n" + \
         text
 
@@ -280,7 +298,7 @@ def format_mmlu_plain(question, subject_name, few_shots):
     return text, truth
 
 
-def evaluate_mmlu(args, model, tokenizer, subject_name, json_path):
+def evaluate_mmlu(args, model, tokenizer, subject_name, json_path, subject_stats):
     dataset = load_dataset('lukaemon/mmlu', subject_name, trust_remote_code=True)
 
     few_shots = get_fewshots(dataset, subject_name, shift=1)
@@ -290,7 +308,7 @@ def evaluate_mmlu(args, model, tokenizer, subject_name, json_path):
     n_correct = 0
     seq_len_sum = 0
 
-    qanda = [format_mmlu_plain(question, subject_name, few_shots) for question in dataset["test"]]
+    qanda = [format_mmlu_plain(question, subject_name, few_shots, tokenizer) for question in dataset["test"]]
 
     print("total len of questions and answers: ", len(qanda))
     n = math.ceil(len(qanda) / args.batch_size)
@@ -303,7 +321,7 @@ def evaluate_mmlu(args, model, tokenizer, subject_name, json_path):
             texts = [v[0] for v in input_slice]
             truths = [v[1] for v in input_slice]
 
-            batch_estimations, seq_lens = exam_mmlu(model, tokenizer, texts, args)
+            batch_estimations, seq_lens = exam_mmlu(model, tokenizer, texts, args, subject_stats, subject_name)
             # print(f"{truths=} {batch_estimations=}")
 
             for estimations, truth, seq_len in zip(batch_estimations, truths,
@@ -375,7 +393,7 @@ def job_mmlu(args, model, tokenizer, device):
         print(f"mean len for {subject}: {subject_stats[subject][0]=}")
         # if subject_stats[subject][0] < args.window:
         #     continue
-        acc = evaluate_mmlu(args, model, tokenizer, subject, json_path)
+        acc = evaluate_mmlu(args, model, tokenizer, subject, json_path, subject_stats)
         accuracies.append(acc)
 
     accuracy = np.array(accuracies).mean()
@@ -403,8 +421,7 @@ if __name__ == "__main__":
 
         for input_slice in qanda:
             text, truth = input_slice
-            inputs = tokenizer(
-                text, return_tensors='pt', truncation=False)
+            inputs = tokenizer(text, return_tensors='pt', truncation=False)
 
             inputs = inputs.input_ids
             lens.append(inputs.size(1))

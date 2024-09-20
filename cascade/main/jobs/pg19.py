@@ -1,4 +1,5 @@
 import os
+import gc
 import torch
 from cascade.dataset.pg19 import PG19Streaming
 from tqdm import tqdm
@@ -16,9 +17,6 @@ def job_ppl_pg19(args, model, tokenizer, device):
     stats = {"nll-total": 0, "count-total": 0, "ppl-book": {}}
     dataset = PG19Streaming(tokenizer)
 
-    past_key_values = None
-    use_cache = False
-
     path = "cache/pg19/stats.json"
     if not os.path.exists(path):
         raise ValueError("run pg19 dataset file as __main__ to generate stats")
@@ -33,6 +31,9 @@ def job_ppl_pg19(args, model, tokenizer, device):
 
         input_ids = x.cuda()
         target_ids = y.cuda()
+
+        past_key_values = None
+        use_cache = False
 
         if args.method == "sink":
             use_cache = True
@@ -56,8 +57,17 @@ def job_ppl_pg19(args, model, tokenizer, device):
                 head_reduction=mdl.config._head_reduction,
                 layers=len(mdl.layers),
             )
-        elif args.method == "vanilla":
+        elif args.method == "sink":
             max_seq_len = 32768
+        elif args.method in ["bigbird", "snapkv"]:
+            mdl = model.model
+            max_seq_len = 32768
+            print(f"{max_seq_len=}")
+            for lyr in mdl.layers:
+                if args.method == "bigbird":
+                    lyr.self_attn.config._bb_window = args.window
+                elif args.method == "snapkv":
+                    lyr.self_attn.config.max_capacity_prompt = args.window
         else:
             raise ValueError(f"unsupported method: {args.method=}")
 
@@ -75,13 +85,14 @@ def job_ppl_pg19(args, model, tokenizer, device):
                     logits = output.logits
 
                     _nll = torch.nn.functional.cross_entropy(
-                        logits.reshape(-1, logits.size(-1)).float(),
-                        targets.reshape(-1),
+                        logits.reshape(-1, logits.size(-1)).cpu().float(),
+                        targets.reshape(-1).cpu(),
                         ignore_index=-100,
                         reduction="none",
                     )
 
                     nll, count = _nll.sum().item(), (targets >= 0).sum().item()
+                    del logits, output
 
                     stats["nll-total"] += nll
                     stats["count-total"] += count
@@ -92,8 +103,10 @@ def job_ppl_pg19(args, model, tokenizer, device):
                         stats['ppl-book'][j] = []
                     stats['ppl-book'][j].append((nll, count, max_seq_len))
 
-        del past_key_values, logits, targets, inputs, output, input_ids, target_ids
+        del past_key_values, targets, inputs, input_ids, target_ids
+        # del logits, output
         torch.cuda.empty_cache()
+        gc.collect()
 
     print(f"final ppl: {np.exp(stats['nll-total'] / stats['count-total'])}")
     os.makedirs('./cache/llama_eval/pg19/', exist_ok=True)

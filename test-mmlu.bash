@@ -16,7 +16,7 @@ METHOD=$method
 WINDOW=(2048 2048)
 CASCADES=(4 1)
 SINKS=(64 64)
-COMMENT=("2048-all" "2048-all")
+COMMENT=("2048-all-chat" "2048-all-chat")
 BATCH_SIZE=20
 
 if [ "$METHOD" = "vanilla" ]; then

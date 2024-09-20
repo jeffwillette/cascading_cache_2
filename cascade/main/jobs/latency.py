@@ -12,19 +12,23 @@ def job_latency(args, model, tokenizer, device):
 
     latency = []
     stride = args.cascade_stride
-    rng = [2 ** i for i in range(12, 20)]
-    if args.method != "vanilla":
+    rng = [2 ** i for i in range(12, 21)]
+    if args.method == "sink":
         if args.cascade_stride == 1:
             rng = [2 ** i for i in range(12, 16)]
         else:
             rng = [2 ** i for i in range(12, 21)]
+    elif args.method == "h2o":
+        rng = [2 ** i for i in range(12, 19)]
 
+    print(f"{args.method=}")
     for l in rng:
         input_ids = torch.randn(1, 1024, 4096, dtype=torch.float16, device="cuda").repeat(1, l // 1024, 1)
+        position_ids = torch.arange(l, device="cuda").unsqueeze(0)
         position_embeddings = m.rotary_emb(input_ids, torch.arange(l, device="cuda").view(1, -1))
         model = m.layers[0].self_attn
 
-        if args.method != "vanilla":
+        if args.method == "sink":
             window = args.window // args.cascades
             past_key_values = CascadingKVCache(
                 window, num_sink_tokens=4, max_batch_size=1,
@@ -63,6 +67,48 @@ def job_latency(args, model, tokenizer, device):
                 del output, input_ids, position_embeddings
                 torch.cuda.empty_cache()
 
+            elif args.method == "h2o":
+                # cache is an attention class attribute in h2o
+                tic = time.perf_counter()
+                for i in range(0, input_ids.size(1), stride):
+                    inp = input_ids[:, i:i + stride]
+                    output = model(inp, position_ids=position_ids[:, i:i + stride], use_cache=True)
+
+                torch.cuda.synchronize()
+                t = time.perf_counter() - tic
+                latency.append(t)
+                print(f"latency for h2o: len: {l}: {t}")
+
+            elif args.method == "snapkv":
+                cache = DynamicCache()
+                output = model(
+                    input_ids,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    past_key_value=cache,
+                    use_cache=True,
+                )
+
+                cache = DynamicCache()
+                del output, cache
+                torch.cuda.synchronize()
+
+                cache = DynamicCache()
+
+                tic = time.perf_counter()
+                output = model(
+                    input_ids,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    past_key_value=cache,
+                    use_cache=True,
+                )
+                torch.cuda.synchronize()
+                t = time.perf_counter() - tic
+                latency.append(t)
+                print(f"latency for snapkv: len: {l}: {t}")
+
+                del output, position_embeddings, input_ids, cache
             else:
                 cache = DynamicCache()
                 output = model(
