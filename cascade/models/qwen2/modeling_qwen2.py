@@ -1135,8 +1135,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
-        # logger.warning_once("temporarily commented out float")
-        logits = logits.float()
+        logger.warning_once("temporarily commented out float")
+        # logits = logits.float()
 
         loss = None
         if labels is not None:
