@@ -44,7 +44,7 @@ def gen_filler_text(num_words):
     return " ".join(out)
 
 
-def gen_text(tokenizer):
+def gen_text(tokenizer, max_tokens):
     FILLER_TEXT = gen_filler_text(1000000)
 
     prefix_tok = tokenizer(PREFIX, return_tensors="pt", truncation=False).input_ids[0]
@@ -58,7 +58,11 @@ def gen_text(tokenizer):
     filler_tok = tokenizer(FILLER_TEXT, return_tensors="pt", truncation=False).input_ids[0]
 
     inputs, targets, len_loc = [], [], []
-    prompt_lens = [32768, 65536, 131072, 262144, 524288, 524288 * 2]
+    if max_tokens == "1M":
+        prompt_lens = [32768, 65536, 131072, 262144, 524288, 524288 * 2]
+    elif max_tokens == "262K":
+        prompt_lens = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
+
     insert_locs = [0.2, 0.4, 0.6, 0.8, 1.0]
 
     for l in prompt_lens:
@@ -87,14 +91,14 @@ def gen_text(tokenizer):
 
 class Passkey(Dataset):
 
-    def __init__(self, tokenizer, batch_size=10):
+    def __init__(self, tokenizer, batch_size=10, max_tokens="1M"):
         self.tokenizer = tokenizer
         os.makedirs("cache/passkey", exist_ok=True)
-        cache_path = f"cache/passkey/{'-'.join(tokenizer.name_or_path.split('/'))[1:]}.pt"
+        cache_path = f"cache/passkey/{max_tokens}-{'-'.join(tokenizer.name_or_path.split('/'))[1:]}.pt"
         if os.path.exists(cache_path):
             inputs, targets, len_loc = torch.load(cache_path)
         else:
-            inputs, targets, len_loc = gen_text(self.tokenizer)
+            inputs, targets, len_loc = gen_text(self.tokenizer, max_tokens)
             torch.save((inputs, targets, len_loc), cache_path)
 
         self.batch_size = batch_size

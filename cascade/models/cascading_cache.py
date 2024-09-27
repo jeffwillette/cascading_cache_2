@@ -1201,27 +1201,38 @@ class CascadingKVCache(Cache):
         if self.cascade_func == "pow2":
             self.do_cache_every_n = [torch.tensor([2**i for i in range(self.cascades[l])], device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow2-1":
+            # do cache every time except for last cascade which is pow2
             self.do_cache_every_n = [torch.tensor(
                 [1 for i in range(self.cascades[l] - 1)] + \
                 [2**i for i in range(self.cascades[l] - 1, self.cascades[l])],
                 device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow2-1-4":
+            # co cache every time except for the last 1/4th which is pow2
             n = [c // 4 for c in self.cascades]
             self.do_cache_every_n = [torch.tensor(
                 [1 for i in range(3 * n[l])] + \
                 [2**i for i in range(3 * n[l], self.cascades[l])],
                 device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow2-2-4":
+            # do cache every time, except for last half which is pow2
             n = [c // 4 for c in self.cascades]
             self.do_cache_every_n = [torch.tensor(
                 [1 for i in range(2 * n[l])] + \
                 [2**i for i in range(2 * n[l], self.cascades[l])],
                 device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow2-3-4":
+            # do cache every time in the first 1/4, then pow2 for the last 3/4
             n = [c // 4 for c in self.cascades]
             self.do_cache_every_n = [torch.tensor(
                 [1 for i in range(1 * n[l])] + \
                 [2**i for i in range(1 * n[l], self.cascades[l])],
+                device=dev, dtype=torch.long) for l in range(L)]
+        elif self.cascade_func == "1-then-2":
+            # do cache every time on the first cache, then accept half tokens for all other caches
+            # this one results in an almost doubling of the token span in the cache
+            self.do_cache_every_n = [torch.tensor(
+                [1 for i in range(1)] + \
+                [2 for _ in range(1, self.cascades[l])],
                 device=dev, dtype=torch.long) for l in range(L)]
         elif self.cascade_func == "pow3":
             self.do_cache_every_n = [torch.tensor([3**i for i in range(self.cascades[l])], device=dev, dtype=torch.long) for l in range(L)]

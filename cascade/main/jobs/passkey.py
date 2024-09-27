@@ -3,6 +3,7 @@ import torch
 from tqdm import tqdm
 import json
 from cascade.models.cascading_cache import CascadingKVCache
+from cascade.models.offloaded_cache import OffloadedCache
 from cascade.dataset.passkey import Passkey
 
 
@@ -46,7 +47,11 @@ def job_passkey(args, model, tokenizer, device):
             layers=len(m.layers),
         )
 
-    dataset = Passkey(tokenizer, batch_size=args.batch_size)
+    pk_type = "1M"
+    if args.comment == "262K":
+        pk_type = "262K"
+
+    dataset = Passkey(tokenizer, batch_size=args.batch_size, max_tokens=pk_type)
 
     stride = args.cascade_stride
 
@@ -61,6 +66,7 @@ def job_passkey(args, model, tokenizer, device):
 
     for j, (input_ids, targets, len_locs) in enumerate(tqdm(dataset, ncols=150)):
         len_loc = len_locs[0]  # they should all be the same in a single batch
+
         ll_str = len_loc_str(len_loc)
 
         correct, count = 0, 0
@@ -75,31 +81,39 @@ def job_passkey(args, model, tokenizer, device):
 
         if args.method != "vanilla":
             past_key_values.reset(verbose=False)
+        elif args.method == "vanilla":
+            past_key_values = OffloadedCache()
         else:
-            past_key_values = None
+            raise NotImplementedError(f"passkey pkv for {args.method=} is not implemented")
 
         with torch.no_grad():
-            with tqdm(range(0, input_ids.size(1) - 1, stride), ncols=150) as pbar:
-                for i in pbar:
-                    # print(f"stride step: {i}")
-                    inputs = input_ids[:, i:i + stride]
-                    output = model(inputs, use_cache=True, past_key_values=past_key_values)
-                    past_key_values = output.past_key_values
+            if args.method == "sink":
+                with tqdm(range(0, input_ids.size(1) - 1, stride), ncols=150) as pbar:
+                    for i in pbar:
+                        # print(f"stride step: {i}")
+                        inputs = input_ids[:, i:i + stride]
+                        output = model(inputs, use_cache=True, past_key_values=past_key_values)
+                        past_key_values = output.past_key_values
+            elif args.method == "vanilla":
+                output = model(input_ids, use_cache=True, past_key_values=past_key_values)
+                past_key_values = output.past_key_values
+            else:
+                raise NotImplementedError(f"passkey not implemented for {args.method=}")
 
-                # print(f"{inp.size()=} {input_ids.size()=}")
-                guesses, i = [], 0
-                for i in range(50):
-                    pred = output.logits[:, -1:].argmax(dim=-1)
-                    guesses.append(pred.cpu())
-                    output = model(pred, use_cache=True, past_key_values=past_key_values)
+            # print(f"{inp.size()=} {input_ids.size()=}")
+            guesses, i = [], 0
+            for i in range(50):
+                pred = output.logits[:, -1:].argmax(dim=-1)
+                guesses.append(pred.cpu())
+                output = model(pred, use_cache=True, past_key_values=past_key_values)
 
-                guesses = torch.cat(guesses, dim=-1)
-                # print(f"{guesses=}\n{guesses.size()=}")
-                output: str = tokenizer.batch_decode(
-                    guesses.data.cpu(),
-                    skip_special_tokens=True,
-                )
-                # print(f"{output=}")
+            guesses = torch.cat(guesses, dim=-1)
+            # print(f"{guesses=}\n{guesses.size()=}")
+            output: str = tokenizer.batch_decode(
+                guesses.data.cpu(),
+                skip_special_tokens=True,
+            )
+            # print(f"{output=}")
 
             guess_string = [get_numbers(s.strip()) for s in output]
             print(f"{guess_string=} {targets=}")

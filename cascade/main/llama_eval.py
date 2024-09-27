@@ -207,6 +207,7 @@ def load_model(args):
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
     if args.method == "h2o":
+        # sinks and window args from cli args are fit into h2o setting within laod function
         from cascade.models.h2o import load
         model, _ = load(model_id, heavy_hitter=True, args=args)
     elif args.method == "snapkv":

@@ -5,6 +5,7 @@ from cascade.dataset.pg19 import PG19Streaming
 from tqdm import tqdm
 import json
 from cascade.models.cascading_cache import CascadingKVCache
+import math
 import numpy as np
 from cascade.utils.other import pad_targets
 
@@ -57,11 +58,11 @@ def job_ppl_pg19(args, model, tokenizer, device):
                 head_reduction=mdl.config._head_reduction,
                 layers=len(mdl.layers),
             )
-        elif args.method == "sink":
-            max_seq_len = 32768
+        elif args.method == "vanilla":
+            max_seq_len = args.window
         elif args.method in ["bigbird", "snapkv"]:
             mdl = model.model
-            max_seq_len = 32768
+            max_seq_len = args.window
             print(f"{max_seq_len=}")
             for lyr in mdl.layers:
                 if args.method == "bigbird":
@@ -79,6 +80,20 @@ def job_ppl_pg19(args, model, tokenizer, device):
                     inputs = input_ids[:, i:i + stride]
                     targets = target_ids[:, i + 1:i + stride + 1]
                     targets = pad_targets(inputs, targets, ignore_index=-100)
+
+                    # there were some errors on bigbird, so added padding to powers of 2 
+                    # helped. Probably a triton issue
+                    if args.method == "bigbird":
+                        if np.log2(inputs.size(1)) % 1 != 0:
+                            target_len = 2 ** math.ceil(np.log2(inputs.size(1)))
+                            len_diff = target_len - inputs.size(1)
+                            print(f"{inputs.size()=} {target_len=} {len_diff=}")
+                            inputs = torch.cat((
+                                inputs,
+                                torch.zeros(inputs.size(0), len_diff, dtype=inputs.dtype, device=inputs.device)), dim=-1)
+                            targets = torch.cat((
+                                targets,
+                                torch.full((targets.size(0), len_diff), -100, dtype=inputs.dtype, device=inputs.device)), dim=-1)
 
                     output = model(inputs, use_cache=use_cache, past_key_values=past_key_values)
                     past_key_values = output.past_key_values

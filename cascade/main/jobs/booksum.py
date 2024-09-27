@@ -10,6 +10,7 @@ import torch
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from transformers import LogitsProcessor, LogitsProcessorList
+from transformers.cache_utils import SinkCache, DynamicCache
 
 from cascade.dataset.booksum import BookSumDataset
 from cascade.models.cascading_cache import CascadingKVCache
@@ -73,11 +74,12 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
         max_length = None
         truncation = False
 
-    inputs = tokenizer.apply_chat_template(messages,
-                                           return_tensors='pt',
-                                           max_length=max_length,
-                                           truncation=truncation,
-                                           )
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        return_tensors='pt',
+        max_length=max_length,
+        truncation=truncation,
+    )
 
     seq_len = inputs.shape[-1]
     print(f"seq_len: {seq_len}")
@@ -96,10 +98,10 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
                                                )
         seq_len = inputs.shape[-1]
         print(f"seq_len after truncating: {seq_len}")
-    elif args.method == "snapkv":
+    elif args.method in ["snapkv", "h2o"] or "cascade-quadratic-prompt" in args.comment:
         print("truncating snapkv model due to OOM")
         tokenizer.truncation_side = "right"
-        max_seq_len = 22000
+        max_seq_len = 32768
         inputs = tokenizer.apply_chat_template(messages,
                                                return_tensors='pt',
                                                max_length=max_seq_len,
@@ -119,12 +121,15 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
         )
 
     past_key_values = None
+
+    max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
+    print(f"{max_seq_len=}")
+    max_seq_len = 2048
     if args.method == "sink":
         mdl = model.model
-        max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
         # max_seq_len = args.window
+
         max_seq_len = min(max_seq_len, mdl.config.max_position_embeddings // 2)
-        print(f"{max_seq_len=}")
         window = max_seq_len // args.cascades
 
         past_key_values = CascadingKVCache(
@@ -140,16 +145,25 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
             head_reduction=mdl.config._head_reduction,
             layers=len(mdl.layers),
         )
-    elif args.method in ["bigbird", "snapkv"]:
+    elif args.method in ["bigbird", "snapkv", "h2o"]:
         mdl = model.model
-        max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
-        print(f"{max_seq_len=}")
 
         for lyr in mdl.layers:
             if args.method == "bigbird":
                 lyr.self_attn.config._bb_window = max_seq_len
             elif args.method == "snapkv":
-                lyr.self_attn.config.max_capacity_prompt = max_seq_len
+                # since snapkv applies the original positional encodings, we cannot use a sink cache
+                # here. So we need to subtract the number of generated tokens from the snapshot size
+                lyr.self_attn.config.max_capacity_prompt = max(128, max_seq_len - 300)
+
+            elif args.method == "h2o":
+                lyr.self_attn.kv_cache.recent_size = max_seq_len // 2
+                lyr.self_attn.kv_cache.hh_size = max_seq_len // 2
+
+                lyr.self_attn.kv_cache.cache_size = \
+                    lyr.self_attn.kv_cache.recent_size + lyr.self_attn.kv_cache.hh_size
+
+                lyr.self_attn.kv_cache._clean_scores()
 
     _output = model.generate(
         inputs=inputs.cuda(),
@@ -158,9 +172,9 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
         max_new_tokens=args.max_tokens,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
-        logits_processor=LogitsProcessorList([
-            StopAfterStringIsGenerated(inputs.shape[-1], tokenizer)
-        ]),
+        # logits_processor=LogitsProcessorList([
+        #     StopAfterStringIsGenerated(inputs.shape[-1], tokenizer)
+        # ]),
         **additional_args,
     )
     output: str = tokenizer.decode(
@@ -240,19 +254,20 @@ def generate_samples(args, model, tokenizer, device, out_dir):
         else:
             output = generate_summary(args, model, tokenizer, device, idx, item, out_dir)
 
-        output_summary = output.replace('\n', '\\n')[:200]
-        tqdm.write(f"[{idx:<7}] Summary: {output_summary}[...]")
-        with open(out_dir / f"out_{idx}.txt", 'w') as f:
-            f.write(output)
-        outputs.append(output)
+        if output != -1:
+            output_summary = output.replace('\n', '\\n')[:200]
+            tqdm.write(f"[{idx:<7}] Summary: {output_summary}[...]")
+            with open(out_dir / f"out_{idx}.txt", 'w') as f:
+                f.write(output)
+            outputs.append(output)
 
-        fname = f"saves/llama_eval/booksum/reference/ref_{idx}.txt"
-        if not os.path.exists(fname):
-            with open(fname, 'w') as f:
-                if isinstance(completion, str):
-                    f.write(completion)
-                else:
-                    f.write(tokenizer.decode(completion, skip_special_tokens=True))
+            fname = f"saves/llama_eval/booksum/reference/ref_{idx}.txt"
+            if not os.path.exists(fname):
+                with open(fname, 'w') as f:
+                    if isinstance(completion, str):
+                        f.write(completion)
+                    else:
+                        f.write(tokenizer.decode(completion, skip_special_tokens=True))
 
 
 MAX_NEW_TOKENS = 256
