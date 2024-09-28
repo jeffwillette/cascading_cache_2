@@ -4,6 +4,7 @@ import numpy as np
 from typing import Optional, Tuple
 
 import torch
+from cascade.models.flash_attention import attention
 from torch import nn
 import torch.utils.checkpoint
 
@@ -414,7 +415,7 @@ def attn_batched_quad(query_states, key_states, value_states):
     return attn_weights, attn_output
 
 
-def attn_batched(query_states, key_states, value_states):
+def attn_batched_full(query_states, key_states, value_states):
     N, HEAD, TDST, HID = query_states.shape
     N, HEAD_KV, TSRC, HID = key_states.shape
     assert key_states.shape == value_states.shape
@@ -454,8 +455,9 @@ def attn_batched(query_states, key_states, value_states):
         ).to(query_states.dtype)
 
         num_new_tokens += attn_weights.size(2)
-        attn_weight_accumulator[:, :, :, :i_tdst_end + TSRC - TDST].add_(attn_weights.sum(2, keepdim=True))
-        attn_output = torch.matmul(attn_weights, value_states[:, :, :i_tdst_end + TSRC - TDST])
+        # print(f"{attn_weight_accumulator.size()=} {attn_weights.size()=}")
+        attn_weight_accumulator.add_(attn_weights.sum(2, keepdim=True))
+        attn_output = torch.matmul(attn_weights, value_states)
 
         attn_output_final.index_copy_(
             dim=2,
@@ -466,6 +468,25 @@ def attn_batched(query_states, key_states, value_states):
     attn_weights = attn_weight_accumulator
     attn_output = attn_output_final
     return attn_weights, attn_output, num_new_tokens
+
+
+def attn_batched(query_states, key_states, value_states):
+    N, HEAD, TDST, HID = query_states.shape
+    N, HEAD_KV, TSRC, HID = key_states.shape
+    assert key_states.shape == value_states.shape
+
+    num_new_tokens = TDST
+
+    mask = torch.zeros(TSRC - TDST, dtype=torch.bool, device=key_states.device)
+    out, scores = attention(
+        query_states,
+        key_states,
+        value_states,
+        True, 1 / np.sqrt(HID), mask, 0.9999
+    )
+    scores = scores.unsqueeze(2)
+
+    return scores, out, num_new_tokens
 
 
 # H2O KV Cache dropping with Position rolling
@@ -509,7 +530,7 @@ class H2OLlamaAttention_streaming(nn.Module):
     def _clean_cache(self):
         self.kv_cache._clean_scores()
 
-    def forward(
+    def forward_old(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -561,7 +582,7 @@ class H2OLlamaAttention_streaming(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         num_new_tokens = None
-        if "h2o-linear" in self.config.comment:
+        if "h2o-linear" in self.config.comment and query_states.size(-2) > 64:
             attn_weights, attn_output, num_new_tokens = attn_batched(query_states, key_states, value_states)
         else:
             attn_weights, attn_output = attn_batched_quad(query_states, key_states, value_states)
@@ -609,7 +630,7 @@ class H2OLlamaAttention_streaming(nn.Module):
 
         return attn_output, attn_weights, past_key_value
 
-    def forward_original(
+    def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -787,56 +808,7 @@ class H2OQwenAttention_streaming(nn.Module):
     def _clean_cache(self):
         self.kv_cache._clean_scores()
 
-    def attn_batched(self, query_states, key_states, value_states):
-        N, HEAD, TDST, HID = query_states.shape
-        N, HEAD_KV, TSRC, HID = key_states.shape
-        assert key_states.shape == value_states.shape
-
-        attn_weight_accumulator = torch.zeros(
-            (N, HEAD, 1, TSRC),
-            dtype=torch.float32,
-            device=query_states.device
-        )
-
-        chunk_count = math.ceil((TDST * TSRC) / (2040 * 2048))
-        chunk_size = math.ceil(TDST / chunk_count)
-
-        attn_output_final = torch.empty_like(query_states)
-
-        for i_tdst_start in range(0, TDST, chunk_size):
-            i_tdst_end = min(i_tdst_start + chunk_size, TDST)
-            attn_weights = torch.matmul(
-                query_states[:, :, i_tdst_start:i_tdst_end] / np.sqrt(np.sqrt(HID)),
-                key_states[:, :, :i_tdst_end + TSRC - TDST].transpose(2, 3) / np.sqrt(np.sqrt(HID))
-            )
-            if TDST > 1:
-                idx_tdst = torch.arange(i_tdst_start, i_tdst_end, device=query_states.device)
-                idx_tsrc = torch.arange(0, i_tdst_end, device=query_states.device) + TSRC - TDST
-                attn_weights = torch.where(
-                    idx_tsrc[None, None, None, :] <= idx_tdst[None, None, :, None],
-                    attn_weights,
-                    -32000.0
-                )
-            attn_weights = nn.functional.softmax(
-                attn_weights,
-                dim=-1,
-                dtype=torch.float32
-            ).to(query_states.dtype)
-
-            attn_weight_accumulator[:, :, :, :i_tdst_end + TSRC - TDST].add_(attn_weights.sum(2, keepdim=True))
-            attn_output = torch.matmul(attn_weights, value_states[:, :, :i_tdst_end + TSRC - TDST])
-
-            attn_output_final.index_copy_(
-                dim=2,
-                index=torch.arange(i_tdst_start, i_tdst_end, device=attn_output.device),
-                source=attn_output.to(attn_output_final.dtype)
-            )
-
-        attn_weights = attn_weight_accumulator
-        attn_output = attn_output_final
-        return attn_weights, attn_output
-
-    def forward(
+    def forward_old(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -916,6 +888,137 @@ class H2OQwenAttention_streaming(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # remake causal mask
+        pkv_len = 0
+        if len(past_key_value) > self.layer_idx:
+            pkv_len = past_key_value[self.layer_idx][0].shape[-2]
+
+        attention_mask = _make_causal_mask(
+            bsz=bsz,
+            tgt_len=q_len,
+            past_key_values_length=pkv_len,
+            dtype=query_states.dtype,
+            device=query_states.device,
+        )
+
+        kv_seq_len = key_states.shape[-2]
+
+        if len(past_key_value) > self.layer_idx:
+            kv_seq_len += past_key_value[self.layer_idx][0].shape[-2]
+
+        position_ids = torch.arange(kv_seq_len, device=position_ids.device, dtype=position_ids.dtype)
+        position_ids = position_ids.unsqueeze(0)
+
+        if not position_ids.nelement() > 1:
+            position_ids[0][0] = kv_seq_len - 1
+
+        cos, sin = self.rotary_emb(value_states, position_ids=position_ids)
+        # Shift Pos: query pos is min(cache_size, idx)
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        query_states = apply_rotary_pos_emb_single_qwen(query_states, cos, sin, position_ids[:, -q_len:])
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # Shift Pos: key pos is the pos in cache (Rolling KV Cache and using relative pos emb)
+        key_states = apply_rotary_pos_emb_single_qwen(key_states, cos, sin, position_ids)
+        ###
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
+            self.head_dim
+        )
+
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+            query_states.dtype
+        )
+
+        ql, kl = attn_weights.size(-2), attn_weights.size(-1)
+        past_key_value_for_layer = self.kv_cache(
+            past_key_value[self.layer_idx],
+            attn_weights.detach().view(bsz, self.num_key_value_heads, self.num_key_value_groups, ql, kl).amax(dim=2).clone()
+        )
+
+        # # cache returns a tuple, so just insert this tuple as the new cache for this layer
+        past_key_value.key_cache[self.layer_idx] = past_key_value_for_layer[0]
+        past_key_value.value_cache[self.layer_idx] = past_key_value_for_layer[1]
+        if self.layer_idx == 31:
+            past_key_value._seen_tokens = past_key_value_for_layer[0].size(-2)
+
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        if self.config.pretraining_tp > 1:
+            attn_output = attn_output.split(
+                self.hidden_size // self.config.pretraining_tp, dim=2
+            )
+            o_proj_slices = self.o_proj.weight.split(
+                self.hidden_size // self.config.pretraining_tp, dim=1
+            )
+            attn_output = sum(
+                [
+                    F.linear(attn_output[i], o_proj_slices[i])
+                    for i in range(self.config.pretraining_tp)
+                ]
+            )
+        else:
+            attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None

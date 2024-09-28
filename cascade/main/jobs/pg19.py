@@ -5,6 +5,7 @@ from cascade.dataset.pg19 import PG19Streaming
 from tqdm import tqdm
 import json
 from cascade.models.cascading_cache import CascadingKVCache
+from transformers.cache_utils import DynamicCache
 import math
 import numpy as np
 from cascade.utils.other import pad_targets
@@ -27,7 +28,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
         ds_stats = {int(k): v for k, v in ds_stats.items()}
 
     for j, (x, y) in enumerate(dataset):
-        if j not in ds_stats[args.window]["index"]:
+        if "stride-vs-single-step-ablation" not in args.comment and j not in ds_stats[args.window]["index"]:
             continue  # skip book because it contains fewer tokens than the window
 
         input_ids = x.cuda()
@@ -60,7 +61,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
             )
         elif args.method == "vanilla":
             max_seq_len = args.window
-        elif args.method in ["bigbird", "snapkv"]:
+        elif args.method in ["bigbird", "snapkv", "h2o"]:
             mdl = model.model
             max_seq_len = args.window
             print(f"{max_seq_len=}")
@@ -69,6 +70,17 @@ def job_ppl_pg19(args, model, tokenizer, device):
                     lyr.self_attn.config._bb_window = args.window
                 elif args.method == "snapkv":
                     lyr.self_attn.config.max_capacity_prompt = args.window
+                elif args.method == "h2o":
+                    lyr.self_attn.kv_cache.recent_size = args.window // 2
+                    lyr.self_attn.kv_cache.hh_size = args.window // 2
+
+                    lyr.self_attn.kv_cache.cache_size = \
+                        lyr.self_attn.kv_cache.recent_size + lyr.self_attn.kv_cache.hh_size
+
+                    lyr.self_attn.kv_cache._clean_scores()
+                    use_cache = True
+                    past_key_values = DynamicCache()
+
         else:
             raise ValueError(f"unsupported method: {args.method=}")
 
@@ -81,7 +93,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
                     targets = target_ids[:, i + 1:i + stride + 1]
                     targets = pad_targets(inputs, targets, ignore_index=-100)
 
-                    # there were some errors on bigbird, so added padding to powers of 2 
+                    # there were some errors on bigbird, so added padding to powers of 2
                     # helped. Probably a triton issue
                     if args.method == "bigbird":
                         if np.log2(inputs.size(1)) % 1 != 0:
@@ -122,6 +134,9 @@ def job_ppl_pg19(args, model, tokenizer, device):
         # del logits, output
         torch.cuda.empty_cache()
         gc.collect()
+
+        if "stride-vs-single-step-ablation" in args.comment:
+            break  # only do the first book for this experiment
 
     print(f"final ppl: {np.exp(stats['nll-total'] / stats['count-total'])}")
     os.makedirs('./cache/llama_eval/pg19/', exist_ok=True)

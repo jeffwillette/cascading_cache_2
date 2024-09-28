@@ -19,7 +19,12 @@ def job_latency(args, model, tokenizer, device):
         else:
             rng = [2 ** i for i in range(12, 21)]
     elif args.method == "h2o":
-        rng = [2 ** i for i in range(12, 19)]
+        if args.comment == "h2o-linear":
+            # keep already initialized one above
+            pass
+        else:
+            # truncate because it will take forever
+            rng = [2 ** i for i in range(12, 16)]
 
     print(f"{args.method=}")
     for l in rng:
@@ -40,6 +45,18 @@ def job_latency(args, model, tokenizer, device):
                 head_reduction=args.head_reduction,
                 layers=1,
             )
+        elif args.method in ["h2o", "snapkv"]:
+            for lyr in m.layers:
+                if args.method == "snapkv":
+                    lyr.self_attn.config.max_capacity_prompt = args.window
+                elif args.method == "h2o":
+                    lyr.self_attn.kv_cache.recent_size = args.window // 2
+                    lyr.self_attn.kv_cache.hh_size = args.window // 2
+
+                    lyr.self_attn.kv_cache.cache_size = \
+                        lyr.self_attn.kv_cache.recent_size + lyr.self_attn.kv_cache.hh_size
+
+                    lyr.self_attn.kv_cache._clean_scores()
 
         with torch.no_grad():
             if args.method == "sink":
@@ -68,11 +85,22 @@ def job_latency(args, model, tokenizer, device):
                 torch.cuda.empty_cache()
 
             elif args.method == "h2o":
-                # cache is an attention class attribute in h2o
+                # warmup to compile and autotune triton if necessary
+                past_key_values = DynamicCache()
+                for i in range(0, input_ids.size(1), stride):
+                    inp = input_ids[:, i:i + stride]
+                    output = model(inp, position_ids=position_ids[:, i:i + stride], use_cache=True, past_key_value=past_key_values)
+                    past_key_values = output[2]
+
+                past_key_values = DynamicCache()
+                model.kv_cache._clean_scores()
+                torch.cuda.synchronize()
+
                 tic = time.perf_counter()
                 for i in range(0, input_ids.size(1), stride):
                     inp = input_ids[:, i:i + stride]
-                    output = model(inp, position_ids=position_ids[:, i:i + stride], use_cache=True)
+                    output = model(inp, position_ids=position_ids[:, i:i + stride], use_cache=True, past_key_value=past_key_values)
+                    past_key_values = output[2]
 
                 torch.cuda.synchronize()
                 t = time.perf_counter() - tic
@@ -140,5 +168,5 @@ def job_latency(args, model, tokenizer, device):
 
         torch.cuda.empty_cache()
 
-    with open(f"./plots/latency/attention-{args.method}-stride-{args.cascade_stride}.json", "w") as f:
+    with open(f"./plots/latency/attention-{args.method}-stride-{args.cascade_stride}-comment-{args.comment}.json", "w") as f:
         json.dump(latency, f)

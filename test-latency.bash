@@ -1,9 +1,10 @@
 #!/bin/bash
 
 # passkey experiment
-GPUS=6
+GPUS=3
 WINDOW=16384
-CASCADES=4
+# CASCADES=4
+CASCADES=1
 SINKS=64
 BATCH_SIZE=1
 
@@ -18,8 +19,13 @@ HEAD_REDUCTION=max
 
 MODEL=llama3.1-8b
 # MODEL=llama7b-chat
-METHODS=(snapkv)
-CASCADE_STRIDES=(1)
+# METHODS=(snapkv)
+# CASCADE_STRIDES=(1)
+CASCADE_STRIDES=(4096)
+# METHODS=(h2o)
+METHODS=(sink)
+COMMENT=none
+# COMMENT=h2o-linear
 
 for i in "${!METHODS[@]}";
 do 
@@ -33,6 +39,7 @@ do
         --cascade_stride ${CASCADE_STRIDES[$i]} \
         --head_reduction $HEAD_REDUCTION \
         --cascades $CASCADES \
+        --comment $COMMENT \
         --batch_size $BATCH_SIZE
         
         sleep 1

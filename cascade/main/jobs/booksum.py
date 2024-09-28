@@ -124,7 +124,7 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
 
     max_seq_len = int(2 ** math.floor(np.log2(seq_len / 2)))
     print(f"{max_seq_len=}")
-    max_seq_len = 2048
+    # max_seq_len = 2048
     if args.method == "sink":
         mdl = model.model
         # max_seq_len = args.window

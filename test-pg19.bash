@@ -40,9 +40,21 @@ CASCADE_STRIDE=1024
 # WINDOW=(32768 16384)
 # CASCADES=(1 1)
 
-CASCADE_STRIDE=(65536)
-WINDOW=(65536)
+# TEMPORARY ADDITION TO RUN H2O
+# WINDOW=(16384 16384)
+# WINDOW=(65536)
+# CASCADES=(1 1 1 1 1)
+# CASCADE_STRIDE=(128 256 512 1024 1)
+# COMMENT=h2o-linear-stride-vs-single-step-ablation
+# COMMENT=stride-vs-single-step-ablation
+# WINDOW=(2048 2048 2048 2048 2048)
+
+# for patching up single step experiment
 CASCADES=(1)
+CASCADE_STRIDE=(1)
+COMMENT=h2o-linear-stride-vs-single-step-ablation
+WINDOW=(2048)
+
 
 # MAIN PG19 experiment code
 for i in "${!WINDOW[@]}";
