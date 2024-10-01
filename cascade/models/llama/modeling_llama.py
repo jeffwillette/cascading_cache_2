@@ -49,7 +49,7 @@ from transformers.utils import (
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
 from cascade.models.cascade_attention import LlamaCascadeAttention
-from hip import hip_attention, HiPAttentionArgs
+# from hip import hip_attention, HiPAttentionArgs
 
 
 logger = logging.get_logger(__name__)
@@ -557,16 +557,18 @@ class LlamaFlashAttention2(LlamaAttention):
             value_states = value_states.to(target_dtype)
 
         if self.config._method == "bigbird":
+            raise EnvironmentError("make sure hip-attention is installed to run bigbird")
+            # if hip-attention is installed, these lines can be uncommented
 
-            w = self.config._bb_window // 2
-            args = HiPAttentionArgs(mask_k=w, sliding_window_size=w)
+            # w = self.config._bb_window // 2
+            # args = HiPAttentionArgs(mask_k=w, sliding_window_size=w)
 
-            attn_output, _ = hip_attention(
-                query_states / math.sqrt(query_states.size(-1)),
-                key_states,
-                value_states,
-                args=args
-            )
+            # attn_output, _ = hip_attention(
+            #     query_states / math.sqrt(query_states.size(-1)),
+            #     key_states,
+            #     value_states,
+            #     args=args
+            # )
 
         else:
             attn_output = _flash_attention_forward(

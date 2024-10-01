@@ -4,7 +4,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="hip_attention",
+    name="cascading cache",
     version="0.0.1",
     author="Jeffrey Willette",
     author_email="jwillette@kaist.ac.kr",

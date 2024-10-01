@@ -47,7 +47,7 @@ from transformers.utils import (
 )
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from cascade.models.cascade_attention import Qwen2CascadeAttention
-from hip import hip_attention, HiPAttentionArgs
+# from hip import hip_attention, HiPAttentionArgs
 
 
 if is_flash_attn_2_available():
@@ -484,16 +484,18 @@ class Qwen2FlashAttention2(Qwen2Attention):
             sliding_window = None
 
         if self.config._method == "bigbird":
+            raise EnvironmentError("make sure hip-attention is installed to run bigbird")
+            # if hip-attention is installed, these lines can be uncommented
 
-            w = self.config._bb_window // 2
-            args = HiPAttentionArgs(mask_k=w, sliding_window_size=w)
+            # w = self.config._bb_window // 2
+            # args = HiPAttentionArgs(mask_k=w, sliding_window_size=w)
 
-            attn_output, _ = hip_attention(
-                query_states / math.sqrt(query_states.size(-1)),
-                key_states,
-                value_states,
-                args=args
-            )
+            # attn_output, _ = hip_attention(
+            #     query_states / math.sqrt(query_states.size(-1)),
+            #     key_states,
+            #     value_states,
+            #     args=args
+            # )
 
         else:
             attn_output = _flash_attention_forward(
