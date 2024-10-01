@@ -29,15 +29,7 @@ CASCADE_FUNC="pow2"
 # COMMENT="max-gen-adjust-quarter-ctx"
 # COMMENT="max-gen-adjust"
 # COMMENT=none
-# COMMENT=h2o-linear
-# COMMENT=h2o-linear-75-25-quarter-ctx
-COMMENT=quarter-ctx
-# COMMENT=truncate
-# COMMENT=h2o-test
-#
-# CASCADE_FUNC="1-then-2"
-# COMMENT="cascade-quadratic-prompt-2048-only-long"
-#
+COMMENT=truncate
 # COMMENT="half-ctx"
 
 for i in "${!CASCADES[@]}";

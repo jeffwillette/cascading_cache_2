@@ -77,7 +77,7 @@ class TestCascadeAttention(unittest.TestCase):
 
     def test_cascade_attention_iterative_generate(self):
         args = self.args
-        for model in ["llama3.1-8b", "qwen7b"]:
+        for model in ["llama3.1-8b", "qwen2-7b-instruct"]:
             args.model = model
             model, tokenizer, device = load_model(args)
             model = sample_monkeypatch(model)
@@ -122,7 +122,7 @@ class TestCascadeAttention(unittest.TestCase):
         with a seqeuence length which gits inside the sliding window, it should
         be equivalent to dense attention.
         """
-        for model in ["llama3.1-8b", "qwen7b"]:
+        for model in ["llama3.1-8b", "qwen2-7b-instruct"]:
             args = self.args
             args.cascades = 1
             args.model = model
@@ -931,7 +931,7 @@ if __name__ == "__main__":
     WIND = 2048 // 4
     HEAD = 32
     MAX_SEQ = 2048
-    DEVICE = "cuda:3"
+    DEVICE = "cuda:0"
     DTYPE = torch.float16
 
     # for nsys profiling

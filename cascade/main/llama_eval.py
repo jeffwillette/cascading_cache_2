@@ -1,7 +1,6 @@
 import os
 import torch
 import transformers
-from third_party.hyper_attn.models.attention.hyper_attn import HyperAttention
 
 from peft import LoraConfig, TaskType
 from peft import get_peft_model, prepare_model_for_kbit_training
@@ -242,95 +241,8 @@ def load_model(args):
         )
         model = get_model(model_id, **from_pretrained_kwargs)
 
-        # args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
-        # from_pretrained_kwargs = dict(
-        #     config=config,
-        #     device_map={"": device},
-        #     quantization_config=transformers.BitsAndBytesConfig(
-        #         load_in_4bit=True,
-        #         bnb_4bit_compute_dtype=args.infer_dtype,
-        #         bnb_4bit_use_double_quant=True,
-        #         bnb_4bit_quant_type="fp4",
-        #         llm_int8_skip_modules=[
-        #             "input_layernorm",
-        #             "post_attention_layernorm",
-        #             "norm",
-        #             "lm_head",
-        #         ]
-        #     ),
-        #     torch_dtype=args.infer_dtype,
-        # )
-        # model = get_model(model_id, **from_pretrained_kwargs)
-
-        # import deepspeed
-        # args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
-        # from_pretrained_kwargs = dict(
-        #     config=config,
-        #     device_map="cpu",
-        #     quantization_config=transformers.BitsAndBytesConfig(
-        #         load_in_8bit=True,
-        #         bnb_8bit_compute_dtype=args.infer_dtype,
-        #         llm_int8_skip_modules=[
-        #             "input_layernorm",
-        #             "post_attention_layernorm",
-        #             "norm",
-        #         ]
-        #     ),
-        #     torch_dtype=args.infer_dtype,
-        #     trust_remote_code=True,
-        # )
-        # model = get_model(model_id, **from_pretrained_kwargs)
-
-        # model = deepspeed.init_inference(
-        #     model,
-        #     tensor_parallel={"tp_size": args.world_size},
-        #     replace_with_kernel_inject=False,
-        #     dtype=torch.int8,
-        #     injection_policy=get_injection_policy(args.model),
-        # )
-
-        # args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
-        # from_pretrained_kwargs = dict(
-        #     config=config,
-        #     device_map={"": "cpu"},
-        #     quantization_config=transformers.GPTQConfig(
-        #         bits=4,
-        #         tokenizer=tokenizer,
-        #         dataset="wikitext2",
-        #     ),
-        #     torch_dtype=args.infer_dtype,
-        #     trust_remote_code=True,
-        # )
-
-        # assert "awq" in model_id.lower()
-        # args.infer_dtype = get_dtype(model_id, use_fp32=args.use_fp32)
-        # from_pretrained_kwargs = dict(
-        #     config=config,
-        #     device_map={"": device},
-        #     quantization_config=transformers.AwqConfig(bits=4, do_fuse=False),
-        #     torch_dtype=args.infer_dtype,
-        #     trust_remote_code=True,
-        # )
-        # model = get_model(model_id, **from_pretrained_kwargs)
-
     if args.method == "sink":
         model = sample_monkeypatch(model)
-
-    if args.method == "hyper":
-        for i, decoder_layer in enumerate(model.model.layers):
-            # print(f"init hyper attention for layer {i=} {self.config=}")
-
-            min_seq_len = 32
-            # min_seq_len = model.model.config.max_position_embeddings
-
-            decoder_layer.self_attn.hyper_attn = HyperAttention(
-                input_dim=128,
-                lsh_num_projs=7,
-                block_size=64,
-                sample_size=1024,
-                min_seq_len=min_seq_len,
-                cuda=True,
-            ).half().to("cuda:0")
 
     if args.lora_r > 0 and args.checkpoint is not None:
         print("LoRA init")
