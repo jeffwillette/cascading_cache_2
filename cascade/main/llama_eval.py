@@ -13,6 +13,7 @@ from cascade.utils import seed
 
 # from cascade.main.jobs.bench_single_layer import job_bench_single_layer
 from cascade.main.jobs.passkey import job_passkey
+from cascade.main.jobs.attn_matrix_plot import job_attn_matrix
 from cascade.main.jobs.latency import job_latency
 from cascade.main.jobs.ppl_memory import job_ppl_memory
 from cascade.main.jobs.ppl import job_ppl
@@ -380,7 +381,7 @@ def main():
 
     assert args.job in [
         'ppl', 'ppl-pg19', 'ppl-memory', 'stream', 'mmlu',
-        'bench_single_layer', 'passkey', 'profile', "latency", "booksum",
+        'bench_single_layer', 'passkey', 'profile', "latency", "booksum", "attn_matrix_plot"
     ]
 
     model, tokenizer, device = load_model(args)
@@ -389,6 +390,8 @@ def main():
         job_ppl(args, model, tokenizer, device)
     elif args.job == 'ppl-memory':
         job_ppl_memory(args, model, tokenizer, device)
+    elif args.job == 'attn_matrix_plot':
+        job_attn_matrix(args, model, tokenizer, device)
     elif args.job == 'latency':
         job_latency(args, model, tokenizer, device)
     elif args.job == 'passkey':

@@ -19,12 +19,8 @@ def job_latency(args, model, tokenizer, device):
         else:
             rng = [2 ** i for i in range(12, 21)]
     elif args.method == "h2o":
-        if args.comment == "h2o-linear":
-            # keep already initialized one above
-            pass
-        else:
-            # truncate because it will take forever
-            rng = [2 ** i for i in range(12, 16)]
+        # truncate because it will go OOM
+        rng = [2 ** i for i in range(10, 14)]
 
     print(f"{args.method=}")
     for l in rng:
@@ -87,20 +83,16 @@ def job_latency(args, model, tokenizer, device):
             elif args.method == "h2o":
                 # warmup to compile and autotune triton if necessary
                 past_key_values = DynamicCache()
-                for i in range(0, input_ids.size(1), stride):
-                    inp = input_ids[:, i:i + stride]
-                    output = model(inp, position_ids=position_ids[:, i:i + stride], use_cache=True, past_key_value=past_key_values)
-                    past_key_values = output[2]
+                output = model(input_ids, position_ids=position_ids, use_cache=True, past_key_value=past_key_values)
+                past_key_values = output[2]
 
                 past_key_values = DynamicCache()
                 model.kv_cache._clean_scores()
                 torch.cuda.synchronize()
 
                 tic = time.perf_counter()
-                for i in range(0, input_ids.size(1), stride):
-                    inp = input_ids[:, i:i + stride]
-                    output = model(inp, position_ids=position_ids[:, i:i + stride], use_cache=True, past_key_value=past_key_values)
-                    past_key_values = output[2]
+                output = model(input_ids, position_ids=position_ids, use_cache=True, past_key_value=past_key_values)
+                past_key_values = output[2]
 
                 torch.cuda.synchronize()
                 t = time.perf_counter() - tic

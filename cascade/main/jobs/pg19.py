@@ -28,7 +28,10 @@ def job_ppl_pg19(args, model, tokenizer, device):
         ds_stats = {int(k): v for k, v in ds_stats.items()}
 
     for j, (x, y) in enumerate(dataset):
-        if "stride-vs-single-step-ablation" not in args.comment and j not in ds_stats[args.window]["index"]:
+        if "stride-vs-single-step-ablation" not in args.comment \
+                and "token-selection-ablation" not in args.comment \
+                and j not in ds_stats[args.window]["index"]:
+
             continue  # skip book because it contains fewer tokens than the window
 
         input_ids = x.cuda()
@@ -135,7 +138,7 @@ def job_ppl_pg19(args, model, tokenizer, device):
         torch.cuda.empty_cache()
         gc.collect()
 
-        if "stride-vs-single-step-ablation" in args.comment:
+        if "stride-vs-single-step-ablation" in args.comment or "token-selection-ablation" in args.comment:
             break  # only do the first book for this experiment
 
     print(f"final ppl: {np.exp(stats['nll-total'] / stats['count-total'])}")

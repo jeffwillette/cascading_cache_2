@@ -173,7 +173,7 @@ class CascadeAttention(nn.Module):
         if do_og_pos:
             b, h, s, d = k_states.size()
             k_states, _, _ = self.rope(k_states.view(b * h, 1, s, d), og_pos.view(b * h, -1))
-            k_states, _, _ = k_states.view(b, h, s, d)
+            k_states = k_states.view(b, h, s, d)
         else:
             k_states, cos_k, sin_k = self.rope(k_states, key_pos, cos=cos_k, sin=sin_k)
 
@@ -305,6 +305,20 @@ class CascadeAttention(nn.Module):
         attn = torch.cat((sattn, cattn, qattn), dim=-1)
         attn = attn.softmax(dim=-1)
 
+        if hasattr(past_key_value, "plot_attn"):
+            if self.layer_idx == 0:
+                past_key_value._attn_plot_og_pos = []
+                past_key_value._attn_plot_attn_scores = []
+
+            og_pos = past_key_value.get_vals(self.layer_idx)[-1]
+            # these are relative pos, used for sanity check in attn matrix plotting.
+            # og_pos = past_key_value.get_vals(self.layer_idx)[-3]
+            # print(f"{og_pos.size()=} {key_mask.size()=}")
+            og_pos = og_pos * ~key_mask
+
+            past_key_value._attn_plot_og_pos.append(og_pos.clone())
+            past_key_value._attn_plot_attn_scores.append(attn.clone())
+
         sk, k = sink_key_states.size(2), k_states.size(2)
         out = attn[:, :, :, :sk] @ sink_value_states
         out += attn[:, :, :, sk:sk + k] @ v_states
@@ -430,6 +444,8 @@ class LlamaCascadeAttention(CascadeAttention, LlamaAttention):
             cos, sin = self.rotary_emb(x, pos)
 
         # cos, sin = self.rotary_emb(x, pos)
+        # out = apply_rotary_pos_emb_one(x, cos[:, :x.size(-2)], sin[:, :x.size(-2)])
+        # out = apply_rotary_pos_emb_one(x, cos[:, -x.size(-2):], sin[:, -x.size(-2):])
         out = apply_rotary_pos_emb_one(x, cos, sin)
         return out, cos, sin
 

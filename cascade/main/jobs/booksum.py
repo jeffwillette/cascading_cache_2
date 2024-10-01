@@ -98,7 +98,18 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
                                                )
         seq_len = inputs.shape[-1]
         print(f"seq_len after truncating: {seq_len}")
-    elif args.method in ["snapkv", "h2o"] or "cascade-quadratic-prompt" in args.comment:
+    elif "truncate" in args.comment and args.method == "h2o":
+        print("truncating h2o model due to OOM")
+        max_seq_len = min(seq_len, 8192 + 1024)  # OOM above this
+
+        if max_seq_len < seq_len:
+            half = max_seq_len // 2
+            inputs = torch.cat((inputs[:, :half], inputs[:, -half:]), dim=-1)
+
+        seq_len = inputs.shape[-1]
+        # set this for the cache limit which comes later
+        # max_seq_len = int(2 ** math.floor(np.log2(max_seq_len / 2)))
+    elif args.method in ["snapkv"] or "cascade-quadratic-prompt" in args.comment:
         print("truncating snapkv model due to OOM")
         tokenizer.truncation_side = "right"
         max_seq_len = 32768
@@ -157,6 +168,8 @@ def generate_summary(args, model, tokenizer, device, idx, item, out_dir):
                 lyr.self_attn.config.max_capacity_prompt = max(128, max_seq_len - 300)
 
             elif args.method == "h2o":
+                # lyr.self_attn.kv_cache.recent_size = max_seq_len // 4
+                # lyr.self_attn.kv_cache.hh_size = 3 * (max_seq_len // 4)
                 lyr.self_attn.kv_cache.recent_size = max_seq_len // 2
                 lyr.self_attn.kv_cache.hh_size = max_seq_len // 2
 

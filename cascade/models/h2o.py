@@ -582,7 +582,7 @@ class H2OLlamaAttention_streaming(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         num_new_tokens = None
-        if "h2o-linear" in self.config.comment and query_states.size(-2) > 64:
+        if "h2o-linear" in self.config.comment and query_states.size(-2) > 1:
             attn_weights, attn_output, num_new_tokens = attn_batched(query_states, key_states, value_states)
         else:
             attn_weights, attn_output = attn_batched_quad(query_states, key_states, value_states)
@@ -860,7 +860,7 @@ class H2OQwenAttention_streaming(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         num_new_tokens = None
-        if "h2o-linear" in self.config.comment:
+        if "h2o-linear" in self.config.comment and query_states.size(-2) > 1:
             attn_weights, attn_output, num_new_tokens = attn_batched(query_states, key_states, value_states)
         else:
             attn_weights, attn_output = attn_batched_quad(query_states, key_states, value_states)
@@ -940,7 +940,7 @@ class H2OQwenAttention_streaming(nn.Module):
         if not position_ids.nelement() > 1:
             position_ids[0][0] = kv_seq_len - 1
 
-        cos, sin = self.rotary_emb(value_states, position_ids=position_ids)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         # Shift Pos: query pos is min(cache_size, idx)
         # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -959,9 +959,9 @@ class H2OQwenAttention_streaming(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
-            self.head_dim
-        )
+        # print(f"{query_states.size()=} {key_states.size()=}")
+        s = np.sqrt(np.sqrt(self.head_dim))
+        attn_weights = torch.matmul(query_states / s, key_states.transpose(2, 3) / s)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -990,7 +990,7 @@ class H2OQwenAttention_streaming(nn.Module):
         # # cache returns a tuple, so just insert this tuple as the new cache for this layer
         past_key_value.key_cache[self.layer_idx] = past_key_value_for_layer[0]
         past_key_value.value_cache[self.layer_idx] = past_key_value_for_layer[1]
-        if self.layer_idx == 31:
+        if self.layer_idx == 27:
             past_key_value._seen_tokens = past_key_value_for_layer[0].size(-2)
 
         attn_output = torch.matmul(attn_weights, value_states)
@@ -1004,21 +1004,7 @@ class H2OQwenAttention_streaming(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(
-                self.hidden_size // self.config.pretraining_tp, dim=2
-            )
-            o_proj_slices = self.o_proj.weight.split(
-                self.hidden_size // self.config.pretraining_tp, dim=1
-            )
-            attn_output = sum(
-                [
-                    F.linear(attn_output[i], o_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ]
-            )
-        else:
-            attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None

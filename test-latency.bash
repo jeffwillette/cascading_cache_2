@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # passkey experiment
-GPUS=3
+GPUS=7
 WINDOW=16384
 # CASCADES=4
 CASCADES=1
@@ -21,11 +21,10 @@ MODEL=llama3.1-8b
 # MODEL=llama7b-chat
 # METHODS=(snapkv)
 # CASCADE_STRIDES=(1)
-CASCADE_STRIDES=(4096)
-# METHODS=(h2o)
-METHODS=(sink)
-COMMENT=none
-# COMMENT=h2o-linear
+CASCADE_STRIDES=(1)
+METHODS=(h2o)
+# METHODS=(sink)
+COMMENT=h2o-eager
 
 for i in "${!METHODS[@]}";
 do 
