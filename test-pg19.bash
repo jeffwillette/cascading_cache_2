@@ -59,10 +59,10 @@ CASCADE_STRIDE=1024
 # COMMENT=token-selection-ablation
 # WINDOW=(2048 2048)
 #
-CASCADES=(4)
-CASCADE_STRIDE=(128)
-COMMENT=token-selection-ablation-noselection
-WINDOW=(2048)
+# CASCADES=(4)
+# CASCADE_STRIDE=(128)
+# COMMENT=token-selection-ablation-noselection
+# WINDOW=(2048)
 
 # MAIN PG19 experiment code
 for i in "${!WINDOW[@]}";
