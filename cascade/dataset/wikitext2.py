@@ -23,7 +23,8 @@ class ChunkedIterator:
         return self
 
     def __next__(self):
-        if self.eof: raise StopIteration
+        if self.eof:
+            raise StopIteration
 
         chunk = []
         end_of_file = False
@@ -145,7 +146,7 @@ class Wikitext2Dataset(Dataset):
                                                chunk_size,
                                                cutoff=cutoff_dataset)
             with mp.Pool(mp.cpu_count() - 1) as pool, \
-                    tqdm.tqdm(pool.imap(self.get_encodings, chunked_iterator, chunksize=8), dynamic_ncols=True, total=math.ceil(cutoff_dataset/chunk_size)) as pbar:
+                    tqdm.tqdm(pool.imap(self.get_encodings, chunked_iterator, chunksize=8), dynamic_ncols=True, total=math.ceil(cutoff_dataset / chunk_size)) as pbar:
                 for chunk_encodings in pbar:
                     encodings_size += chunk_encodings.shape[1]
                     pbar.set_description(f'tokens: {encodings_size}')

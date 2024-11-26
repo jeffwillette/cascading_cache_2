@@ -63,11 +63,19 @@ def _attn_fwd_inner(
         qk = tl.dot(q, k)
         qk = qk * qk_scale + tl.where(mask, -1.0e6, 0)
 
-        exps = tl.flip(tl.arange(0, BLOCK_M))[:, None]
+        # ------------------------------
+        # for sum accumulation
+        # coeff = 1
+
+        # for EMA accumulation
+        exps = tl.flip(tl.arange(0, BLOCK_M))[:, None]  # original submission
+        # exps = N_CTX - (start_m * tl.flip(tl.arange(0, BLOCK_M))[:, None])  # bugfix?
         # do beta ** exps * (1 - beta)
         unmasked = tl.where(mask, 0, 1)
         exps = tl.exp2(exps.to(DTYPE) * tl.log2(beta))
         coeff = exps * (1 - beta) * unmasked
+        # ------------------------------
+
         score_offset = (start_n + tl.arange(0, BLOCK_N)).to(
             tl.int64) * stride_sn
 
@@ -607,27 +615,12 @@ class _attention(torch.autograd.Function):
             o,  #
             mask,
             scores,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),  #
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),  #
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),  #
-            o.stride(0),
-            o.stride(1),
-            o.stride(2),
-            o.stride(3),  #
-            mask.stride(0),
-            mask.stride(1),
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
+            mask.stride(0), mask.stride(1),
+            scores.stride(0), scores.stride(1), scores.stride(2),
             q.shape[0],
             q.shape[1],  #
             N_CTX=q.shape[2],  #

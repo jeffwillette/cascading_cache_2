@@ -13,3 +13,6 @@
 [submodule "third_party/hip-ainl"]
 	path = third_party/hip-ainl
 	url = git@github.com:jeffwillette/hip-ainl.git
+[submodule "third_party/MInference"]
+	path = third_party/MInference
+	url = git@github.com:jeffwillette/MInference.git

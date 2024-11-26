@@ -16,8 +16,9 @@ from cascade.main.jobs.attn_matrix_plot import job_attn_matrix
 from cascade.main.jobs.latency import job_latency
 from cascade.main.jobs.ppl_memory import job_ppl_memory
 from cascade.main.jobs.ppl import job_ppl
-from cascade.main.jobs.profile import job_profile
+from cascade.main.jobs.profile_ import job_profile
 from cascade.main.jobs.pg19 import job_ppl_pg19
+from cascade.main.jobs.wikitext import job_ppl_wikitext2
 from cascade.main.jobs.booksum import job_booksum
 # from cascade.main.jobs.stream import job_stream
 from cascade.main.jobs.mmlu import job_mmlu
@@ -292,7 +293,7 @@ def main():
     args = eval_args()
 
     assert args.job in [
-        'ppl', 'ppl-pg19', 'ppl-memory', 'stream', 'mmlu',
+        'ppl', 'ppl-pg19', 'ppl-wikitext', 'ppl-memory', 'stream', 'mmlu',
         'bench_single_layer', 'passkey', 'profile', "latency", "booksum", "attn_matrix_plot"
     ]
 
@@ -310,6 +311,8 @@ def main():
         job_passkey(args, model, tokenizer, device)
     elif args.job == 'ppl-pg19':
         job_ppl_pg19(args, model, tokenizer, device)
+    elif args.job == 'ppl-wikitext':
+        job_ppl_wikitext2(args, model, tokenizer, device)
     elif args.job == 'profile':
         job_profile(args, model, tokenizer, device)
     elif args.job == 'booksum':

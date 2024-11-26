@@ -477,17 +477,25 @@ def _sample_monkeypatch(
             inputs = model_inputs["input_ids"]
 
             # print(f"in sample monkeypatch {model_inputs['input_ids'].size()=}")
+            for lyr in self.model.layers:
+                lyr.self_attn.last_it = False
 
             for i in range(0, inputs.size(1), stride):
-                # print(f"{i=} {i+stride=} {inputs.size()=} {inputs[:, i:i+stride].size()=}")
+                if i + stride >= inputs.size(1):
+                    for lyr in self.model.layers:
+                        lyr.self_attn.last_it = True
+
                 # print(f"{list(model_inputs.keys())=}")
                 model_inputs["input_ids"] = inputs[:, i:i + stride]
+                seen_tok = model_inputs["past_key_values"].seen_tokens_by_layer[0]
                 outputs = self(**model_inputs, return_dict=True)
                 # print(f"after {list(model_inputs.keys())=}")
                 model_inputs["past_key_values"] = outputs["past_key_values"]
+                seen_tok = model_inputs["past_key_values"].seen_tokens_by_layer[0]
 
             first_it = False
         else:
+            seen_tok = model_inputs["past_key_values"].seen_tokens_by_layer[0]
             outputs = self(**model_inputs, return_dict=True)
 
         if synced_gpus and this_peer_finished:

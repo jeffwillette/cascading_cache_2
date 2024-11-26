@@ -4,6 +4,7 @@ import unittest
 import triton
 import json
 import gc
+import time
 
 from argparse import Namespace
 from cascade.main.llama_eval import load_model
@@ -13,9 +14,11 @@ from cascade.models.cascade_attention import sample_monkeypatch
 from cascade.models.flash_attention import attention
 from cascade.main.llama_eval import MODELS
 import transformers
+from transformers import pipeline
+from minference import MInference, get_support_models
 
 
-def get_cache(model):
+def get_cache(model, dtype=torch.float):
     mdl = model.model
     window = mdl.config._window // mdl.config._cascades
     max_seq_len = mdl.config._window
@@ -27,7 +30,7 @@ def get_cache(model):
         heads=mdl.config.num_key_value_heads // mdl.config.world_size,
         dim=mdl.config.hidden_size // mdl.config.num_attention_heads,
         max_seq_len=max_seq_len,
-        dtype=torch.float,  # use fp32 for testing so we can be sure numerical errors aren't from precision
+        dtype=dtype,  # use fp32 for testing so we can be sure numerical errors aren't from precision
         device=mdl.embed_tokens.weight.device,
         cascade_func=mdl.config._cascade_func,
         head_reduction=mdl.config._head_reduction,
@@ -273,7 +276,7 @@ class TestFlashAttention(unittest.TestCase):
         """
 
         with torch.no_grad():
-            N_CTX, N_KV = 128, 4096
+            N_CTX, N_KV = 4096, 4096
             q = torch.randn(1, 1, N_CTX, 128, dtype=torch.float16, device="cuda")
             k = torch.randn(1, 1, N_KV, 128, dtype=torch.float16, device="cuda")
             v = torch.randn(1, 1, N_KV, 128, dtype=torch.float16, device="cuda")
@@ -311,6 +314,7 @@ class TestFlashAttention(unittest.TestCase):
             # flash
             scale = 1 / np.sqrt(q.size(-1))
             _, score = attention(q, k, v, True, scale, M.squeeze(0), cache.beta)
+            print(f"kernel score: {score=}")
             _, _, _, _, _, _, pos, _, og_pos = cache.update(k, v, 0, score)
             # print(f"flash og pos {og_pos=}")
             # print(f"flash score: {score=}")
@@ -326,12 +330,14 @@ class TestFlashAttention(unittest.TestCase):
             eager_scores = (eager_scores * exps[None, None, :, None]).sum(dim=2).half()
             # print(f"eager score: {eager_scores=}")
             _, _, _, _, _, _, _, _, eager_og_pos = eager_cache.update(k, v, 0, eager_scores)
+            print(f"eager score: {eager_scores=}")
             # print(f"{eager_og_pos=}")
 
             # diff = og_pos != eager_og_pos
             # print(f"{diff.sum()=}")
 
             score_diff = (score - eager_scores).abs().amax()
+            print(f"{score_diff=}")
             self.assertTrue(torch.allclose(score, eager_scores, atol=1e-5), f"{score_diff=}")
 
         del q, k, v, cache, eager_cache, qkT, M, M2, M_eager
@@ -922,6 +928,87 @@ class TestCascadingKVCache(unittest.TestCase):
             d = dict(naive_times=naive_times, fast_times=fast_times, cascade_times=cascade_times)
             with open("./plots/latency/cache_times.json", "w") as f:
                 json.dump(d, f)
+
+
+class RebuttalTest(unittest.TestCase):
+    def setUp(self):
+        print('\n', unittest.TestCase.id(self))
+        args = Namespace(
+            batch_size=1,
+            sinks=64,
+            cascades=4,
+            window=65536,
+            world_size=1,
+            cascade_func="pow2",
+            head_reduction="mean",
+            method="sink",
+            use_fp32=False,   # use fp 32 for testing
+            cascade_stride=4096,
+            job="test",
+            lora_r=0,
+            homogeneous_heads=True,
+            do_og_pos=False,
+        )
+        self.args = args
+        torch.set_grad_enabled(False)
+
+    def tearDown(self):
+        torch.set_grad_enabled(True)
+
+    def test_minference(self):
+        model_name = "/d1/dataset/llama/models/llama_v3.1/Meta-Llama-3.1-8B-Instruct"
+
+        pipe = pipeline("text-generation", model=model_name, torch_dtype="auto", device_map="auto")
+
+        for i in range(11, 21):
+            prompt = pipe.tokenizer.decode(torch.randint(0, 32768, size=(2**i,)))
+
+            # Patch MInference Module,
+            # If you use the local path, please use the model_name from HF when initializing MInference.
+            minference_patch = MInference(
+                "streaming",
+                model_name,
+                n_local=65536 + 4096,
+                n_init=64
+            )
+            pipe.model = minference_patch(pipe.model)
+
+            tic = time.perf_counter()
+            _ = pipe(prompt, max_new_tokens=1)
+            torch.cuda.synchronize()
+            print(f"minference time ({2**i}): {time.perf_counter() - tic=}")
+            # print(out)
+
+    def test_minference_cascade(self):
+        args = self.args
+        args.model = "llama3.1-8b-instruct"
+
+        model, tokenizer, device = load_model(args)
+        model = sample_monkeypatch(model)
+
+        for i in range(11, 21):
+            if i < 12:
+                continue
+            inputs = torch.randint(0, 32768, size=(1, 2**i)).cuda()
+
+            past_key_values = get_cache(model, dtype=torch.float16)
+            tic = time.perf_counter()
+            output = model.generate(
+                input_ids=inputs,
+                max_new_tokens=1,
+                num_beams=1,
+                do_sample=False,
+                temperature=1.0,
+                use_cache=True,
+                past_key_values=past_key_values,
+            )[0]
+            torch.cuda.synchronize()
+            print(f"cascade time ({2**i}): {time.perf_counter() - tic=}")
+
+            _ = tokenizer.decode(output[inputs.size(1):])
+
+        del model
+        del past_key_values
 
 
 if __name__ == "__main__":
